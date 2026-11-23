@@ -114,7 +114,7 @@ impl Host {
         let (stop, mut stopping) = watch::channel(false);
         let router = lobby::router_with_shutdown(
             lobby::Config {
-                database: profile.directory.join("channels.sqlite3"),
+                database: profile.channel_database(),
                 owner_identity: credential.clone(),
                 invite_key: profile.invite_key.clone(),
                 livekit_key: api_key,

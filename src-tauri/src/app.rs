@@ -1,7 +1,9 @@
 use crate::{
+    channels::{ChannelPreview, Channels},
     client::Client,
     host::Host,
     network::{GuestEndpoint, Ticket},
+    player_profile,
     preferences::{Preferences, Profile},
     voice::{AudioSettings, PeerGain, VoiceEngine},
 };
@@ -49,14 +51,6 @@ struct ConnectionInfo {
     is_host: bool,
 }
 
-fn nickname(name: &str) -> Result<&str, String> {
-    let name = name.trim();
-    if name.is_empty() || name.chars().count() > 32 || name.chars().any(char::is_control) {
-        Err("昵称需要 1 到 32 个可显示字符".into())
-    } else {
-        Ok(name)
-    }
-}
 fn executable(app: &AppHandle) -> Result<PathBuf, String> {
     let installed = app
         .path()
@@ -69,6 +63,9 @@ fn executable(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(installed)
 }
 fn save_name(profile: &mut Profile, name: &str) -> Result<(), String> {
+    if profile.settings.nickname == name {
+        return Ok(());
+    }
     let mut next = profile.settings.clone();
     next.nickname = name.to_owned();
     profile.save(next)
@@ -80,7 +77,7 @@ async fn host_lobby(
     state: State<'_, Desktop>,
     nickname: String,
 ) -> Result<ConnectionInfo, String> {
-    let name = self::nickname(&nickname)?;
+    let name = player_profile::nickname(&nickname)?;
     let mut slot = state.session.lock().await;
     if let Some(session) = slot.take() {
         state.teardown(session).await;
@@ -88,7 +85,7 @@ async fn host_lobby(
     let mut profile = state.profile.lock().await;
     save_name(&mut profile, name)?;
     let host = Host::start(&profile, &executable(&app)?).await?;
-    let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name});
+    let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name,"avatar":profile.settings.avatar});
     drop(profile);
     let result = Client::open(app, state.voice.clone(), host.gateway, hello).await;
     match result {
@@ -119,7 +116,7 @@ async fn join_lobby(
     nickname: String,
 ) -> Result<ConnectionInfo, String> {
     let ticket = Ticket::parse(&invite)?;
-    let name = self::nickname(&nickname)?;
+    let name = player_profile::nickname(&nickname)?;
     let mut slot = state.session.lock().await;
     let mut profile = state.profile.lock().await;
     if ticket.address.id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
@@ -127,12 +124,13 @@ async fn join_lobby(
     }
     save_name(&mut profile, name)?;
     let id = profile.player_credential(&ticket.address.id.to_string());
+    let avatar = profile.settings.avatar.clone();
     drop(profile);
     if let Some(session) = slot.take() {
         state.teardown(session).await;
     }
     let guest = GuestEndpoint::start(&ticket).await?;
-    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"playbackAddress":guest.media.to_string()});
+    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
     match Client::open(app, state.voice.clone(), guest.gateway, hello).await {
         Ok(client) => {
             *slot = Some(Session {
@@ -175,6 +173,54 @@ async fn lobby_action(state: State<'_, Desktop>, action: Value) -> Result<(), St
 #[tauri::command]
 async fn get_preferences(state: State<'_, Desktop>) -> Result<Preferences, String> {
     Ok(state.profile.lock().await.settings.clone())
+}
+
+#[tauri::command]
+async fn list_local_channels(state: State<'_, Desktop>) -> Result<Vec<ChannelPreview>, String> {
+    let path = state.profile.lock().await.channel_database();
+    Channels::preview(&path)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileUpdate {
+    #[serde(flatten)]
+    preferences: Preferences,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_sync_error: Option<String>,
+}
+
+#[tauri::command]
+async fn set_profile(
+    state: State<'_, Desktop>,
+    nickname: String,
+    avatar: String,
+) -> Result<ProfileUpdate, String> {
+    let name = player_profile::nickname(&nickname)?;
+    player_profile::validate_avatar(&avatar)?;
+    let slot = state.session.lock().await;
+    let mut profile = state.profile.lock().await;
+    let mut preferences = profile.settings.clone();
+    preferences.nickname = name.into();
+    preferences.avatar = avatar;
+    profile.save(preferences.clone())?;
+    drop(profile);
+    let mut profile_sync_error = None;
+    if let Some(session) = slot.as_ref() {
+        if let Err(e) = session
+            .client
+            .send(json!({"type":"profile","nickname":name,"avatar":preferences.avatar}))
+            .await
+        {
+            profile_sync_error = Some(format!(
+                "个人资料已保存在本机。当前大厅同步失败，重进大厅后将使用新资料。{e}"
+            ));
+        }
+    }
+    Ok(ProfileUpdate {
+        preferences,
+        profile_sync_error,
+    })
 }
 #[tauri::command]
 async fn list_devices(state: State<'_, Desktop>) -> Result<crate::voice::AudioDevices, String> {
@@ -350,6 +396,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            set_profile,
+            list_local_channels,
             host_lobby,
             join_lobby,
             leave_lobby,
@@ -362,7 +410,7 @@ pub fn run() {
             take_invite
         ])
         .build(tauri::generate_context!())
-        .expect("无法启动队频");
+        .expect("无法启动友声");
     app.run(|app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             let state = app.state::<Desktop>();

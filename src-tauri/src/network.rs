@@ -113,7 +113,7 @@ impl Ticket {
             .trim()
             .strip_prefix(PREFIX)
             .and_then(|s| s.split_once('#'))
-            .ok_or("请粘贴完整的队频邀请链接")?;
+            .ok_or("请粘贴完整的友声邀请链接")?;
         if parts.0.len() > 16000
             || parts.1.len() != 64
             || !parts.1.bytes().all(|b| b.is_ascii_hexdigit())

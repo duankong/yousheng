@@ -2,7 +2,7 @@ mod media;
 #[cfg(test)]
 mod tests;
 
-use crate::{channels::Channels, chat::Chat};
+use crate::{channels::Channels, chat::Chat, player_profile};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -53,6 +53,7 @@ struct Membership {
 struct Member {
     session: Uuid,
     name: String,
+    avatar: String,
     playback: Option<std::net::SocketAddrV4>,
     membership: Option<Membership>,
     dirty: watch::Sender<()>,
@@ -70,6 +71,7 @@ struct Core {
     channels: Channels,
     chat: Chat,
     members: BTreeMap<String, Member>,
+    avatar_revision: u64,
     // A participant cannot re-enter this same room until its previous removal is acknowledged.
     pending: HashSet<(String, String)>,
 }
@@ -98,6 +100,7 @@ pub fn router_with_shutdown(config: Config, stop: watch::Receiver<bool>) -> Resu
             channels: Channels::open(&config.database).map_err(|e| e.to_string())?,
             chat: Chat::default(),
             members: BTreeMap::new(),
+            avatar_revision: 0,
             pending: HashSet::new(),
         })),
         media,
@@ -126,8 +129,14 @@ enum Op {
     Hello {
         invite_key: String,
         nickname: String,
+        #[serde(default)]
+        avatar: String,
         identity: String,
         playback_address: Option<String>,
+    },
+    Profile {
+        nickname: String,
+        avatar: String,
     },
     Create {
         name: String,
@@ -163,6 +172,7 @@ impl Core {
         let Op::Hello {
             invite_key,
             nickname,
+            avatar,
             identity,
             playback_address,
         } = op
@@ -173,10 +183,8 @@ impl Core {
             return Err("邀请凭证无效");
         }
         let id = player_id(&identity)?;
-        let name = nickname.trim();
-        if name.is_empty() || name.chars().count() > 32 || name.chars().any(char::is_control) {
-            return Err("昵称须为 1–32 个字符");
-        }
+        let name = player_profile::nickname(&nickname)?;
+        player_profile::validate_avatar(&avatar)?;
         if self.members.len() >= 64 && !self.members.contains_key(&id) {
             return Err("大厅人数已满");
         }
@@ -191,11 +199,15 @@ impl Core {
             })
             .transpose()?;
         let (tx, rx) = watch::channel(());
+        if self.members.get(&id).map_or("", |m| m.avatar.as_str()) != avatar {
+            self.avatar_revision += 1;
+        }
         let old = self.members.insert(
             id.clone(),
             Member {
                 session,
                 name: name.into(),
+                avatar,
                 playback,
                 membership: None,
                 dirty: tx,
@@ -206,7 +218,7 @@ impl Core {
         Ok((id, session, rx, previous_room))
     }
 
-    fn snapshot(&self, id: &str) -> Value {
+    fn snapshot(&self, id: &str, sent_avatar_revision: Option<u64>) -> Value {
         let me = &self.members[id];
         let admin = self.owner == id;
         let channels: Vec<_> = self.channels.list.iter().map(|c|
@@ -214,7 +226,13 @@ impl Core {
         let members: Vec<_> = self
             .members
             .iter()
-            .map(|(id, m)| json!({"id":id, "name":m.name, "channelId":m.room()}))
+            .map(|(id, m)| {
+                let mut member = json!({"id":id, "name":m.name, "channelId":m.room()});
+                if sent_avatar_revision != Some(self.avatar_revision) {
+                    member["avatar"] = json!(m.avatar);
+                }
+                member
+            })
             .collect();
         json!({"type":"snapshot", "selfId":id, "admin":admin, "channels":channels, "members":members,
             "channelId":me.room(), "messages":self.chat.history(me.room())})
@@ -224,6 +242,16 @@ impl Core {
         let mut cleanup = Cleanup::None;
         match op {
             Op::Hello { .. } => return Err("已完成身份验证"),
+            Op::Profile { nickname, avatar } => {
+                let name = player_profile::nickname(&nickname)?;
+                let member = self.members.get_mut(id).unwrap();
+                if member.avatar != avatar {
+                    player_profile::validate_avatar(&avatar)?;
+                    member.avatar = avatar;
+                    self.avatar_revision += 1;
+                }
+                member.name = name.into();
+            }
             Op::Create { name } => {
                 self.channels.create(id, &name)?;
             }
@@ -325,6 +353,7 @@ async fn socket(mut ws: WebSocket, state: Shared) {
     }
     drop(core);
     let mut sent_epoch = None;
+    let mut sent_avatar_revision = None;
     let period = Duration::from_secs(15);
     let mut heartbeat = interval_at(Instant::now() + period, period);
     let mut last_seen = Instant::now();
@@ -335,7 +364,8 @@ async fn socket(mut ws: WebSocket, state: Shared) {
                 if changed.is_err() { break; }
                 let core = state.core.lock().await;
                 if !core.active(&id, session) { break; }
-                let snapshot = core.snapshot(&id);
+                let snapshot = core.snapshot(&id, sent_avatar_revision);
+                sent_avatar_revision = Some(core.avatar_revision);
                 let member = &core.members[&id];
                 let epoch = member.membership.as_ref().map(|m| m.epoch.clone());
                 let voice = if epoch != sent_epoch {
@@ -382,7 +412,11 @@ async fn socket(mut ws: WebSocket, state: Shared) {
     }
     let mut core = state.core.lock().await;
     if core.active(&id, session) {
-        if let Some(old) = core.members.remove(&id).and_then(|m| m.membership) {
+        let member = core.members.remove(&id).unwrap();
+        if !member.avatar.is_empty() {
+            core.avatar_revision += 1;
+        }
+        if let Some(old) = member.membership {
             media::cleanup(&state, &mut core, Cleanup::Participant(old.room, id));
         }
         core.notify(None);

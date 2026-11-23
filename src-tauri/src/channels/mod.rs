@@ -1,4 +1,5 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -8,9 +9,37 @@ pub(crate) struct Channel {
     pub owner: String,
 }
 
+#[derive(Serialize)]
+pub(crate) struct ChannelPreview {
+    id: String,
+    name: String,
+}
+
 impl Channel {
     pub fn can_delete(&self, player: &str, admin: bool) -> bool {
         admin || self.owner == player
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_reads_saved_channels_while_host_is_offline() {
+        let storage = tempfile::tempdir().unwrap();
+        let file = storage.path().join("channels.sqlite3");
+        assert!(Channels::preview(&file).unwrap().is_empty());
+        assert!(!file.exists());
+        let mut channels = Channels::open(&file).unwrap();
+        let id = channels.create("host", "排位").unwrap();
+        let removed = channels.create("host", "旧队伍").unwrap();
+        channels.delete(&removed, "host", true).unwrap();
+        drop(channels);
+        let list = Channels::preview(&file).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].name, "排位");
     }
 }
 
@@ -27,8 +56,12 @@ impl Channels {
             id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, owner TEXT NOT NULL
         )",
         )?;
-        let list = db
-            .prepare("SELECT id, name, owner FROM channels ORDER BY rowid")?
+        let list = Self::read_list(&db)?;
+        Ok(Self { db, list })
+    }
+
+    fn read_list(db: &Connection) -> rusqlite::Result<Vec<Channel>> {
+        db.prepare("SELECT id, name, owner FROM channels ORDER BY rowid")?
             .query_map([], |r| {
                 Ok(Channel {
                     id: r.get(0)?,
@@ -36,8 +69,23 @@ impl Channels {
                     owner: r.get(2)?,
                 })
             })?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(Self { db, list })
+            .collect()
+    }
+
+    pub fn preview(path: &Path) -> Result<Vec<ChannelPreview>, String> {
+        if !path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(Vec::new());
+        }
+        let list = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|db| Self::read_list(&db))
+            .map_err(|e| format!("无法读取本机频道：{e}"))?;
+        Ok(list
+            .into_iter()
+            .map(|c| ChannelPreview {
+                id: c.id,
+                name: c.name,
+            })
+            .collect())
     }
 
     pub fn find(&self, id: &str) -> Result<&Channel, &'static str> {

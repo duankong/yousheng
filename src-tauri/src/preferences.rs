@@ -19,6 +19,7 @@ pub fn random_key() -> [u8; 32] {
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
     pub nickname: String,
+    pub avatar: String,
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub shortcut_error: Option<String>,
     pub audio: AudioSettings,
@@ -52,10 +53,7 @@ impl Profile {
         };
         let settings = match fs::read(directory.join("settings.json")) {
             Ok(data) => serde_json::from_slice(&data).map_err(file_error)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Preferences {
-                nickname: "玩家".into(),
-                ..Default::default()
-            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
             Err(e) => return Err(file_error(e)),
         };
         Ok(Self {
@@ -65,6 +63,10 @@ impl Profile {
             host_key: keys[1],
             invite_key: hex::encode(keys[2]),
         })
+    }
+
+    pub fn channel_database(&self) -> PathBuf {
+        self.directory.join("channels.sqlite3")
     }
 
     pub fn player_credential(&self, host: &str) -> String {
@@ -89,6 +91,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_launch_requires_nickname_and_older_settings_keep_their_name() {
+        let storage = tempfile::tempdir().unwrap();
+        let profile = Profile::load(storage.path().into()).unwrap();
+        assert!(profile.settings.nickname.is_empty());
+        assert!(profile.settings.avatar.is_empty());
+        fs::write(
+            storage.path().join("settings.json"),
+            r#"{"nickname":"小雨"}"#,
+        )
+        .unwrap();
+        let existing = Profile::load(storage.path().into()).unwrap();
+        assert_eq!(existing.settings.nickname, "小雨");
+        assert!(existing.settings.avatar.is_empty());
+        assert_eq!(existing.host_key, profile.host_key);
+    }
 
     #[test]
     fn preferences_and_lobby_specific_identity_survive_restart() {

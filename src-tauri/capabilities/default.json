@@ -1,6 +1,6 @@
 {
   "identifier": "main",
-  "description": "队频本机应用窗口",
+  "description": "友声本机应用窗口",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

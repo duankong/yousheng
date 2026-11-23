@@ -3,8 +3,9 @@ import { computed, ref, watch } from 'vue'
 import { AudioLines, SlidersHorizontal, VolumeX, Users, X } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
 import type { Member, PeerSettings, Snapshot } from '../model'
+import PlayerAvatar from './PlayerAvatar.vue'
 const props = defineProps<{ snapshot: Snapshot; speakers: string[]; peers: Record<string, PeerSettings> }>()
-const emit = defineEmits<{ saved: [id: string, settings: PeerSettings]; error: [error: string] }>()
+const emit = defineEmits<{ saved: [id: string, settings: PeerSettings]; error: [error: string]; editProfile: [] }>()
 const editId = ref('')
 const edit = ref<PeerSettings>({ volume: 100, muted: false })
 const busy = ref(false)
@@ -30,7 +31,8 @@ async function save() {
   <aside class="members"><h3><Users />{{ snapshot.channelId ? '频道成员' : '大厅成员' }} <span class="number">{{ visible.length }}</span></h3>
     <ul><li v-for="member in visible" :key="member.id">
       <div class="member-row">
-        <span class="avatar" :class="{ mine: member.id === snapshot.selfId, speaking: speakers.includes(member.id) }">{{ Array.from(member.name)[0] }}</span>
+        <PlayerAvatar :name="member.name" :avatar="member.avatar" :editable="member.id === snapshot.selfId"
+          :class="{ mine: member.id === snapshot.selfId, speaking: speakers.includes(member.id) }" @edit="emit('editProfile')" />
         <div class="member-info"><strong>{{ member.name }}</strong>
           <small v-if="speakers.includes(member.id)" class="speech"><AudioLines /> 正在发言</small>
           <small v-else-if="peers[member.id]?.muted"><VolumeX /> 本地已静音</small>

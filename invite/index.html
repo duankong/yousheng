@@ -1,8 +1,8 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
-<title>加入队频大厅</title>
+<title>加入友声大厅</title>
 <style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f0f3f8;color:#243049;font:16px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}main{width:min(90vw,410px);padding:32px;background:white;border-radius:18px;border:1px solid #d9dfeb}h1{margin:0;font-size:26px}p{color:#536075}a{display:inline-block;padding:9px 20px;border-radius:9px;background:#334fc1;color:white;text-decoration:none;font-weight:600}[hidden]{display:none}</style>
-</head><body><main><h1>加入队频大厅</h1><p id="message">打开队频，用本机昵称加入好友的大厅。</p><a id="join" hidden>打开队频</a></main>
+</head><body><main><h1>加入友声大厅</h1><p id="message">打开友声，用本机昵称加入好友的大厅。</p><a id="join" hidden>打开友声</a></main>
 <script>
 const invite = window.location.hash.slice(1);
 if (/^duipin:\/\/join\/[A-Za-z0-9_-]{1,16000}#[A-Fa-f0-9]{64}$/.test(invite)) {

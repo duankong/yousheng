@@ -8,6 +8,7 @@ mod host;
 mod ice;
 mod lobby;
 mod network;
+mod player_profile;
 mod preferences;
 #[cfg(test)]
 mod scenario_tests;

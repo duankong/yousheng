@@ -1,8 +1,8 @@
 [package]
 name = "duipin"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "队频 Windows 开黑语音"
+description = "友声 Windows 开黑语音"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -20,6 +20,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 hmac = "0.12"
 iroh = "1.5"
+jpeg-decoder = { version = "0.3", default-features = false }
 jsonwebtoken = "9"
 livekit = { version = "=0.12.0", features = ["rustls-tls-native-roots"] }
 livekit-protocol = "0.9"

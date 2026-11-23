@@ -3,15 +3,16 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { MessageSquare, Send, Headphones, Mic, MicOff, Settings2, LogOut, RotateCw } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
 import { modes, type AudioSettings, type Channel, type Snapshot } from '../model'
+import PlayerAvatar from './PlayerAvatar.vue'
 
 const props = defineProps<{ channel: Channel; snapshot: Snapshot; drafts: Record<string, string>; audio?: AudioSettings; voiceLabel: string; inVoice: boolean; canRetryVoice: boolean; busy: boolean }>()
-const emit = defineEmits<{ mute: []; settings: []; leave: []; retry: []; draft: [id: string, text: string]; error: [error: string] }>()
+const emit = defineEmits<{ mute: []; settings: []; leave: []; retry: []; draft: [id: string, text: string]; error: [error: string]; editProfile: [] }>()
 const draft = computed({ get: () => props.drafts[props.channel.id] ?? '', set: text => emit('draft', props.channel.id, text) })
 const sending = ref(false)
 const log = ref<HTMLElement>()
 const atBottom = ref(true)
 const time = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
-function initial(name: string) { return Array.from(name.trim())[0] || '友' }
+const authors = computed(() => new Map(props.snapshot.members.map(member => [member.id, member])))
 function updateScroll() { if (log.value) atBottom.value = log.value.scrollHeight - log.value.clientHeight - log.value.scrollTop < 72 }
 watch(() => [props.channel.id, props.snapshot.messages.at(-1)?.id], async ([room], previous) => {
   const follow = atBottom.value || room !== previous?.[0] || props.snapshot.messages.at(-1)?.authorId === props.snapshot.selfId
@@ -49,7 +50,8 @@ function keydown(event: KeyboardEvent) {
         <span class="empty-icon"><MessageSquare /></span><h3>聊点什么吧</h3><p>发出的第一条消息会出现在这里。</p>
       </div>
       <article v-for="msg in snapshot.messages" :key="msg.id" class="message">
-        <div class="avatar" :class="{ mine: msg.authorId === snapshot.selfId }">{{ initial(msg.authorName) }}</div>
+        <PlayerAvatar :name="msg.authorName" :avatar="authors.get(msg.authorId)?.avatar" :editable="msg.authorId === snapshot.selfId"
+          :class="{ mine: msg.authorId === snapshot.selfId }" @edit="emit('editProfile')" />
         <div><header><b>{{ msg.authorName }}</b><small v-if="msg.authorId === snapshot.selfId" class="self-tag">我</small><time :title="new Date(msg.time).toLocaleString('zh-CN')">{{ time.format(msg.time) }}</time></header><p>{{ msg.text }}</p></div>
       </article>
     </div>

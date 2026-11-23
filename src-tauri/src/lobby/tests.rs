@@ -12,6 +12,7 @@ fn core(path: &Path) -> Core {
         channels: Channels::open(path).unwrap(),
         chat: Chat::default(),
         members: BTreeMap::new(),
+        avatar_revision: 0,
         pending: HashSet::new(),
     }
 }
@@ -20,6 +21,7 @@ fn hello(secret: char) -> Op {
     Op::Hello {
         invite_key: INVITE.into(),
         nickname: "同名玩家".into(),
+        avatar: String::new(),
         identity: secret.to_string().repeat(64),
         playback_address: None,
     }
@@ -40,13 +42,133 @@ fn join(c: &mut Core, id: &str, room: &str) {
     .unwrap();
 }
 
+fn jpeg_url(bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
+}
+
+#[test]
+fn avatar_and_nickname_updates_keep_voice_and_actor_identity() {
+    let mut c = core(Path::new(":memory:"));
+    let avatar = jpeg_url(include_bytes!("test-avatar.jpg"));
+    let guest = login(&mut c, 'b');
+    let admin = login(&mut c, 'a');
+    let room = c.channels.create(&guest, "排位").unwrap();
+    join(&mut c, &guest, &room);
+    let session = c.members[&guest].session;
+    let epoch = c.members[&guest].membership.as_ref().unwrap().epoch.clone();
+    let revision = c.avatar_revision;
+    let op = serde_json::from_value(json!({"type":"profile","id":admin,
+        "nickname":"  夜猫  ","avatar":avatar}))
+    .unwrap();
+    assert!(matches!(c.apply(&guest, op), Ok(Cleanup::None)));
+    assert!(c.active(&guest, session));
+    assert_eq!(c.members[&guest].membership.as_ref().unwrap().epoch, epoch);
+    assert_eq!(c.members[&guest].room(), Some(room.as_str()));
+    assert_eq!(c.members[&admin].name, "同名玩家");
+    assert_eq!(c.members[&guest].name, "夜猫");
+    assert_eq!(c.members[&guest].avatar, avatar);
+    assert!(c.channels.find(&room).unwrap().can_delete(&guest, false));
+
+    let members = c.snapshot(&admin, Some(revision))["members"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        members.iter().find(|m| m["id"] == guest).unwrap()["avatar"],
+        avatar
+    );
+    let revision = c.avatar_revision;
+    let chat = Op::Chat {
+        channel_id: room.clone(),
+        text: "报点".into(),
+    };
+    assert!(c.apply(&guest, chat).is_ok());
+    let state = c.snapshot(&guest, Some(revision));
+    assert_eq!(state["messages"][0]["authorName"], "夜猫");
+    assert!(state["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m.get("avatar").is_none()));
+    assert!(c
+        .apply(
+            &guest,
+            Op::Profile {
+                nickname: "换错了".into(),
+                avatar: "data:text/plain,hi".into()
+            }
+        )
+        .is_err());
+    assert_eq!(c.members[&guest].name, "夜猫");
+    assert_eq!(c.avatar_revision, revision);
+
+    assert!(c
+        .apply(
+            &guest,
+            Op::Profile {
+                nickname: "夜猫".into(),
+                avatar: String::new()
+            }
+        )
+        .is_ok());
+    let state = c.snapshot(&admin, Some(revision));
+    assert_eq!(
+        state["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == guest)
+            .unwrap()["avatar"],
+        ""
+    );
+}
+
+#[test]
+fn hello_accepts_old_clients_and_rejects_invalid_or_oversize_pictures() {
+    let mut c = core(Path::new(":memory:"));
+    let mut hello =
+        json!({"type":"hello","identity":"b".repeat(64),"nickname":"玩家","inviteKey":INVITE});
+    let first = c
+        .login(serde_json::from_value(hello.clone()).unwrap())
+        .unwrap()
+        .0;
+    assert!(c.members[&first].avatar.is_empty());
+
+    let jpeg = include_bytes!("test-avatar.jpg");
+    hello["avatar"] = jpeg_url(jpeg).into();
+    let rejoined = c
+        .login(serde_json::from_value(hello.clone()).unwrap())
+        .unwrap()
+        .0;
+    assert_eq!(first, rejoined);
+    assert_eq!(c.members[&first].avatar, hello["avatar"]);
+    let session = c.members[&first].session;
+    let mut wide = jpeg.to_vec();
+    let frame = wide.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+    wide[frame + 7..frame + 9].copy_from_slice(&97u16.to_be_bytes());
+    for invalid in [
+        jpeg_url(&wide),
+        jpeg_url(&jpeg[..20]),
+        jpeg_url(&vec![0; 8193]),
+        "https://example.org/avatar.jpg".into(),
+        "data:image/jpeg;base64,invalid?".into(),
+    ] {
+        hello["avatar"] = invalid.into();
+        assert!(c
+            .login(serde_json::from_value(hello.clone()).unwrap())
+            .is_err());
+        assert!(c.active(&first, session));
+    }
+}
+
 #[test]
 fn ownership_survives_restart_and_deleted_room_stays_deleted() {
     let path = std::env::temp_dir().join(format!("duipin-{}.sqlite", Uuid::new_v4()));
     let mut c = core(&path);
     let creator = login(&mut c, 'b');
     let room = c.channels.create(&creator, "游戏").unwrap();
-    assert!(!c.snapshot(&creator)["admin"].as_bool().unwrap());
+    assert!(!c.snapshot(&creator, None)["admin"].as_bool().unwrap());
     drop(c);
     let mut c = core(&path);
     let other = login(&mut c, 'c');
@@ -58,10 +180,10 @@ fn ownership_survives_restart_and_deleted_room_stays_deleted() {
             }
         )
         .is_err());
-    assert_eq!(c.snapshot(&other)["channels"][0]["canDelete"], false);
+    assert_eq!(c.snapshot(&other, None)["channels"][0]["canDelete"], false);
     let owner = login(&mut c, 'b');
     assert_eq!(owner, creator);
-    assert_eq!(c.snapshot(&owner)["channels"][0]["canDelete"], true);
+    assert_eq!(c.snapshot(&owner, None)["channels"][0]["canDelete"], true);
     assert!(c
         .apply(
             &owner,
@@ -117,12 +239,12 @@ fn chat_is_bounded_scoped_and_cleared_when_an_occupied_room_is_deleted() {
             )
             .is_ok());
     }
-    let history = c.snapshot(&a)["messages"].as_array().unwrap().clone();
+    let history = c.snapshot(&a, None)["messages"].as_array().unwrap().clone();
     assert_eq!(history.len(), 100);
     assert_eq!(history[0]["text"], "1");
-    assert_eq!(c.snapshot(&b)["messages"], json!([]));
+    assert_eq!(c.snapshot(&b, None)["messages"], json!([]));
     join(&mut c, &b, &red);
-    assert_eq!(c.snapshot(&b)["messages"], json!(history));
+    assert_eq!(c.snapshot(&b, None)["messages"], json!(history));
     let revoked = c.members[&b]
         .membership
         .as_ref()
@@ -138,7 +260,7 @@ fn chat_is_bounded_scoped_and_cleared_when_an_occupied_room_is_deleted() {
         )
         .is_ok());
     assert!(revoked.has_changed().is_err());
-    assert_eq!(c.snapshot(&b)["channelId"], Value::Null);
+    assert_eq!(c.snapshot(&b, None)["channelId"], Value::Null);
     assert!(c.chat.history(Some(&red)).is_empty());
     assert!(c
         .apply(
@@ -501,4 +623,84 @@ async fn packaged_livekit_admits_member_and_destroys_deleted_room() {
     .unwrap();
     server.abort();
     sfu.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_sockets_observe_profile_changes_without_leaving_the_channel() {
+    let (_stop, stopping) = watch::channel(false);
+    let app = router_with_shutdown(config(), stopping).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (mut host, _) = connect_async(&url).await.unwrap();
+    let host_state = command(
+        &mut host,
+        json!({"type":"hello","inviteKey":INVITE,"identity":"a".repeat(64),"nickname":"主机"}),
+    )
+    .await;
+    assert_eq!(host_state["admin"], true);
+    let created = command(&mut host, json!({"type":"create","name":"排位"})).await;
+    let room = created["channels"][0]["id"].as_str().unwrap();
+    command(&mut host, json!({"type":"join","channelId":room})).await;
+    assert_eq!(read(&mut host).await["type"], "voice");
+
+    let (mut guest, _) = connect_async(&url).await.unwrap();
+    let guest_state = command(
+        &mut guest,
+        json!({"type":"hello","inviteKey":INVITE,"identity":"b".repeat(64),"nickname":"旧昵称"}),
+    )
+    .await;
+    let guest_id = guest_state["selfId"].as_str().unwrap();
+    assert_eq!(
+        read(&mut host).await["members"].as_array().unwrap().len(),
+        2
+    );
+    command(&mut guest, json!({"type":"join","channelId":room})).await;
+    assert_eq!(read(&mut guest).await["type"], "voice");
+    read(&mut host).await;
+
+    command(
+        &mut guest,
+        json!({"type":"chat","channelId":room,"text":"改名前"}),
+    )
+    .await;
+    let old_message = read(&mut host).await["messages"][0].clone();
+    assert_eq!(old_message["authorName"], "旧昵称");
+
+    let portrait = jpeg_url(include_bytes!("test-avatar.jpg"));
+    for avatar in [&portrait[..], ""] {
+        let ack = command(
+            &mut guest,
+            json!({"type":"profile","nickname":"新昵称","avatar":avatar,"requestId":7}),
+        )
+        .await;
+        assert_eq!(ack, json!({"type":"result","requestId":7,"error":null}));
+        let (local, remote) = tokio::join!(read(&mut guest), read(&mut host));
+        for state in [local, remote] {
+            let members = state["members"].as_array().unwrap();
+            let changed = members.iter().find(|m| m["id"] == guest_id).unwrap();
+            assert_eq!(changed["name"], "新昵称");
+            assert_eq!(changed["avatar"], avatar);
+            assert_eq!(members.len(), 2);
+            assert!(members.iter().all(|m| m["channelId"] == room));
+            assert_eq!(state["channelId"], room);
+            assert_eq!(state["messages"][0], old_message);
+        }
+        command(
+            &mut guest,
+            json!({"type":"chat","channelId":room,"text":"改名后"}),
+        )
+        .await;
+        let remote = read(&mut host).await;
+        let newest = remote["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(newest["authorId"], guest_id);
+        assert_eq!(newest["authorName"], "新昵称");
+        assert!(remote["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("avatar").is_none()));
+    }
+    server.abort();
 }
