@@ -1,0 +1,8 @@
+# Local browser preview sessions contain temporary connection details.
+/.superpowers/brainstorm/*/state/
+/.superpowers/sdd/
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/resources/
+/ui/node_modules/
+/ui/dist/

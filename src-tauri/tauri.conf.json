@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "队频",
+  "version": "0.1.0",
+  "identifier": "app.duipin.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [{"label":"main","title":"队频","width":1150,"height":760,"minWidth":760,"minHeight":540}],
+    "security": {"csp":"default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'"}
+  },
+  "bundle": {
+    "active": true,
+    "useLocalToolsDir": true,
+    "targets": ["nsis"],
+    "icon": ["icons/app.ico"],
+    "resources": ["resources/livekit-server.exe","resources/livekit-LICENSE.txt","resources/*-NOTICES.*"],
+    "windows": {"nsis":{"languages":["SimpChinese","English"],"installMode":"currentUser"}}
+  },
+  "plugins": {"deep-link":{"desktop":{"schemes":["duipin"]}}}
+}
