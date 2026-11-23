@@ -3,15 +3,16 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { Activity, ArrowDownLeft, AudioLines, AudioWaveform, ChevronRight, CircleAlert, Clipboard, Copy, House, Link2, LogOut, Menu, Plus, Radio, Settings2, Trash2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
-import AudioSettingsView from './features/AudioSettings.vue'
+import SettingsDialog from './features/SettingsDialog.vue'
 import Chat from './features/Chat.vue'
 import Members from './features/Members.vue'
 import ProfileEditor from './features/ProfileEditor.vue'
 import PlayerAvatar from './features/PlayerAvatar.vue'
 import { useLobby } from './features/useLobby'
+import { useUpdater } from './features/useUpdater'
 import type { AudioSettings, Channel, Preferences } from './model'
 
-type Panel = 'join' | 'invite' | 'create' | 'delete' | 'exit' | 'audio' | 'profile' | ''
+type Panel = 'join' | 'invite' | 'create' | 'delete' | 'exit' | 'audio' | 'updates' | 'profile' | ''
 type LocalChannel = Pick<Channel, 'id' | 'name'>
 const panel = ref<Panel>('')
 const drawer = ref(false)
@@ -29,13 +30,16 @@ let draftLobby = ''
 const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, action,
   localChannels, loadingChannels, channelsError, refreshLocalChannels } = useLobby(link => { pendingInvite.value = link })
 const connected = computed(() => !!(snapshot.value || session.value))
+const installBlocked = computed(() => busy.value || connected.value || inVoice.value || ['connecting', 'reconnecting'].includes(voice.value.state))
+const updater = useUpdater(preferences, ready, installBlocked)
+const dismissedUpdate = ref('')
 const firstRun = computed(() => !!preferences.value && !preferences.value.nickname.trim())
 const editingProfile = computed(() => firstRun.value || panel.value === 'profile')
 const myName = computed(() => preferences.value?.nickname || '本地玩家')
 const navChannels = computed<(LocalChannel & { canDelete?: boolean })[]>(() => snapshot.value?.channels ?? (connected.value ? [] : localChannels.value))
 const heading = computed(() => active.value?.name || (connected.value ? '我的大厅' : '本机频道'))
 const banner = computed(() => (!panel.value && error.value) || offline.value || preferences.value?.shortcutError || '')
-const panelTitle: Record<Panel, string> = { join: '通过邀请加入', invite: '邀请好友', create: '创建语音频道', delete: '删除频道', exit: '退出大厅', audio: '声音设置', profile: '个人资料', '': '' }
+const panelTitle: Record<Panel, string> = { join: '通过邀请加入', invite: '邀请好友', create: '创建语音频道', delete: '删除频道', exit: '退出大厅', audio: '软件设置', updates: '软件设置', profile: '个人资料', '': '' }
 const artBars = Array.from({ length: 77 }, (_, i) => {
   const t = i / 76
   return {
@@ -55,11 +59,11 @@ function openPanel(next: Panel) {
 function closePanel() { if (!busy.value) { panel.value = ''; error.value = '' } }
 // An invite may arrive during onboarding or another connection. Keep the latest
 // one until the player has a saved identity and the current action has finished.
-watch([pendingInvite, ready, busy, editingProfile], async ([link, initialized, working, editing]) => {
-  if (!link || !initialized || working || editing) return
+watch([pendingInvite, ready, busy, editingProfile, () => updater.installing], async ([link, initialized, working, editing, installing]) => {
+  if (!link || !initialized || working || editing || installing) return
   // Let the completed action dismiss its own dialog before showing this invite.
   await nextTick()
-  if (pendingInvite.value !== link || busy.value || editingProfile.value) return
+  if (pendingInvite.value !== link || busy.value || editingProfile.value || updater.installing) return
   pendingInvite.value = ''
   if (session.value?.invite === link && connected.value) return
   invite.value = link
@@ -128,7 +132,7 @@ watch(() => session.value?.invite, link => {
   if (link && link !== draftLobby) { drafts.value = {}; draftLobby = link }
 })
 watch(offline, message => {
-  if (message && !['profile', 'join', 'audio'].includes(panel.value)) panel.value = ''
+  if (message && !['profile', 'join', 'audio', 'updates'].includes(panel.value)) panel.value = ''
 })
 </script>
 
@@ -153,7 +157,7 @@ watch(offline, message => {
         </div>
       </nav>
       <div class="sidebar-bottom">
-        <button class="settings-link" :disabled="!preferences" @click="openPanel('audio')"><Settings2 /> 声音设置 <ChevronRight /></button>
+        <button class="settings-link" :disabled="!preferences" @click="openPanel('audio')"><Settings2 /> 软件设置 <ChevronRight /></button>
         <div class="profile"><button class="profile-edit" :disabled="!preferences || busy" title="编辑个人资料" aria-label="编辑个人资料" @click="openPanel('profile')"><PlayerAvatar class="profile-avatar" :name="myName" :avatar="preferences?.avatar" /><span><b>{{ myName }}</b><small>{{ connected ? (session?.isHost ? '大厅管理员' : '大厅成员') : '个人资料' }}</small></span></button>
           <button v-if="connected" class="icon-button" :title="session?.isHost ? '停止大厅' : '退出大厅'" :aria-label="session?.isHost ? '停止大厅' : '退出大厅'" @click="openPanel('exit')"><LogOut /></button></div>
       </div>
@@ -169,6 +173,11 @@ watch(offline, message => {
         <button v-if="banner === offline && lastJoin && !connected" class="text-button" @click="invite = lastJoin; openPanel('join'); enter()">重试</button>
         <button v-if="banner === preferences?.shortcutError" class="text-button" @click="openPanel('audio')">声音设置</button>
         <button class="icon-button" aria-label="关闭提示" @click="dismissBanner"><X /></button></div>
+      <div v-if="updater.available && updater.enabled && dismissedUpdate !== updater.available.version" class="alert update-banner" role="status">
+        <span>友声 {{ updater.available.version }} 可以更新了</span>
+        <button class="text-button" @click="openPanel('updates')">查看更新</button>
+        <button class="icon-button" aria-label="稍后提醒" @click="dismissedUpdate = updater.available.version"><X /></button>
+      </div>
       <div v-if="!connected" class="landing-scroll"><div class="landing">
         <header class="hero">
           <div class="hero-grid"></div><div class="wave-art" aria-hidden="true"><i v-for="(bar, i) in artBars" :key="i" :style="bar"></i></div>
@@ -210,7 +219,8 @@ watch(offline, message => {
       </template>
     </main>
     <ProfileEditor v-if="editingProfile && preferences" :preferences="preferences" :first-run="firstRun" @close="closePanel" @saved="profileSaved" />
-    <AudioSettingsView v-else-if="panel === 'audio' && preferences" :audio="preferences.audio" :level="level" :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice" @close="closePanel" @saved="audioSaved" />
+    <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates') && preferences" :tab="panel" :audio="preferences.audio" :level="level" :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice"
+      :updater="updater" @tab="panel = $event" @close="closePanel" @saved="audioSaved" />
     <Dialog v-else-if="panel" :key="panel" :title="panel === 'exit' && session?.isHost ? '停止大厅' : panelTitle[panel]" @close="closePanel">
       <form v-if="panel === 'join'" @submit.prevent="enter">
         <p class="dialog-desc">{{ session?.isHost ? '加入新大厅将停止你主持的大厅，所有成员会断开连接，本次聊天记录也会清除。' : (connected ? '加入新大厅将退出当前大厅。' : '输入好友发来的大厅邀请链接。') }}</p>

@@ -12,6 +12,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"

@@ -103,6 +103,10 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 .text-button svg { width: 14px; height: 14px; }
 .alert { display: flex; gap: 8px; align-items: center; padding: 7px 18px; font-size: 13px; color: #804e28; background: #fff4e8; border-bottom: 1px solid #f5ddbf; overflow-wrap: anywhere; }
 .alert span { flex: 1; }
+.update-banner { background: #eff1fd; color: var(--accent-dark); border-color: var(--line); }
+.update-settings .switch-row { margin-top: 18px; }
+.update-version { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 16px; }
+.update-notes { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; max-height: 170px; overflow-y: auto; }
 .room-header { display: flex; align-items: center; flex: none; gap: 14px; border-bottom: 1px solid var(--line); padding: 23px clamp(18px, 2.8vw, 40px); }
 .room-icon { width: 46px; height: 46px; border-radius: 14px; background: var(--lavender); color: var(--accent); }
 .room-icon svg { width: 24px; height: 24px; }

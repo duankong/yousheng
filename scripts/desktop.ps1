@@ -1,8 +1,18 @@
-param([ValidateSet('dev','build','test')][string]$Mode='dev',[switch]$Integration)
+param([ValidateSet('dev','build','test')][string]$Mode='dev',[switch]$Integration,[switch]$SignedRelease)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+$previousTargetFlags = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS
+if ($SignedRelease -and ($Mode -ne 'build' -or !$env:TAURI_SIGNING_PRIVATE_KEY)) {
+    throw 'Use -SignedRelease with build and set TAURI_SIGNING_PRIVATE_KEY for the official release.'
+}
 Push-Location $root
 try {
+    # The prebuilt WebRTC library links the static MSVC runtime.
+    $localCargoConfig = Get-Item -LiteralPath '.cargo/config.toml', '.cargo/config' -ErrorAction SilentlyContinue
+    $configuredCrt = $localCargoConfig | Select-String -Pattern '[+-]crt-static' -Quiet
+    if (!$configuredCrt -and $previousTargetFlags -notmatch '[+-]crt-static') {
+        $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "$previousTargetFlags -C target-feature=+crt-static".Trim()
+    }
     if (!(Get-Command cl.exe -ErrorAction SilentlyContinue)) {
         $locator = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
         if (!(Test-Path $locator)) { throw 'Install Visual Studio C++ Build Tools with a Windows SDK.' }
@@ -35,7 +45,14 @@ try {
             cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml scenario_tests -- --ignored --test-threads=1
         }
     } else {
-        & 'ui/node_modules/.bin/tauri.cmd' $Mode --target x86_64-pc-windows-msvc
+        $options = @('--target', 'x86_64-pc-windows-msvc')
+        if ($Mode -eq 'build' -and !$SignedRelease) {
+            $options += @('--config', (Join-Path $PSScriptRoot 'tauri.local.conf.json'))
+        }
+        & 'ui/node_modules/.bin/tauri.cmd' $Mode @options
     }
     exit $LASTEXITCODE
-} finally { Pop-Location }
+} finally {
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $previousTargetFlags
+    Pop-Location
+}

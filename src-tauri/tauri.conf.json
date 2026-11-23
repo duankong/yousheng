@@ -15,11 +15,18 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "useLocalToolsDir": true,
     "targets": ["nsis"],
     "icon": ["icons/app.ico"],
     "resources": ["resources/livekit-server.exe","resources/livekit-LICENSE.txt","resources/*-NOTICES.*"],
     "windows": {"nsis":{"languages":["SimpChinese","English"],"installMode":"currentUser"}}
   },
-  "plugins": {"deep-link":{"desktop":{"schemes":["duipin"]}}}
+  "plugins": {
+    "deep-link": {"desktop":{"schemes":["duipin"]}},
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRDREM1MjIwOTAxODJFNDYKUldSR0xoaVFJRkxjVEQvSE9sM3JrZ0RFeUdGdU9WZEd5SXROT2R6Sk8xS09hMmpKelU1TFVxQlcK",
+      "endpoints": ["https://github.com/duankong/yousheng/releases/latest/download/latest.json"]
+    }
+  }
 }

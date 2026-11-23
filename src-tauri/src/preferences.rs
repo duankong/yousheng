@@ -15,15 +15,29 @@ pub fn random_key() -> [u8; 32] {
     key
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Preferences {
     pub nickname: String,
     pub avatar: String,
+    pub auto_update: bool,
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub shortcut_error: Option<String>,
     pub audio: AudioSettings,
     pub peers: HashMap<String, PeerGain>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            nickname: String::new(),
+            avatar: String::new(),
+            auto_update: true,
+            shortcut_error: None,
+            audio: AudioSettings::default(),
+            peers: HashMap::new(),
+        }
+    }
 }
 
 pub struct Profile {
@@ -98,6 +112,7 @@ mod tests {
         let profile = Profile::load(storage.path().into()).unwrap();
         assert!(profile.settings.nickname.is_empty());
         assert!(profile.settings.avatar.is_empty());
+        assert!(profile.settings.auto_update);
         fs::write(
             storage.path().join("settings.json"),
             r#"{"nickname":"小雨"}"#,
@@ -106,6 +121,7 @@ mod tests {
         let existing = Profile::load(storage.path().into()).unwrap();
         assert_eq!(existing.settings.nickname, "小雨");
         assert!(existing.settings.avatar.is_empty());
+        assert!(existing.settings.auto_update);
         assert_eq!(existing.host_key, profile.host_key);
     }
 
@@ -118,10 +134,12 @@ mod tests {
         for name in ["first", "second"] {
             let mut prefs = first.settings.clone();
             prefs.nickname = name.into();
+            prefs.auto_update = false;
             first.save(prefs).unwrap();
         }
         let reopened = Profile::load(storage.path().into()).unwrap();
         assert_eq!(reopened.settings.nickname, "second");
+        assert!(!reopened.settings.auto_update);
         assert_eq!(first.host_key, reopened.host_key);
         assert_eq!(first.invite_key, reopened.invite_key);
         assert_eq!(credential, reopened.player_credential("host-a"));

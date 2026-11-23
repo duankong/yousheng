@@ -43,7 +43,7 @@ export interface AudioSettings {
 }
 
 export interface PeerSettings { volume: number; muted: boolean }
-export interface Preferences { nickname: string; avatar?: string; audio: AudioSettings; peers: Record<string, PeerSettings>; shortcutError?: string | null; profileSyncError?: string }
+export interface Preferences { nickname: string; avatar?: string; audio: AudioSettings; autoUpdate: boolean; peers: Record<string, PeerSettings>; shortcutError?: string | null; profileSyncError?: string }
 export interface Devices { inputs: { id: string; name: string }[]; outputs: { id: string; name: string }[] }
 export interface VoiceStatus { state: string; message?: string }
 export const modes = { open: '持续开麦', activation: '语音激活', ptt: '按键说话' } as const

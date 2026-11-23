@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { Mic, Headphones, AudioWaveform } from 'lucide-vue-next'
-import Dialog from './Dialog.vue'
 import { modes, type AudioSettings, type Devices } from '../model'
 
-const props = defineProps<{ audio: AudioSettings; level: number; speaking: boolean; connected: boolean }>()
-const emit = defineEmits<{ close: []; saved: [audio: AudioSettings] }>()
+const props = defineProps<{ audio: AudioSettings; level: number; speaking: boolean; connected: boolean; visible: boolean }>()
+const emit = defineEmits<{ close: []; saved: [audio: AudioSettings]; saving: [busy: boolean] }>()
 const draft = ref<AudioSettings>({ ...props.audio })
 const devices = ref<Devices>({ inputs: [], outputs: [] })
 const error = ref('')
@@ -23,28 +22,36 @@ const meterStatus = computed(() => {
   return '试音中'
 })
 
-onMounted(async () => {
+watch(() => props.visible, (visible, _, onCleanup) => {
+  if (!visible) return
+  let current = true
+  monitoring.value = false
+  monitorError.value = ''
+  onCleanup(() => {
+    current = false
+    void invoke('monitor_microphone', { active: false }).catch(() => {})
+  })
   void invoke('monitor_microphone', { active: true })
-    .then(() => { monitoring.value = true })
-    .catch(reason => { monitorError.value = String(reason) })
-  try { devices.value = await invoke<Devices>('list_devices') }
-  catch (reason) { error.value = String(reason) }
-})
-onBeforeUnmount(() => { void invoke('monitor_microphone', { active: false }).catch(() => {}) })
+    .then(() => { if (current) monitoring.value = true })
+    .catch(reason => { if (current) monitorError.value = String(reason) })
+  void invoke<Devices>('list_devices')
+    .then(value => { if (current) devices.value = value })
+    .catch(reason => { if (current) error.value = String(reason) })
+}, { immediate: true })
 
 async function save() {
   busy.value = true
+  emit('saving', true)
   error.value = ''
   try {
     await invoke('set_audio', { audio: { ...draft.value } })
     emit('saved', { ...draft.value })
   } catch (reason) { error.value = String(reason) }
-  finally { busy.value = false }
+  finally { busy.value = false; emit('saving', false) }
 }
 </script>
 
 <template>
-  <Dialog title="声音设置" wide @close="!busy && emit('close')">
     <form @submit.prevent="save">
       <section class="settings-section">
         <h3><Mic /> 麦克风</h3>
@@ -96,5 +103,4 @@ async function save() {
       <footer class="dialog-actions"><button type="button" class="button" @click="emit('close')" :disabled="busy">取消</button>
         <button class="button primary" :disabled="busy">{{ busy ? '正在保存…' : '保存设置' }}</button></footer>
     </form>
-  </Dialog>
 </template>

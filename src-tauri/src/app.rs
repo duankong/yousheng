@@ -19,6 +19,8 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::Mutex as AsyncMutex;
 
+mod updates;
+
 struct Session {
     client: Client,
     host: Option<Host>,
@@ -28,6 +30,7 @@ struct Desktop {
     profile: AsyncMutex<Profile>,
     voice: Arc<VoiceEngine>,
     session: AsyncMutex<Option<Session>>,
+    available_update: AsyncMutex<Option<tauri_plugin_updater::Update>>,
     invite: Mutex<Option<String>>,
     closing: AtomicBool,
 }
@@ -337,6 +340,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _, event| {
@@ -366,6 +370,7 @@ pub fn run() {
                 profile: AsyncMutex::new(profile),
                 voice: voice.clone(),
                 session: AsyncMutex::new(None),
+                available_update: AsyncMutex::new(None),
                 invite: Mutex::new(None),
                 closing: AtomicBool::new(false),
             });
@@ -403,6 +408,9 @@ pub fn run() {
             leave_lobby,
             lobby_action,
             get_preferences,
+            updates::set_auto_update,
+            updates::check_update,
+            updates::install_update,
             set_audio,
             set_peer,
             list_devices,
