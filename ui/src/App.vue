@@ -18,6 +18,7 @@ const panel = ref<Panel>('')
 const drawer = ref(false)
 const showPeople = ref(false)
 const invite = ref('')
+const shareLink = ref('')
 const pendingInvite = ref('')
 const channelName = ref('')
 const deletion = ref<LocalChannel>()
@@ -25,6 +26,7 @@ const notice = ref('')
 const muteBusy = ref(false)
 const copyInput = ref<HTMLInputElement>()
 const lastJoin = ref('')
+const joiningChannel = ref('')
 const drafts = ref<Record<string, string>>({})
 let draftLobby = ''
 const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, action,
@@ -65,7 +67,7 @@ watch([pendingInvite, ready, busy, editingProfile, () => updater.installing], as
   await nextTick()
   if (pendingInvite.value !== link || busy.value || editingProfile.value || updater.installing) return
   pendingInvite.value = ''
-  if (session.value?.invite === link && connected.value) return
+  if ((session.value?.invite === link || shareLink.value === link) && connected.value) return
   invite.value = link
   openPanel('join')
   if (!connected.value) await enter()
@@ -97,16 +99,32 @@ async function deleteChannel() {
   if (deletion.value && await action({ type: 'delete', channelId: deletion.value.id }) && panel.value === 'delete') closePanel()
 }
 async function joinChannel(id: string) {
+  if (busy.value || id === active.value?.id) return
   drawer.value = false
   if (!connected.value) lastJoin.value = ''
-  if (id !== active.value?.id && !busy.value) await action({ type: 'join', channelId: id }, !connected.value)
+  joiningChannel.value = id
+  try { await action({ type: 'join', channelId: id }, !connected.value) }
+  finally { joiningChannel.value = '' }
 }
 async function leaveSession() {
   if (await leave()) { panel.value = ''; lastJoin.value = ''; drafts.value = {}; draftLobby = '' }
 }
+async function openShare() {
+  const current = session.value
+  if (!current) return
+  openPanel('invite')
+  shareLink.value = current.isHost ? '' : current.invite
+  if (!current.isHost) return
+  try {
+    const link = await invoke<string>('share_host_invite')
+    if (session.value === current && panel.value === 'invite') shareLink.value = link
+  } catch (reason) {
+    if (session.value === current && panel.value === 'invite') error.value = String(reason)
+  }
+}
 async function copyInvite() {
-  if (!session.value?.invite) return
-  try { await navigator.clipboard.writeText(session.value.invite); inform('邀请链接已复制'); panel.value = '' }
+  if (!shareLink.value) return
+  try { await navigator.clipboard.writeText(shareLink.value); inform('邀请链接已复制'); panel.value = '' }
   catch { openPanel('invite'); await nextTick(); copyInput.value?.select(); error.value = '请按 Ctrl+C 复制已选中的邀请链接。' }
 }
 async function mute() {
@@ -129,6 +147,7 @@ function dismissBanner() {
 }
 watch(() => snapshot.value?.channelId, () => { showPeople.value = false })
 watch(() => session.value?.invite, link => {
+  shareLink.value = ''
   if (link && link !== draftLobby) { drafts.value = {}; draftLobby = link }
 })
 watch(offline, message => {
@@ -152,7 +171,7 @@ watch(offline, message => {
         <div v-if="!navChannels.length" class="nav-hint">{{ !connected && loadingChannels ? '正在读取频道…' : !connected && channelsError ? '频道读取失败' : '暂无频道' }}</div>
         <div v-for="c in navChannels" :key="c.id" class="channel-row" :class="{ selected: active?.id === c.id }">
           <button class="nav-item" :disabled="busy" :aria-current="active?.id === c.id" @click="joinChannel(c.id)">
-            <Volume2 /><span>{{ c.name }}</span><small v-if="snapshot">{{ snapshot.members.filter(m => m.channelId === c.id).length }}</small></button>
+            <Volume2 /><span>{{ c.name }}</span><small v-if="joiningChannel === c.id" role="status">正在加入…</small><small v-else-if="snapshot">{{ snapshot.members.filter(m => m.channelId === c.id).length }}</small></button>
           <button v-if="c.canDelete" class="delete-channel icon-button" :aria-label="'删除' + c.name" :title="'删除' + c.name" @click="askDelete(c)"><Trash2 /></button>
         </div>
       </nav>
@@ -190,14 +209,14 @@ watch(offline, message => {
           <div v-if="channelsError" class="local-list-error" role="alert"><span>{{ channelsError }}</span><button class="button" @click="refreshLocalChannels">重新读取</button></div>
           <div v-else-if="loadingChannels && !localChannels.length" class="overview-empty" role="status">正在读取频道…</div>
           <div v-else-if="localChannels.length" class="room-list"><button v-for="c in localChannels" :key="c.id" :disabled="busy || !ready" @click="joinChannel(c.id)">
-            <span class="list-icon"><Volume2 /></span><b>{{ c.name }}</b><ArrowDownLeft /></button></div>
+            <span class="list-icon"><Volume2 /></span><b>{{ c.name }}</b><small v-if="joiningChannel === c.id" role="status">正在加入…</small><ArrowDownLeft v-else /></button></div>
           <div v-else class="overview-empty"><span class="empty-icon"><AudioLines /></span><h3>还没有语音频道</h3><p>创建第一个频道，邀请队友一起玩。</p></div>
         </section>
       </div></div>
       <template v-else>
         <header class="room-header"><span class="room-icon"><component :is="active ? Volume2 : Radio" /></span>
           <div><h1>{{ heading }}</h1><p>{{ active ? '语音频道' : (session?.isHost ? '由你主持的语音大厅' : '语音大厅') }}</p></div>
-          <button class="button primary invite-button" :disabled="!session?.invite" @click="openPanel('invite')"><UserRoundPlus /> 邀请好友</button>
+          <button class="button primary invite-button" :disabled="!session" @click="openShare"><UserRoundPlus /> 邀请好友</button>
         </header>
         <div v-if="snapshot" class="workspace" :class="{ 'people-open': showPeople }">
           <Chat v-if="active" :channel="active" :snapshot="snapshot" :audio="preferences?.audio" :voice-label="voiceLabel" :in-voice="inVoice"
@@ -230,9 +249,9 @@ watch(offline, message => {
         <footer class="dialog-actions"><button class="button" type="button" :disabled="busy" @click="closePanel">取消</button><button class="button primary" :disabled="!ready || busy || !invite.trim()">{{ busy ? '正在连接…' : '加入大厅' }}</button></footer>
       </form>
       <div v-if="panel === 'invite'"><p class="dialog-desc">将邀请链接发给好友，即可加入这个大厅。</p>
-        <label class="field">大厅邀请链接<input ref="copyInput" :value="session?.invite" readonly @focus="copyInput?.select()" /></label>
+        <label class="field">大厅邀请链接<input ref="copyInput" :value="shareLink" :placeholder="error ? '' : '正在准备邀请链接…'" readonly @focus="copyInput?.select()" /></label>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
-        <footer class="dialog-actions"><button class="button primary" @click="copyInvite"><Copy /> 复制链接</button></footer>
+        <footer class="dialog-actions"><button class="button primary" :disabled="!shareLink" @click="copyInvite"><Copy /> 复制链接</button></footer>
       </div>
       <form v-if="panel === 'create'" @submit.prevent="createChannel"><label class="field">频道名称<input v-model.trim="channelName" required maxlength="40" placeholder="例如 排位一队" /></label>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>

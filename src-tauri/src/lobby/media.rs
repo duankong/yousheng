@@ -313,13 +313,11 @@ async fn bridge(
                 frame = up.next() => {
                     let frame = match frame {
                         Some(Ok(Frame::Binary(v))) => {
-                            if let Some(addr) = playback {
-                                match crate::ice::redirect(&v, addr) {
-                                    Ok(Some(bytes)) => Message::Binary(bytes.into()),
-                                    Ok(None) => continue,
-                                    Err(_) => break,
-                                }
-                            } else { Message::Binary(v) }
+                            match crate::ice::local_signal(&v, playback) {
+                                Ok(Some(bytes)) => Message::Binary(bytes.into()),
+                                Ok(None) => continue,
+                                Err(_) => break,
+                            }
                         }
                         Some(Ok(Frame::Text(v))) => Message::Text(v.to_string().into()),
                         Some(Ok(Frame::Ping(_) | Frame::Pong(_))) => continue,

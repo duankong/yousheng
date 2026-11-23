@@ -1,5 +1,5 @@
-//! Keep DTLS, ICE credentials and audio intact. Only substitute the address of
-//! our UDP forwarder for the SFU's single UDP-mux candidate on remote clients.
+//! WebRTC connects to the local SFU or guest UDP forwarder. Iroh handles the
+//! internet hop, so neither WebRTC endpoint needs public STUN/TURN discovery.
 use livekit_protocol::{signal_response::Message, SignalResponse};
 use prost::Message as _;
 use std::net::SocketAddrV4;
@@ -24,10 +24,15 @@ fn candidate(line: &str, target: SocketAddrV4) -> Option<String> {
     Some(fields.join(" "))
 }
 
-pub fn redirect(bytes: &[u8], target: SocketAddrV4) -> Result<Option<Vec<u8>>, String> {
+pub fn local_signal(bytes: &[u8], target: Option<SocketAddrV4>) -> Result<Option<Vec<u8>>, String> {
     let mut signal = SignalResponse::decode(bytes).map_err(|e| e.to_string())?;
     match &mut signal.message {
+        Some(Message::Join(join)) => join.ice_servers.clear(),
+        Some(Message::Reconnect(reconnect)) => reconnect.ice_servers.clear(),
         Some(Message::Offer(desc) | Message::Answer(desc)) => {
+            let Some(target) = target else {
+                return Ok(Some(bytes.to_vec()));
+            };
             let mut lines = Vec::new();
             for line in desc.sdp.lines() {
                 if let Some(raw) = line.strip_prefix("a=candidate:") {
@@ -41,6 +46,9 @@ pub fn redirect(bytes: &[u8], target: SocketAddrV4) -> Result<Option<Vec<u8>>, S
             desc.sdp = lines.join("\r\n") + "\r\n";
         }
         Some(Message::Trickle(trickle)) if !trickle.candidate_init.is_empty() => {
+            let Some(target) = target else {
+                return Ok(Some(bytes.to_vec()));
+            };
             let mut json: serde_json::Value =
                 serde_json::from_str(&trickle.candidate_init).map_err(|e| e.to_string())?;
             if let Some(line) = json["candidate"].as_str().filter(|s| !s.is_empty()) {
@@ -61,6 +69,7 @@ mod tests {
     use super::*;
     #[test]
     fn drops_unreachable_tcp_trickle_and_preserves_end_of_candidates() {
+        assert!(local_signal(&[0xff], None).is_err());
         let target = "127.0.0.1:5000".parse().unwrap();
         let encode = |line: &str| {
             SignalResponse {
@@ -72,14 +81,46 @@ mod tests {
             }
             .encode_to_vec()
         };
-        assert!(redirect(
+        assert!(local_signal(
             &encode("candidate:2 1 tcp 1 192.0.2.5 7881 typ host"),
-            target
+            Some(target)
         )
         .unwrap()
         .is_none());
         let end = encode("");
-        assert_eq!(redirect(&end, target).unwrap(), Some(end));
+        assert_eq!(local_signal(&end, Some(target)).unwrap(), Some(end));
+    }
+
+    #[test]
+    fn local_media_does_not_contact_public_stun_on_join_or_reconnect() {
+        let servers = vec![livekit_protocol::IceServer {
+            urls: vec!["stun:example.invalid".into()],
+            ..Default::default()
+        }];
+        for message in [
+            Message::Join(livekit_protocol::JoinResponse {
+                ice_servers: servers.clone(),
+                ..Default::default()
+            }),
+            Message::Reconnect(livekit_protocol::ReconnectResponse {
+                ice_servers: servers.clone(),
+                ..Default::default()
+            }),
+        ] {
+            let data = SignalResponse {
+                message: Some(message),
+            }
+            .encode_to_vec();
+            for target in [None, Some("127.0.0.1:4000".parse().unwrap())] {
+                let filtered = local_signal(&data, target).unwrap().unwrap();
+                let signal = SignalResponse::decode(filtered.as_slice()).unwrap();
+                match signal.message.unwrap() {
+                    Message::Join(join) => assert!(join.ice_servers.is_empty()),
+                    Message::Reconnect(reconnect) => assert!(reconnect.ice_servers.is_empty()),
+                    _ => panic!("unexpected signal"),
+                }
+            }
+        }
     }
     #[test]
     fn rewrites_only_udp_address_and_preserves_ice_metadata() {

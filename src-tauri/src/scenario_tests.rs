@@ -328,7 +328,12 @@ async fn two_clients() -> Result<()> {
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
     let host = Host::start(&host_profile, &binary).await?;
     let scenario = async {
-        let invite = Ticket::parse(&host.invite)?;
+        let invite = Ticket::parse(
+            &host
+                .overlay
+                .share_invite(host_profile.invite_key.clone())
+                .await?,
+        )?;
         let guest = GuestEndpoint::start(&invite).await?;
         let result = exercise(&host, &guest, &guest_profile, &invite.key).await.and_then(|()| {
             let route = guest.selected_transport().ok_or("iroh has no selected path")?;

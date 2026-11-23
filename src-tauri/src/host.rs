@@ -65,7 +65,10 @@ impl Host {
         // Keep the admin endpoint private. WebRTC authenticates the separate ICE/UDP port.
         // Clients initiate ICE toward a locally reachable UDP endpoint. The SFU
         // must not select a direct return route to a guest on the same LAN.
-        let config = format!("port: {signaling}\nbind_addresses: [127.0.0.1]\nrtc:\n  node_ip: {media_ip}\n  use_external_ip: false\n  use_ice_lite: true\n  udp_port: {media_port}\n  tcp_port: 0\n  enable_loopback_candidate: true\nkeys:\n  {api_key}: {api_secret}\n");
+        // LiveKit rewrites every interface's ICE address to node_ip. Select its
+        // matching UDP socket too, so a loopback or VPN socket cannot advertise
+        // the same address as the socket the local client and tunnel reach.
+        let config = format!("port: {signaling}\nbind_addresses: [127.0.0.1]\nrtc:\n  node_ip: {media_ip}\n  ips:\n    includes: [{media_ip}/32]\n  use_external_ip: false\n  use_ice_lite: true\n  udp_port: {media_port}\n  tcp_port: 0\n  enable_loopback_candidate: {}\nkeys:\n  {api_key}: {api_secret}\n", media_ip.is_loopback());
         let mut cmd = Command::new(executable);
         cmd.env("LIVEKIT_CONFIG", &config)
             .kill_on_drop(true)

@@ -64,7 +64,7 @@ async fn tunnel_exchange() -> Result<(), String> {
     )
     .await?;
     let verify = async {
-        let invite = host.invite(&key)?;
+        let invite = host.share_invite(key.clone()).await?;
         let mut bad = Ticket::parse(&invite)?;
         bad.key = "b".repeat(64);
         if let Ok(unexpected) = GuestEndpoint::start(&bad).await {

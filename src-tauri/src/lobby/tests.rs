@@ -412,8 +412,11 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
     let (mut signal, _) = connect_async(format!("ws://{addr}/rtc/v1?access_token={ticket}"))
         .await
         .unwrap();
+    let frame = prost::Message::encode_to_vec(&livekit_protocol::SignalResponse {
+        message: Some(livekit_protocol::signal_response::Message::Pong(42)),
+    });
     signal
-        .send(Frame::Binary(b"media signaling".as_slice().to_vec().into()))
+        .send(Frame::Binary(frame.clone().into()))
         .await
         .unwrap();
     assert_eq!(
@@ -423,7 +426,7 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
             .unwrap()
             .unwrap()
             .into_data(),
-        &b"media signaling"[..]
+        frame
     );
     ws.send(Frame::Text(json!({"type":"leave"}).to_string().into()))
         .await

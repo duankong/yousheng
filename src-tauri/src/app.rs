@@ -112,6 +112,20 @@ async fn host_lobby(
 }
 
 #[tauri::command]
+async fn share_host_invite(state: State<'_, Desktop>) -> Result<String, String> {
+    let key = state.profile.lock().await.invite_key.clone();
+    let invite = {
+        let slot = state.session.lock().await;
+        let host = slot
+            .as_ref()
+            .and_then(|s| s.host.as_ref())
+            .ok_or("本机大厅已关闭")?;
+        host.overlay.share_invite(key)
+    };
+    invite.await
+}
+
+#[tauri::command]
 async fn join_lobby(
     app: AppHandle,
     state: State<'_, Desktop>,
@@ -404,6 +418,7 @@ pub fn run() {
             set_profile,
             list_local_channels,
             host_lobby,
+            share_host_invite,
             join_lobby,
             leave_lobby,
             lobby_action,

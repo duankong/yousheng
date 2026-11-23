@@ -54,14 +54,9 @@ impl Client {
                     let result = tokio::select! {
                         biased;
                         update=wanted.changed()=>{changed=update; continue;},
-                        result=timeout(Duration::from_secs(18),voice.connect(&base,&token))=>result,
+                        result=voice.connect(&base,&token)=>result,
                     };
-                    let failure = match result {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e),
-                        Err(_) => Some("语音连接超时".into()),
-                    };
-                    if let Some(message) = failure {
+                    if let Err(message) = result {
                         let _ = voice_app
                             .emit("voice-status", json!({"state":"error","message":message}));
                     }

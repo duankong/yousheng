@@ -146,13 +146,6 @@ impl HostEndpoint {
             .bind()
             .await
             .map_err(err)?;
-        if force_relay() {
-            timeout(Duration::from_secs(12), ep.online())
-                .await
-                .map_err(|_| "强制中转模式无法连接公共中转服务".to_string())?;
-        } else {
-            let _ = timeout(Duration::from_secs(2), ep.online()).await;
-        }
         let endpoint = ep.clone();
         let accept = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -173,9 +166,30 @@ impl HostEndpoint {
         self.ep.id().to_string()
     }
     pub fn invite(&self, key: &str) -> Result<String> {
+        Self::encode_invite(self.ep.addr(), key)
+    }
+    // Only sharing an invitation needs internet relay discovery. A host can
+    // enter a local channel as soon as its endpoint and the voice server bind.
+    pub fn share_invite(
+        &self,
+        key: String,
+    ) -> impl std::future::Future<Output = Result<String>> + 'static {
+        let ep = self.ep.clone();
+        async move {
+            if force_relay() {
+                timeout(Duration::from_secs(12), ep.online())
+                    .await
+                    .map_err(|_| "强制中转模式无法连接公共中转服务".to_string())?;
+            } else {
+                let _ = timeout(Duration::from_secs(2), ep.online()).await;
+            }
+            Self::encode_invite(ep.addr(), &key)
+        }
+    }
+    fn encode_invite(address: EndpointAddr, key: &str) -> Result<String> {
         let direct = format!(
             "{PREFIX}{}#{key}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&self.ep.addr()).map_err(err)?)
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&address).map_err(err)?)
         );
         if let Some(base) = option_env!("DUIPIN_INVITE_BASE").filter(|v| !v.is_empty()) {
             let mut url = url::Url::parse(base).map_err(err)?;
