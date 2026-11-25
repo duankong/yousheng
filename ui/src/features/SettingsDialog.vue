@@ -28,7 +28,7 @@ function toggleUpdates(event: Event) {
     <AudioSettingsView v-show="tab === 'audio'" :visible="tab === 'audio'" :audio="audio" :level="level" :speaking="speaking" :connected="connected"
       @close="emit('close')" @saved="emit('saved', $event)" @saving="savingAudio = $event" />
     <section v-if="tab === 'updates'" class="settings-section update-settings">
-      <p class="section-description">当前版本 {{ version }}</p>
+      <p class="section-description">友声 GroveCall · 当前版本 {{ version }}</p>
       <label class="switch-row">启动时自动检查更新<input type="checkbox" role="switch" :checked="updater.enabled" :disabled="locked" @change="toggleUpdates" /></label>
       <p class="section-description">从 GitHub 获取新版本，安装前会询问你。</p>
       <div v-if="updater.available" class="update-version">

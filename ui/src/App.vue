@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Activity, ArrowDownLeft, AudioLines, AudioWaveform, ChevronRight, CircleAlert, Clipboard, Copy, House, Link2, LogOut, Menu, Plus, Radio, Settings2, Trash2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
+import { Activity, ArrowDownLeft, AudioLines, ChevronRight, CircleAlert, Clipboard, Copy, House, Link2, LogOut, Menu, Plus, Radio, Settings2, Trash2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
 import SettingsDialog from './features/SettingsDialog.vue'
@@ -159,7 +159,9 @@ watch(offline, message => {
   <div class="app-shell">
     <div v-if="drawer" class="drawer-scrim" @click="drawer = false"></div>
     <aside class="sidebar" :class="{ expanded: drawer }">
-      <div class="brand"><span class="brand-mark"><AudioWaveform /></span><strong>友声</strong>
+      <div class="brand">
+        <img class="brand-mark" src="/grovecall.png" width="42" height="42" alt="" />
+        <div><strong>友声</strong><small>GroveCall</small></div>
         <button v-if="drawer" class="icon-button close-drawer" aria-label="关闭导航" @click="drawer = false"><X /></button>
       </div>
       <nav class="navigation" aria-label="大厅导航">

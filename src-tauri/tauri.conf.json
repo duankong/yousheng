@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "友声",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "app.duipin.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -10,17 +10,18 @@
     "frontendDist": "../ui/dist"
   },
   "app": {
-    "windows": [{"label":"main","title":"友声","width":1150,"height":760,"minWidth":760,"minHeight":540}],
+    "windows": [{"label":"main","title":"友声 GroveCall","width":1150,"height":760,"minWidth":760,"minHeight":540}],
     "security": {"csp":"default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'"}
   },
   "bundle": {
     "active": true,
+    "homepage": "https://github.com/duankong/yousheng",
     "createUpdaterArtifacts": true,
     "useLocalToolsDir": true,
     "targets": ["nsis"],
     "icon": ["icons/app.ico"],
     "resources": ["resources/livekit-server.exe","resources/livekit-LICENSE.txt","resources/*-NOTICES.*"],
-    "windows": {"nsis":{"languages":["SimpChinese","English"],"installMode":"currentUser"}}
+    "windows": {"nsis":{"languages":["SimpChinese","English"],"installMode":"currentUser","installerIcon":"icons/app.ico","uninstallerIcon":"icons/app.ico","installerHooks":"installer-hooks.nsh"}}
   },
   "plugins": {
     "deep-link": {"desktop":{"schemes":["duipin"]}},
