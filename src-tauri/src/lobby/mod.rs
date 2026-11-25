@@ -16,12 +16,7 @@ use media::Media;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{watch, Mutex},
     time::{interval_at, timeout, Instant},
@@ -72,8 +67,8 @@ struct Core {
     chat: Chat,
     members: BTreeMap<String, Member>,
     avatar_revision: u64,
-    // A participant cannot re-enter this same room until its previous removal is acknowledged.
-    pending: HashSet<(String, String)>,
+    // Removing a sender on SFU acknowledgement wakes joins waiting for this player and room.
+    pending: BTreeMap<(String, String), watch::Sender<()>>,
 }
 
 fn player_id(secret: &str) -> Result<String, &'static str> {
@@ -101,7 +96,7 @@ pub fn router_with_shutdown(config: Config, stop: watch::Receiver<bool>) -> Resu
             chat: Chat::default(),
             members: BTreeMap::new(),
             avatar_revision: 0,
-            pending: HashSet::new(),
+            pending: BTreeMap::new(),
         })),
         media,
         stop,
@@ -257,7 +252,7 @@ impl Core {
             }
             Op::Join { channel_id } => {
                 self.channels.find(&channel_id)?;
-                if self.pending.contains(&(channel_id.clone(), id.into())) {
+                if self.pending.contains_key(&(channel_id.clone(), id.into())) {
                     return Err("上一次通话正在结束，请稍后重试");
                 }
                 let member = self.members.get_mut(id).unwrap();
@@ -389,11 +384,23 @@ async fn socket(mut ws: WebSocket, state: Shared) {
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                     _ => break,
                 };
-                let mut core = state.core.lock().await;
-                if !core.active(&id, session) { break; }
                 let request = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
                 let request_id = request.get("requestId").and_then(Value::as_u64);
-                let result = serde_json::from_value(request).map_err(|_| "不支持的大厅操作").and_then(|op| {
+                let op = serde_json::from_value::<Op>(request).map_err(|_| "不支持的大厅操作");
+                let mut core = state.core.lock().await;
+                if let Ok(Op::Join { channel_id }) = &op {
+                    let pending = core.pending.get(&(channel_id.clone(), id.clone()));
+                    if let Some(mut cleared) = pending.map(watch::Sender::subscribe) {
+                        drop(core);
+                        tokio::select! {
+                            _ = stop.changed() => break,
+                            _ = timeout(Duration::from_secs(3), cleared.changed()) => (),
+                        }
+                        core = state.core.lock().await;
+                    }
+                }
+                if *stop.borrow() || !core.active(&id, session) { break; }
+                let result = op.and_then(|op| {
                     let retry_voice = matches!(&op, Op::Join { .. });
                     let cleanup = core.apply(&id, op)?;
                     if retry_voice { sent_epoch = None; }

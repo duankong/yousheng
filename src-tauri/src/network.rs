@@ -399,7 +399,13 @@ impl GuestEndpoint {
                 tokio::select! {
                     _=expire.tick()=>senders.expire(),
                     received=udp.recv_from(&mut buf)=>{
-                        let Ok((n,source))=received else{break};
+                        let (n, source) = match received {
+                            Ok(packet) => packet,
+                            // A late packet to a closed WebRTC port can report a peer
+                            // error on this shared socket's next receive (WSAECONNRESET).
+                            Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) => continue,
+                            Err(_) => break,
+                        };
                         if !matches!(source,SocketAddr::V4(v) if *v.ip()==ip || v.ip().is_loopback()) {continue}
                         senders.insert(source.port(),source);
                         if send_packet(&media_conn,source.port(),&buf[..n]).await.is_err(){break}

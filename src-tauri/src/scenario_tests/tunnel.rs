@@ -90,7 +90,7 @@ async fn tunnel_exchange() -> Result<(), String> {
             if &reply != b"reply" {
                 return Err("TCP response changed in transit".to_string());
             }
-            let sender = UdpSocket::bind((*guest.media.ip(), 0)).await.map_err(err)?;
+            let mut sender = UdpSocket::bind((*guest.media.ip(), 0)).await.map_err(err)?;
             // 32 KiB exceeds the locally negotiated QUIC datagram MTU and exercises the
             // unidirectional-stream fallback in both directions. Distinct replies prove routing.
             for size in [80, 32 * 1024] {
@@ -116,6 +116,12 @@ async fn tunnel_exchange() -> Result<(), String> {
                 };
                 if !buffer[..n].iter().eq(packet.iter().rev()) {
                     return Err(format!("UDP {size} response changed in transit"));
+                }
+                if size == 80 {
+                    // WebRTC opens new ports on rejoin. A delayed SFU packet to the
+                    // closed port must not stop the tunnel serving the next sender.
+                    sender = UdpSocket::bind((*guest.media.ip(), 0)).await.map_err(err)?;
+                    udp.send_to(b"late media", upstream).await.map_err(err)?;
                 }
             }
             let route = guest

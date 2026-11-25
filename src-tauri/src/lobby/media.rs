@@ -12,6 +12,7 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::btree_map::Entry,
     net::SocketAddrV4,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -159,9 +160,10 @@ pub(super) fn cleanup(state: &Shared, core: &mut Core, job: Cleanup) {
         Cleanup::None => return,
         Cleanup::Participant(room, id) => {
             let key = (room.clone(), id.clone());
-            if !core.pending.insert(key.clone()) {
+            let Entry::Vacant(removal) = core.pending.entry(key.clone()) else {
                 return;
-            }
+            };
+            removal.insert(watch::channel(()).0);
             Some(key)
         }
         Cleanup::Room(_) => None,

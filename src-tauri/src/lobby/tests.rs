@@ -13,7 +13,7 @@ fn core(path: &Path) -> Core {
         chat: Chat::default(),
         members: BTreeMap::new(),
         avatar_revision: 0,
-        pending: HashSet::new(),
+        pending: BTreeMap::new(),
     }
 }
 
@@ -343,7 +343,9 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
                         .to_str()
                         .unwrap()
                         .starts_with("Bearer "));
-                    tx.send(body).await.unwrap();
+                    let (ack, wait) = tokio::sync::oneshot::channel();
+                    tx.send((body, ack)).await.unwrap();
+                    let _ = wait.await;
                     Json(json!({}))
                 }
             }),
@@ -432,7 +434,7 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
         .await
         .unwrap();
     assert_eq!(read(&mut ws).await["channelId"], Value::Null);
-    let removal = timeout(Duration::from_secs(2), kicks.recv())
+    let (removal, ack) = timeout(Duration::from_secs(2), kicks.recv())
         .await
         .unwrap()
         .unwrap();
@@ -450,26 +452,23 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
             .status(),
         403
     );
-    // The same player can return once the private remove call completes. A ticket from
-    // that player's earlier stay must still fail even though the room and identity match.
-    timeout(Duration::from_secs(3), async {
-        loop {
-            ws.send(Frame::Text(
-                json!({"type":"join","channelId":room}).to_string().into(),
-            ))
-            .await
-            .unwrap();
-            let event = read(&mut ws).await;
-            if event["type"] == "snapshot" {
-                assert_eq!(event["channelId"], room);
-                break;
-            }
-            assert_eq!(event["type"], "error");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    // A single rejoin waits for the private removal; the previous ticket stays revoked.
+    ws.send(Frame::Text(
+        json!({"type":"join","channelId":room,"requestId":43})
+            .to_string()
+            .into(),
+    ))
     .await
     .unwrap();
+    assert!(timeout(Duration::from_millis(120), ws.next())
+        .await
+        .is_err());
+    ack.send(()).unwrap();
+    assert_eq!(
+        read(&mut ws).await,
+        json!({"type":"result","requestId":43,"error":null})
+    );
+    assert_eq!(read(&mut ws).await["channelId"], room);
     let fresh = read(&mut ws).await;
     assert_eq!(
         http.get(&endpoint)

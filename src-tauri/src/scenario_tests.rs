@@ -89,7 +89,7 @@ async fn ticket(ws: &mut Socket, room: &str) -> Result<String> {
         .into())
 }
 
-async fn keep_alive(mut ws: Socket) {
+async fn keep_alive(ws: &mut Socket) {
     while let Some(Ok(message)) = ws.next().await {
         match message {
             Message::Ping(p) => {
@@ -259,60 +259,67 @@ async fn exercise(
     let state = event(&mut sender_ws, |v| v["channels"][0]["name"] == "PCM").await?;
     let room = state["channels"][0]["id"].as_str().ok_or("no room id")?;
     let pub_token = ticket(&mut sender_ws, room).await?;
-    let sub_token = ticket(&mut receiver_ws, room).await?;
-
-    let audio = async {
-        let (publisher, mut host_events, host_mic) =
-            join_microphone(&format!("ws://127.0.0.1:{}", host.gateway), &pub_token)
-                .await
-                .map_err(|e| format!("host LiveKit join: {e}"))?;
-        let (receiver, mut guest_events, guest_mic) =
-            match join_microphone(&format!("ws://127.0.0.1:{}", guest.gateway), &sub_token).await {
-                Ok(joined) => joined,
-                Err(e) => {
-                    let _ = publisher.close().await;
-                    return Err(format!("guest LiveKit join through iroh: {e}"));
-                }
-            };
-        let listen = async {
-            tokio::try_join!(
-                hear_tone(&mut guest_events, &sender_id, 1000.),
-                hear_tone(&mut host_events, &guest_id, 1700.),
-            )?;
-            // WebRTC may reuse a cached stats snapshot for a short interval.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let stats = receiver.get_stats().await.map_err(err)?;
-                let subscriber_ok = selected_proxy(&stats.subscriber_stats, guest.media, false);
-                let publisher_ok = selected_proxy(&stats.publisher_stats, guest.media, true);
-                if subscriber_ok && publisher_ok {
-                    println!(
-                        "guest UDP proxy {} confirmed on sending and receiving ICE transports",
-                        guest.media
-                    );
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(format!("decoded both tones; guest forwarder {}, iroh {:?}, subscriber {subscriber_ok}, publisher {publisher_ok}\nsubscriber stats: {}\npublisher stats: {}",
+    let (publisher, mut host_events, host_mic) =
+        join_microphone(&format!("ws://127.0.0.1:{}", host.gateway), &pub_token)
+            .await
+            .map_err(|e| format!("host LiveKit join: {e}"))?;
+    let calls = async {
+        // Keep the host in voice and the guest logged into the same lobby and tunnel.
+        // A different guest tone after rejoining rules out decoded audio from the old call.
+        for (attempt, guest_hz) in [("initial join", 1700.), ("same-channel rejoin", 2300.)] {
+            let token = ticket(&mut receiver_ws, room).await?;
+            let (receiver, mut guest_events, guest_mic) =
+                join_microphone(&format!("ws://127.0.0.1:{}", guest.gateway), &token)
+                    .await
+                    .map_err(|e| format!("guest {attempt} through iroh: {e}"))?;
+            let listen = async {
+                tokio::try_join!(
+                    hear_tone(&mut guest_events, &sender_id, 1000.),
+                    hear_tone(&mut host_events, &guest_id, guest_hz),
+                )?;
+                // WebRTC may reuse a cached stats snapshot for a short interval.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let stats = receiver.get_stats().await.map_err(err)?;
+                    let subscriber_ok = selected_proxy(&stats.subscriber_stats, guest.media, false);
+                    let publisher_ok = selected_proxy(&stats.publisher_stats, guest.media, true);
+                    if subscriber_ok && publisher_ok {
+                        println!(
+                            "guest UDP proxy {} confirmed on sending and receiving ICE transports",
+                            guest.media
+                        );
+                        return Ok(());
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(format!("decoded both tones; guest forwarder {}, iroh {:?}, subscriber {subscriber_ok}, publisher {publisher_ok}\nsubscriber stats: {}\npublisher stats: {}",
                         guest.media, guest.selected_transport(), describe_routes(&stats.subscriber_stats),
                         describe_routes(&stats.publisher_stats)));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        };
-        let result = tokio::select! {
-            r = feed_tone(&host_mic, 1000.) => r,
-            r = feed_tone(&guest_mic, 1700.) => r,
-            r = listen => r,
-        };
-        let _ = tokio::join!(publisher.close(), receiver.close());
-        result
+            };
+            let result = tokio::select! {
+                _ = keep_alive(&mut receiver_ws) => Err("guest lobby socket disconnected".into()),
+                r = feed_tone(&guest_mic, guest_hz) => r,
+                r = listen => r,
+            };
+            result.map_err(|e| format!("{attempt}: {e}"))?;
+            send(&mut receiver_ws, json!({"type":"leave"})).await?;
+            event(&mut receiver_ws, |v| {
+                v["type"] == "snapshot" && v["channelId"].is_null()
+            })
+            .await?;
+            let _ = receiver.close().await;
+        }
+        Ok(())
     };
-    tokio::select! {
-        _ = keep_alive(sender_ws) => Err("host lobby socket disconnected".into()),
-        _ = keep_alive(receiver_ws) => Err("guest lobby socket disconnected".into()),
-        r = timeout(Duration::from_secs(60),audio) => r.map_err(|_| "timed out waiting for LiveKit/decoded tone/selected ICE path".to_string())?,
-    }
+    let result = tokio::select! {
+        _ = keep_alive(&mut sender_ws) => Err("host lobby socket disconnected".into()),
+        r = feed_tone(&host_mic, 1000.) => r,
+        r = timeout(Duration::from_secs(90), calls) => r.unwrap_or_else(|_| Err("timed out waiting for LiveKit/decoded tone/selected ICE path".into())),
+    };
+    let _ = publisher.close().await;
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -340,7 +347,7 @@ async fn two_clients() -> Result<()> {
             if tunnel::expect_relay() && route != "relay" {
                 return Err(format!("expected relay; iroh selected {route}"));
             }
-            println!("verified 1 kHz host and 1.7 kHz guest PCM in both directions through selected iroh {route} path");
+            println!("verified two-way PCM on first join and same-channel rejoin through selected iroh {route} path");
             Ok(())
         });
         guest.close().await;
