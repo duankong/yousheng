@@ -221,7 +221,7 @@ watch(offline, message => {
         <div v-if="snapshot" class="workspace" :class="{ 'people-open': showPeople }">
           <Chat v-if="active" :channel="active" :snapshot="snapshot" :audio="preferences?.audio" :voice-label="voiceLabel" :in-voice="inVoice"
             :drafts="drafts" @draft="(id, text) => { drafts[id] = text }"
-            :can-retry-voice="['error', 'failed', 'disconnected'].includes(voice.state)" :busy="busy"
+            :can-retry-voice="['device-error', 'error', 'failed', 'disconnected'].includes(voice.state)" :busy="busy"
             @retry="action({ type: 'join', channelId: active.id })" @mute="mute" @settings="openPanel('audio')" @edit-profile="openPanel('profile')" @leave="action({ type: 'leave' })" @error="error = $event" />
           <section v-else class="lobby-overview"><div class="overview-title"><h2>语音频道</h2>
               <button class="button" @click="openPanel('create')"><Plus /> 创建频道</button></div>

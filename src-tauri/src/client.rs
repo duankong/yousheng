@@ -44,21 +44,16 @@ impl Client {
         let _ = app.emit("lobby-event", &initial);
         let (commands, mut outgoing) = mpsc::channel::<(Value, Reply)>(64);
         let (target, mut wanted) = watch::channel::<Option<String>>(None);
-        let voice_app = app.clone();
         let audio = tokio::spawn(async move {
             let mut changed = wanted.changed().await;
             while changed.is_ok() {
                 let token = wanted.borrow_and_update().clone();
                 voice.disconnect().await;
                 if let Some(token) = token {
-                    let result = tokio::select! {
+                    tokio::select! {
                         biased;
                         update=wanted.changed()=>{changed=update; continue;},
-                        result=voice.connect(&base,&token)=>result,
-                    };
-                    if let Err(message) = result {
-                        let _ = voice_app
-                            .emit("voice-status", json!({"state":"error","message":message}));
+                        ()=voice.connect(&base,&token)=>{},
                     }
                 }
                 changed = wanted.changed().await;

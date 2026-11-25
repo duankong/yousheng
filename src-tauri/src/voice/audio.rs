@@ -74,15 +74,15 @@ fn latency(delay: Option<Duration>) -> i32 {
 
 type ErrorCallback = Box<dyn FnMut(cpal::StreamError) + Send>;
 
-fn error_handler(app: &AppHandle, failed: &Arc<AtomicBool>) -> ErrorCallback {
+fn error_handler(app: &AppHandle, failed: &Arc<AtomicBool>, device: &'static str) -> ErrorCallback {
     let app = app.clone();
     let failed = failed.clone();
     Box::new(move |e| {
         if !failed.swap(true, Ordering::Relaxed) {
             status(
                 &app,
-                "error",
-                Some(&format!("音频设备已停止：{e}，请在声音设置中重新选择设备")),
+                "device-error",
+                Some(&format!("{device}已停止：{e}，请在声音设置中重新选择设备")),
             );
         }
     })
@@ -170,8 +170,8 @@ macro_rules! build_stream {
             SampleFormat::I32 => $build::<i32>($($arg),+),
             SampleFormat::I64 => $build::<i64>($($arg),+),
             SampleFormat::U8 => $build::<u8>($($arg),+),
-            format => return Err(format!("不支持设备的采样格式 {format}")),
-        }.map_err(|error| error.to_string())?
+            _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+        }
     };
 }
 
@@ -189,35 +189,33 @@ impl AudioIo {
         source: Option<NativeAudioSource>,
     ) -> Result<Self, String> {
         let input = devices::select(&prefs.input_device, true)?;
-        let infmt = input
-            .default_input_config()
-            .map_err(|e| format!("无法读取麦克风的采样格式：{e}"))?;
         let failed = Arc::new(AtomicBool::new(false));
         let (input_tx, input_rx) = mpsc::channel(5);
         let (reference_tx, reference_rx) = mpsc::channel(8);
-        let input = build_stream!(
-            infmt.sample_format(),
-            capture,
-            &input,
-            &infmt.config(),
-            input_tx,
-            error_handler(app, &failed)
-        );
+        let input = devices::open_stream(&input, true, |format| {
+            build_stream!(
+                format.sample_format(),
+                capture,
+                &input,
+                &format.config(),
+                input_tx.clone(),
+                error_handler(app, &failed, "麦克风")
+            )
+        })?;
         let output = if source.is_some() {
             let output = devices::select(&prefs.output_device, false)?;
-            let outfmt = output
-                .default_output_config()
-                .map_err(|e| format!("无法读取播放设备的采样格式：{e}"))?;
-            let stream = build_stream!(
-                outfmt.sample_format(),
-                play,
-                &output,
-                &outfmt.config(),
-                mix,
-                settings.clone(),
-                reference_tx,
-                error_handler(app, &failed)
-            );
+            let stream = devices::open_stream(&output, false, |format| {
+                build_stream!(
+                    format.sample_format(),
+                    play,
+                    &output,
+                    &format.config(),
+                    mix.clone(),
+                    settings.clone(),
+                    reference_tx.clone(),
+                    error_handler(app, &failed, "扬声器")
+                )
+            })?;
             stream
                 .play()
                 .map_err(|e| format!("无法启动播放设备：{e}"))?;
@@ -233,7 +231,7 @@ impl AudioIo {
                 process(&app, settings, pressed, source, input_rx, reference_rx).await
             {
                 fault.store(true, Ordering::Relaxed);
-                status(&app, "error", Some(&error));
+                status(&app, "device-error", Some(&error));
             }
         }));
         Ok(Self {

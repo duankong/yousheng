@@ -179,7 +179,7 @@ impl AudioControls {
             let prefs = self.settings.borrow().clone();
             match self.open_io(&prefs, None) {
                 Ok(input) => preview.input = Some(input),
-                Err(e) => status(&self.app, "error", Some(&e)),
+                Err(e) => status(&self.app, "device-error", Some(&e)),
             }
         }
     }
@@ -231,28 +231,21 @@ impl VoiceEngine {
         }
     }
 
-    pub async fn connect(&self, url: &str, token: &str) -> Result<(), String> {
+    pub async fn connect(&self, url: &str, token: &str) {
         let mut slot = self.session.lock().await;
         if let Some(old) = slot.take() {
             self.stop(old).await;
         }
         self.set_ptt(false);
         status(&self.audio.app, "connecting", None);
-        match self.join(url, token).await {
-            Ok(session) => {
-                *slot = Some(session);
-                Ok(())
-            }
+        let (room, events, source) = match join_microphone(url, token).await {
+            Ok(joined) => joined,
             Err(error) => {
                 silence(&self.audio.app);
                 status(&self.audio.app, "error", Some(&error));
-                Err(error)
+                return;
             }
-        }
-    }
-
-    async fn join(&self, url: &str, token: &str) -> Result<Session, String> {
-        let (room, events, source) = join_microphone(url, token).await?;
+        };
         let settings = self.audio.settings.borrow().clone();
         let audio = match self.audio.open_io(&settings, Some(&source)) {
             Ok(audio) => audio,
@@ -260,7 +253,9 @@ impl VoiceEngine {
                 tokio::spawn(async move {
                     let _ = room.close().await;
                 });
-                return Err(e);
+                silence(&self.audio.app);
+                status(&self.audio.app, "device-error", Some(&e));
+                return;
             }
         };
         self.audio.preview.lock().unwrap().input.take();
@@ -272,12 +267,12 @@ impl VoiceEngine {
             io.clone(),
             source.clone(),
         )));
-        Ok(Session {
+        *slot = Some(Session {
             room,
             source,
             io,
             events,
-        })
+        });
     }
 
     async fn stop(&self, session: Session) {
@@ -345,7 +340,9 @@ impl VoiceEngine {
             }) {
                 let replacement = self.audio.open_io(&settings, Some(&session.source))?;
                 *io = Some(replacement);
-                status(&self.audio.app, "connected", None);
+                if session.room.connection_state() == ConnectionState::Connected {
+                    status(&self.audio.app, "connected", None);
+                }
             }
         }
         let mut preview = self.audio.preview.lock().unwrap();
@@ -519,6 +516,8 @@ async fn room_events(
                     .is_some_and(|audio| !audio.failed())
                 {
                     status(app, "connected", None);
+                } else {
+                    status(app, "device-error", Some("请检查声音设置中的麦克风和播放设备"));
                 }
             }
             RoomEvent::Disconnected { reason: why } => {

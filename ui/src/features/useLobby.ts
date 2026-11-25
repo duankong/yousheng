@@ -23,6 +23,7 @@ export function useLobby(openInvite: (link: string) => void) {
     if (inVoice.value) return '语音已连接'
     if (voice.value.state === 'connecting') return '正在连接语音'
     if (voice.value.state === 'reconnecting') return '语音重新连接中'
+    if (voice.value.state === 'device-error') return '音频设备不可用'
     if (['error', 'failed'].includes(voice.value.state)) return '语音连接失败'
     return '语音未连接'
   })
@@ -93,7 +94,7 @@ export function useLobby(openInvite: (link: string) => void) {
         subscribe<LobbyEvent>('lobby-event', eventReceived),
         subscribe<VoiceStatus>('voice-status', status => {
           voice.value = status
-          if (['error', 'failed', 'disconnected', 'idle'].includes(status.state)) {
+          if (['device-error', 'error', 'failed', 'disconnected', 'idle'].includes(status.state)) {
             speakers.value = []
             level.value = 0
           }
