@@ -118,5 +118,5 @@ async function save() {
 .portrait-actions { display: grid; justify-items: start; gap: 6px; }
 .reset-portrait, .nickname-hint { color: var(--muted); }
 .nickname-hint { display: block; margin-top: -6px; font-size: 12px; }
-.nickname-hint.invalid { color: #a94349; }
+.nickname-hint.invalid { color: var(--danger); }
 </style>

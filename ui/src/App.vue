@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Activity, ArrowDownLeft, AudioLines, ChevronRight, CircleAlert, Clipboard, Copy, House, Link2, LogOut, Menu, Plus, Radio, Settings2, Trash2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
+import { Activity, ArrowRight, AudioLines, ChevronRight, Circle, CircleAlert, Clipboard, Copy, House, Link2, LoaderCircle, LogOut, Menu, Plus, Radio, Settings2, Trash2, Unlink2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
 import SettingsDialog from './features/SettingsDialog.vue'
@@ -21,6 +21,7 @@ const invite = ref('')
 const shareLink = ref('')
 const pendingInvite = ref('')
 const channelName = ref('')
+const channelNameLength = computed(() => Array.from(channelName.value.trim()).length)
 const deletion = ref<LocalChannel>()
 const notice = ref('')
 const muteBusy = ref(false)
@@ -32,6 +33,13 @@ let draftLobby = ''
 const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, action,
   localChannels, loadingChannels, channelsError, refreshLocalChannels } = useLobby(link => { pendingInvite.value = link })
 const connected = computed(() => !!(snapshot.value || session.value))
+const lobbyStatus = computed(() => {
+  if (snapshot.value) return { label: '大厅已连接', icon: Radio, tone: 'live' }
+  if (session.value) return { label: '正在同步', icon: LoaderCircle, tone: 'pending' }
+  if (offline.value) return { label: '大厅已断开', icon: Unlink2, tone: 'idle' }
+  if (busy.value) return { label: '正在连接', icon: LoaderCircle, tone: 'pending' }
+  return { label: '大厅未开启', icon: Circle, tone: 'idle' }
+})
 const installBlocked = computed(() => busy.value || connected.value || inVoice.value || ['connecting', 'reconnecting'].includes(voice.value.state))
 const updater = useUpdater(preferences, ready, installBlocked)
 const dismissedUpdate = ref('')
@@ -42,14 +50,6 @@ const navChannels = computed<(LocalChannel & { canDelete?: boolean })[]>(() => s
 const heading = computed(() => active.value?.name || (connected.value ? '我的大厅' : '本机频道'))
 const banner = computed(() => (!panel.value && error.value) || offline.value || preferences.value?.shortcutError || '')
 const panelTitle: Record<Panel, string> = { join: '通过邀请加入', invite: '邀请好友', create: '创建语音频道', delete: '删除频道', exit: '退出大厅', audio: '软件设置', updates: '软件设置', profile: '个人资料', '': '' }
-const artBars = Array.from({ length: 77 }, (_, i) => {
-  const t = i / 76
-  return {
-    height: (16 + 118 * Math.pow(Math.sin(Math.PI * t), 0.85) * (0.28 + 0.72 * Math.pow(Math.sin(8 * t - 0.6), 2))) + 'px',
-    transform: 'translateY(' + (20 * Math.sin(t * 10 + 1)) + 'px)',
-    opacity: 0.48 + 0.48 * Math.sin(Math.PI * t),
-  }
-})
 let timer: ReturnType<typeof setTimeout>
 function inform(message: string) { clearTimeout(timer); notice.value = message; timer = setTimeout(() => { notice.value = '' }, 3600) }
 function openPanel(next: Panel) {
@@ -90,7 +90,7 @@ async function startHost() {
   await connect()
 }
 async function createChannel() {
-  if (!channelName.value.trim() || busy.value) return
+  if (!channelNameLength.value || channelNameLength.value > 20 || busy.value) return
   if (!connected.value) lastJoin.value = ''
   if (await action({ type: 'create', name: channelName.value.trim() }, !connected.value) && panel.value === 'create') closePanel()
 }
@@ -165,7 +165,6 @@ watch(offline, message => {
         <button v-if="drawer" class="icon-button close-drawer" aria-label="关闭导航" @click="drawer = false"><X /></button>
       </div>
       <nav class="navigation" aria-label="大厅导航">
-        <div class="nav-heading">工作区</div>
         <button class="nav-item" :class="{ selected: !active }" :disabled="busy" @click="drawer = false; active && action({type: 'leave'})">
           <House /><span>{{ connected ? '我的大厅' : '本机频道' }}</span>
         </button>
@@ -185,10 +184,13 @@ watch(offline, message => {
     </aside>
     <main>
       <header class="topbar">
-        <button class="icon-button mobile-menu" aria-label="展开导航" @click="drawer = true"><Menu /></button>
-        <div class="breadcrumb"><House /><span>大厅</span><ChevronRight /><strong>{{ heading }}</strong></div>
-        <span class="badge" :class="{ live: connected && snapshot }"><i></i>{{ connected ? (snapshot ? '大厅已连接' : '正在同步') : (busy ? '正在连接' : '大厅未开启') }}</span>
-        <button v-if="snapshot" class="icon-button people-toggle" aria-label="查看成员" :aria-expanded="showPeople" @click="showPeople = !showPeople"><Users /></button>
+        <button class="icon-button mobile-menu" aria-label="展开导航" :aria-expanded="drawer" @click="drawer = true"><Menu /></button>
+        <div class="topbar-title"><component :is="active ? Volume2 : House" /><strong>{{ heading }}</strong></div>
+        <span class="lobby-status" :data-tone="lobbyStatus.tone" role="status">
+          <component :is="lobbyStatus.icon" aria-hidden="true" />{{ lobbyStatus.label }}
+        </span>
+        <button v-if="connected" class="button invite-button" :disabled="!session" @click="openShare"><UserRoundPlus /> 邀请好友</button>
+        <button v-if="snapshot" class="icon-button people-toggle" :aria-label="showPeople ? '关闭成员列表' : '查看成员'" :aria-expanded="showPeople" @click="showPeople = !showPeople"><Users /></button>
       </header>
       <div v-if="banner" class="alert" role="alert"><CircleAlert /><span>{{ banner }}</span>
         <button v-if="banner === offline && lastJoin && !connected" class="text-button" @click="invite = lastJoin; openPanel('join'); enter()">重试</button>
@@ -201,25 +203,26 @@ watch(offline, message => {
       </div>
       <div v-if="!connected" class="landing-scroll"><div class="landing">
         <header class="hero">
-          <div class="hero-grid"></div><div class="wave-art" aria-hidden="true"><i v-for="(bar, i) in artBars" :key="i" :style="bar"></i></div>
-          <div class="hero-content"><h1>本机频道</h1><p>选择频道，即可开启大厅并加入语音。</p>
-            <div class="home-actions"><button class="button" :disabled="busy || (isTauri() && !ready)" @click="openPanel('join')"><Link2 /> 通过邀请加入</button>
-              <button class="button" :disabled="busy || !ready" @click="startHost"><Radio /> 开启大厅</button></div></div>
+          <div class="hero-emblem" aria-hidden="true"><img class="hero-mark" src="/grovecall.png" alt="" /></div>
+          <div class="hero-content">
+            <h1>本机频道</h1>
+            <p>选择一个频道，和队友开始语音聊天。</p>
+            <div class="home-actions">
+              <button class="button primary" :disabled="busy || !ready" @click="startHost"><Radio /> 开启大厅</button>
+              <button class="button" :disabled="busy || (isTauri() && !ready)" @click="openPanel('join')"><Link2 /> 通过邀请加入</button>
+            </div>
+          </div>
         </header>
-        <section class="home-channels"><div class="overview-title"><h2>我的频道</h2>
-          <button class="button primary" :disabled="busy || (isTauri() && !ready)" @click="openPanel('create')"><Plus /> 创建频道</button></div>
+        <section class="home-channels"><div class="overview-title"><h2>我的频道 <span v-if="localChannels.length" class="channel-count">{{ localChannels.length }}</span></h2>
+          <button class="button" :disabled="busy || (isTauri() && !ready)" @click="openPanel('create')"><Plus /> 创建频道</button></div>
           <div v-if="channelsError" class="local-list-error" role="alert"><span>{{ channelsError }}</span><button class="button" @click="refreshLocalChannels">重新读取</button></div>
           <div v-else-if="loadingChannels && !localChannels.length" class="overview-empty" role="status">正在读取频道…</div>
           <div v-else-if="localChannels.length" class="room-list"><button v-for="c in localChannels" :key="c.id" :disabled="busy || !ready" @click="joinChannel(c.id)">
-            <span class="list-icon"><Volume2 /></span><b>{{ c.name }}</b><small v-if="joiningChannel === c.id" role="status">正在加入…</small><ArrowDownLeft v-else /></button></div>
-          <div v-else class="overview-empty"><span class="empty-icon"><AudioLines /></span><h3>还没有语音频道</h3><p>创建第一个频道，邀请队友一起玩。</p></div>
+            <span class="list-icon"><Volume2 /></span><div><b>{{ c.name }}</b><small>{{ joiningChannel === c.id ? '正在加入…' : '点击进入频道' }}</small></div><ArrowRight /></button></div>
+          <div v-else class="overview-empty"><span class="empty-icon"><AudioLines /></span><h3>还没有语音频道</h3><p>创建一个频道，随时邀请队友加入。</p></div>
         </section>
       </div></div>
       <template v-else>
-        <header class="room-header"><span class="room-icon"><component :is="active ? Volume2 : Radio" /></span>
-          <div><h1>{{ heading }}</h1><p>{{ active ? '语音频道' : (session?.isHost ? '由你主持的语音大厅' : '语音大厅') }}</p></div>
-          <button class="button primary invite-button" :disabled="!session" @click="openShare"><UserRoundPlus /> 邀请好友</button>
-        </header>
         <div v-if="snapshot" class="workspace" :class="{ 'people-open': showPeople }">
           <Chat v-if="active" :channel="active" :snapshot="snapshot" :audio="preferences?.audio" :voice-label="voiceLabel" :in-voice="inVoice"
             :drafts="drafts" @draft="(id, text) => { drafts[id] = text }"
@@ -229,7 +232,7 @@ watch(offline, message => {
               <button class="button" @click="openPanel('create')"><Plus /> 创建频道</button></div>
             <p class="section-description">{{ snapshot.channels.length ? '选择频道，与频道里的队友通话和聊天。' : '创建第一个语音频道，和队友开始聊天。' }}</p>
             <div class="room-list"><button v-for="c in snapshot.channels" :key="c.id" :disabled="busy" @click="joinChannel(c.id)">
-              <span class="list-icon"><Volume2 /></span><div><b>{{ c.name }}</b><small>{{ snapshot.members.filter(m => m.channelId === c.id).length }} 位成员</small></div><ArrowDownLeft />
+              <span class="list-icon"><Volume2 /></span><div><b>{{ c.name }}</b><small>{{ snapshot.members.filter(m => m.channelId === c.id).length }} 位成员</small></div><ArrowRight />
             </button></div>
             <div v-if="!snapshot.channels.length" class="overview-empty"><span class="empty-icon"><AudioLines /></span><h3>还没有语音频道</h3></div>
           </section>
@@ -255,15 +258,16 @@ watch(offline, message => {
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
         <footer class="dialog-actions"><button class="button primary" :disabled="!shareLink" @click="copyInvite"><Copy /> 复制链接</button></footer>
       </div>
-      <form v-if="panel === 'create'" @submit.prevent="createChannel"><label class="field">频道名称<input v-model.trim="channelName" required maxlength="40" placeholder="例如 排位一队" /></label>
+      <form v-if="panel === 'create'" @submit.prevent="createChannel"><label class="field">频道名称<input v-model.trim="channelName" required maxlength="40" placeholder="例如 排位一队" aria-describedby="channel-name-length" :aria-invalid="channelNameLength > 20" /></label>
+        <p id="channel-name-length" :class="channelNameLength > 20 ? 'form-error' : 'field-hint'">{{ channelNameLength }} / 20 个字符<span v-if="channelNameLength > 20">，请缩短频道名称</span></p>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
-        <footer class="dialog-actions"><button type="button" class="button" :disabled="busy" @click="closePanel">取消</button><button class="button primary" :disabled="!ready || busy || !channelName.trim()">创建频道</button></footer>
+        <footer class="dialog-actions"><button type="button" class="button" :disabled="busy" @click="closePanel">取消</button><button class="button primary" :disabled="!ready || busy || !channelNameLength || channelNameLength > 20">创建频道</button></footer>
       </form>
       <div v-if="panel === 'delete' || panel === 'exit'"><p class="dialog-desc">{{ panel === 'delete' ? '删除「' + deletion?.name + '」后，频道成员会返回大厅，此频道的聊天记录将被清除。' : (session?.isHost ? '所有成员将断开连接，本次大厅的聊天记录将被清除。' : '当前通话将结束。你可以通过同一邀请再次加入。') }}</p>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
         <footer class="dialog-actions"><button class="button" :disabled="busy" @click="closePanel">取消</button><button class="button danger" :disabled="busy" @click="panel === 'delete' ? deleteChannel() : leaveSession()">{{ panel === 'delete' ? '删除频道' : (session?.isHost ? '停止大厅' : '退出大厅') }}</button></footer>
       </div>
     </Dialog>
-    <div v-if="notice" class="toast" role="status"><Clipboard /> {{ notice }}</div>
+    <Transition name="notice"><div v-if="notice" class="toast" role="status"><Clipboard /> {{ notice }}</div></Transition>
   </div>
 </template>

@@ -21,7 +21,7 @@ function toggleUpdates(event: Event) {
 
 <template>
   <Dialog title="软件设置" wide :dismissible="!locked" @close="emit('close')">
-    <div class="segmented" role="group" aria-label="设置分类">
+    <div class="segmented settings-tabs" role="group" aria-label="设置分类">
       <button type="button" :aria-pressed="tab === 'audio'" :disabled="locked" @click="emit('tab', 'audio')">声音</button>
       <button type="button" :aria-pressed="tab === 'updates'" :disabled="locked" @click="emit('tab', 'updates')">软件更新</button>
     </div>
@@ -45,3 +45,49 @@ function toggleUpdates(event: Event) {
     </section>
   </Dialog>
 </template>
+
+<style scoped>
+.settings-tabs {
+  width: fit-content;
+  min-width: 220px;
+  margin: 0 0 28px;
+  padding: 4px;
+  border-radius: 12px;
+  background: #f3f3f3;
+}
+.settings-tabs button {
+  min-width: 100px;
+  min-height: 34px;
+  padding: 7px 16px;
+  border-radius: 9px;
+}
+.settings-tabs button[aria-pressed=true] {
+  color: var(--accent);
+  box-shadow: 0 1px 4px #00000012;
+}
+.update-settings {
+  padding-top: 2px;
+}
+.update-settings > .section-description:first-child {
+  font-size: 14px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.update-settings .switch-row {
+  padding: 16px 0;
+  margin: 12px 0 0;
+  border-bottom: 1px solid var(--line);
+}
+.update-version {
+  padding: 18px;
+  border: 1px solid #ededed;
+  border-radius: 12px;
+  background: #fafafa;
+}
+.update-version h3 {
+  margin: 0 0 8px;
+}
+.update-notes {
+  margin: 8px 0;
+}
+</style>

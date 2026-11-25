@@ -41,6 +41,45 @@ mod tests {
         assert_eq!(list[0].id, id);
         assert_eq!(list[0].name, "排位");
     }
+
+    #[test]
+    fn names_are_limited_to_twenty_unicode_characters() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut channels = Channels::open(&storage.path().join("channels.sqlite3")).unwrap();
+        let name = "🎮".repeat(20);
+        let id = channels.create("host", &name).unwrap();
+        assert_eq!(channels.find(&id).unwrap().name, name);
+        assert_eq!(
+            channels.create("host", &"🎮".repeat(21)),
+            Err("频道名称须为 1–20 个字符")
+        );
+        assert_eq!(
+            channels.create("host", "包含\n换行"),
+            Err("频道名称不能包含控制字符")
+        );
+        assert_eq!(channels.list.len(), 1);
+    }
+
+    #[test]
+    fn saved_long_names_remain_available() {
+        let storage = tempfile::tempdir().unwrap();
+        let file = storage.path().join("channels.sqlite3");
+        let channels = Channels::open(&file).unwrap();
+        let name = "旧".repeat(40);
+        channels
+            .db
+            .execute(
+                "INSERT INTO channels (id, name, owner) VALUES (?1, ?2, ?3)",
+                params!["old", name, "host"],
+            )
+            .unwrap();
+        drop(channels);
+        assert_eq!(Channels::preview(&file).unwrap()[0].name, name);
+        let mut channels = Channels::open(&file).unwrap();
+        assert_eq!(channels.find("old").unwrap().name, name);
+        channels.delete("old", "host", false).unwrap();
+        assert!(channels.list.is_empty());
+    }
 }
 
 pub(crate) struct Channels {
@@ -94,8 +133,11 @@ impl Channels {
 
     pub fn create(&mut self, player: &str, name: &str) -> Result<String, &'static str> {
         let name = name.trim();
-        if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
-            return Err("频道名称须为 1–40 个字符");
+        if name.is_empty() || name.chars().count() > 20 {
+            return Err("频道名称须为 1–20 个字符");
+        }
+        if name.chars().any(char::is_control) {
+            return Err("频道名称不能包含控制字符");
         }
         if self.list.len() >= 128 {
             return Err("大厅频道数量已达上限");

@@ -104,3 +104,68 @@ async function save() {
         <button class="button primary" :disabled="busy">{{ busy ? '正在保存…' : '保存设置' }}</button></footer>
     </form>
 </template>
+
+<style scoped>
+.settings-section h3 {
+  margin: 0 0 18px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -.01em;
+}
+.settings-section + .settings-section {
+  padding-top: 26px;
+  margin-top: 26px;
+}
+.field {
+  gap: 8px;
+  margin: 16px 0;
+}
+.field select, .field input {
+  min-height: 44px;
+  border-color: #e4e4e4;
+  border-radius: 10px;
+  background: #fafafa;
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+.field select:hover, .field input:hover {
+  border-color: #bdbdbd;
+  background: #fff;
+}
+.range-label {
+  margin: 18px 0;
+}
+.range-label input {
+  cursor: pointer;
+}
+.level-panel {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-color: #ededed;
+  border-radius: 12px;
+  background: #fafafa;
+}
+.level-panel small {
+  font-variant-numeric: tabular-nums;
+}
+.switch-row {
+  min-height: 48px;
+  padding: 12px 0;
+  margin: 0;
+}
+.switch-row + .switch-row {
+  border-top: 1px solid var(--line);
+}
+.switch-row input {
+  flex: none;
+  transition: background-color 160ms ease;
+}
+.switch-row input::after {
+  transition: left 160ms ease;
+}
+.dialog-actions {
+  margin-top: 24px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch-row input, .switch-row input::after { transition: none; }
+}
+</style>

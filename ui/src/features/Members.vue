@@ -35,10 +35,10 @@ async function save() {
           :class="{ mine: member.id === snapshot.selfId, speaking: speakers.includes(member.id) }" @edit="emit('editProfile')" />
         <div class="member-info"><strong>{{ member.name }}</strong>
           <small v-if="speakers.includes(member.id)" class="speech"><AudioLines /> 正在发言</small>
-          <small v-else-if="peers[member.id]?.muted"><VolumeX /> 本地已静音</small>
+          <small v-else-if="peers[member.id]?.muted" class="peer-muted"><VolumeX /> 本地已静音</small>
           <small v-else>{{ member.id === snapshot.selfId ? '我自己' : (snapshot.channels.find(c => c.id === member.channelId)?.name ?? '在大厅') }}</small>
         </div>
-        <button v-if="member.id !== snapshot.selfId" :disabled="busy" class="icon-button peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal /></button>
+        <button v-if="member.id !== snapshot.selfId" :disabled="busy" class="peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal /><span>音量</span></button>
       </div>
       <div v-if="editId === member.id" class="peer-panel">
         <div class="peer-head"><b>个人收听</b><button class="icon-button" aria-label="收起音量设置" @click="editId = ''"><X /></button></div>
@@ -48,3 +48,27 @@ async function save() {
     </li></ul>
   </aside>
 </template>
+
+<style scoped>
+.peer-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: none;
+  width: auto;
+  min-height: 34px;
+  padding: 0 5px;
+  border-radius: 8px;
+  color: #626262;
+  font-size: 12px;
+}
+.peer-button:hover:not(:disabled), .peer-button[aria-expanded="true"] {
+  color: #222;
+  background: #f0f0f0;
+}
+.member-info small {
+  font-size: 11px;
+  line-height: 1.4;
+}
+</style>
