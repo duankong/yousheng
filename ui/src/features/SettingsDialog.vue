@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, defineAsyncComponent, ref } from 'vue'
 import { version } from '../../package.json'
 import type { AudioSettings } from '../model'
 import type { Updater } from './useUpdater'
@@ -7,6 +7,7 @@ import type { AudioControls } from './useAudioControls'
 import AudioSettingsView from './AudioSettings.vue'
 import Dialog from './Dialog.vue'
 
+const ReleaseNotes = defineAsyncComponent(() => import('./ReleaseNotes.vue'))
 type Tab = 'audio' | 'updates'
 const props = defineProps<{ tab: Tab; audio: AudioSettings; controls: AudioControls; level: number; speaking: boolean; connected: boolean; updater: Updater }>()
 const emit = defineEmits<{ close: []; tab: [tab: Tab] }>()
@@ -45,7 +46,7 @@ function toggleUpdates(event: Event) {
       <p class="section-description">从 GitHub 获取新版本，安装前会询问你。</p>
       <div v-if="updater.available" class="update-version">
         <h3>发现新版本 {{ updater.available.version }}</h3>
-        <p v-if="updater.available.notes" class="update-notes">{{ updater.available.notes }}</p>
+        <ReleaseNotes v-if="updater.available.notes.trim()" :notes="updater.available.notes" />
         <p class="section-description">{{ updater.installBlocked ? '请先退出或停止大厅，再安装更新。' : '安装更新会关闭友声。' }}</p>
       </div>
       <p v-if="updater.error" class="form-error" role="alert">{{ updater.error }}</p>
@@ -98,8 +99,5 @@ function toggleUpdates(event: Event) {
 }
 .update-version h3 {
   margin: 0 0 8px;
-}
-.update-notes {
-  margin: 8px 0;
 }
 </style>

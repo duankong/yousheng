@@ -43,9 +43,14 @@ try {
     git -C $root archive --format=zip "--prefix=yousheng-$version/" "--output=$sourceZip" $commit
     if ($LASTEXITCODE) { throw "Failed to archive source at $commit" }
 
+    # Older clients display notes verbatim. Keep section breaks, bullets and filenames readable.
+    $plainNotes = $Notes -replace '(?m)^ {0,3}#{1,6}[ \t]+', ''
+    $plainNotes = $plainNotes -replace '(?m)^([ \t]*)[-+*][ \t]+', ('$1' + [char]0x2022 + ' ')
+    $plainNotes = $plainNotes -replace '(?<!`)`([^`\r\n]+)`(?!`)', '$1'
     $manifest = [ordered]@{
         version = $version
-        notes = $Notes
+        notes = $plainNotes
+        notesMarkdown = $Notes
         pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
         platforms = @{
             'windows-x86_64' = @{

@@ -30,6 +30,15 @@ fn official_release_asset(url: &Url) -> bool {
             .starts_with("/duankong/yousheng/releases/download/")
 }
 
+fn update_notes(metadata: &serde_json::Value, fallback: Option<&str>) -> String {
+    metadata["notesMarkdown"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .or(fallback)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[tauri::command]
 pub(super) async fn check_update(
     app: AppHandle,
@@ -60,7 +69,7 @@ pub(super) async fn check_update(
     }
     let info = update.as_ref().map(|candidate| UpdateInfo {
         version: candidate.version.clone(),
-        notes: candidate.body.clone().unwrap_or_default(),
+        notes: update_notes(&candidate.raw_json, candidate.body.as_deref()),
     });
     *available = update;
     Ok(info)
@@ -106,6 +115,25 @@ pub(super) async fn install_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_notes_prefer_markdown_and_accept_older_manifests() {
+        use serde_json::json;
+
+        let plain = Some("更新内容");
+        assert_eq!(
+            update_notes(&json!({"notesMarkdown": "## 更新内容"}), plain),
+            "## 更新内容"
+        );
+        for manifest in [
+            json!({}),
+            json!({"notesMarkdown": 42}),
+            json!({"notesMarkdown": " "}),
+        ] {
+            assert_eq!(update_notes(&manifest, plain), "更新内容");
+        }
+        assert_eq!(update_notes(&json!({}), None), "");
+    }
 
     #[test]
     fn update_asset_belongs_to_official_github_release() {

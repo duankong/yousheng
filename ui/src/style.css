@@ -135,7 +135,6 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 .update-banner { background: #f7f7f7; color: var(--ink); border-color: var(--line); }
 .update-settings .switch-row { margin-top: 18px; }
 .update-version { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 16px; }
-.update-notes { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; max-height: 170px; overflow-y: auto; }
 .invite-button { flex: none; }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) clamp(210px, 18vw, 240px); flex: 1; min-height: 0; position: relative; }
 .members { border-left: 1px solid var(--line); background: #fff; padding: 24px 14px; overflow: auto; }

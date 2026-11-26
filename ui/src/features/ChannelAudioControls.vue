@@ -67,15 +67,13 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
         <component :is="audio?.[item.mute] ? item.mutedIcon : item.icon" aria-hidden="true" />
       </button>
       <div v-if="audio && open === item.gain" class="volume-popover">
-        <div class="volume-card">
-          <div class="volume-label">
-            <label :for="'call-' + item.gain">{{ item.name }}</label>
-            <span aria-hidden="true">{{ audio[item.gain] }}%</span>
-          </div>
+        <div class="volume-card" :style="{ '--volume-level': audio[item.gain] / item.max }">
           <input :id="'call-' + item.gain" type="range" min="0" :max="item.max" :value="audio[item.gain]"
-            :aria-valuetext="audio[item.gain] + '%'" @pointerdown="startDrag"
+            :aria-label="item.name" aria-orientation="vertical" :aria-valuetext="audio[item.gain] + '%'"
+            @pointerdown="startDrag"
             @pointerup="endDrag(item.gain, $event)" @pointercancel="endDrag(item.gain, $event)"
             @input="controls.change(item.gain, ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
+          <span class="volume-value" aria-hidden="true">{{ audio[item.gain] }}%</span>
         </div>
       </div>
     </div>
@@ -86,12 +84,68 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
 .call-toggles { display: flex; gap: 2px; margin-inline-start: auto; }
 .gain-control { position: relative; }
 .icon-button { width: 36px; height: 36px; }
+.gain-control:has(.volume-popover) > .icon-button[aria-pressed=false] { color: var(--accent); background: var(--accent-soft); }
 .icon-button[aria-pressed=true] { color: var(--danger); background: #fbf1f2; }
 .icon-button[aria-pressed=true]:hover { background: #f7e5e7; }
-.volume-popover { position: absolute; z-index: 3; inset-inline-end: 0; bottom: 100%; width: 180px; padding-bottom: 5px; }
-.volume-card { padding: 12px 14px 9px; border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 4px 16px #00000012; }
-.volume-label { display: flex; align-items: baseline; justify-content: space-between; font-size: 12px; }
-.volume-label label { font-weight: 600; }
-.volume-label span { color: var(--muted); font-variant-numeric: tabular-nums; }
-.volume-card input { display: block; width: 100%; height: 20px; margin: 5px 0 0; accent-color: var(--accent); cursor: pointer; }
+.volume-popover { position: absolute; z-index: 3; inset-inline: 0; bottom: 100%; padding-bottom: 5px; display: grid; justify-items: center; }
+.volume-card {
+  --volume-fill: color-mix(in srgb, var(--accent) 82%, white);
+  --volume-track-length: 96px;
+  --volume-thumb-size: 14px;
+  --volume-padding: 8px;
+  /* Native range thumb centers move between the inset endpoints of the track. */
+  --volume-thumb-center: calc(var(--volume-thumb-size) / 2 + (var(--volume-track-length) - var(--volume-thumb-size)) * var(--volume-level));
+  position: relative;
+  width: 30px;
+  padding: var(--volume-padding) 0;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 3px 10px #44365014;
+}
+.volume-card input {
+  display: block;
+  width: 100%;
+  height: var(--volume-track-length);
+  margin: 0;
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  background: transparent;
+  cursor: pointer;
+}
+.volume-card input::-webkit-slider-runnable-track {
+  width: 4px;
+  border-radius: 3px;
+  background: linear-gradient(to top, var(--volume-fill) var(--volume-thumb-center), #e2dfe7 var(--volume-thumb-center));
+}
+.volume-card input::-webkit-slider-thumb {
+  appearance: none;
+  width: var(--volume-thumb-size);
+  height: var(--volume-thumb-size);
+  margin-left: -5px;
+  border: 2px solid var(--volume-fill);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px #44365020;
+}
+.volume-value {
+  position: absolute;
+  inset-inline-end: calc(100% + 5px);
+  bottom: calc(var(--volume-padding) + var(--volume-thumb-center));
+  transform: translateY(50%);
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+@media (forced-colors: active) {
+  .volume-card input { appearance: auto; }
+  .volume-card input::-webkit-slider-thumb { appearance: auto; margin-left: 0; }
+}
 </style>
