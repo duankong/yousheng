@@ -35,6 +35,7 @@ pub struct AudioSettings {
     pub threshold: u16,
     pub input_gain: u16,
     pub output_gain: u16,
+    pub output_muted: bool,
     pub noise_suppression: bool,
     pub echo_cancellation: bool,
     pub input_device: String,
@@ -50,11 +51,22 @@ impl Default for AudioSettings {
             threshold: 40,
             input_gain: 100,
             output_gain: 100,
+            output_muted: false,
             noise_suppression: true,
             echo_cancellation: true,
             input_device: String::new(),
             output_device: String::new(),
             shortcut: "F8".into(),
+        }
+    }
+}
+
+impl AudioSettings {
+    fn playback_gain(&self) -> f32 {
+        if self.output_muted {
+            0.0
+        } else {
+            f32::from(self.output_gain) / 100.0
         }
     }
 }
@@ -146,6 +158,14 @@ struct Session {
 struct Preview {
     requested: bool,
     input: Option<AudioIo>,
+}
+
+impl Preview {
+    fn needs_input_change(&self, in_call: bool, input_changed: bool) -> bool {
+        self.requested
+            && !in_call
+            && (input_changed || self.input.as_ref().is_some_and(AudioIo::failed))
+    }
 }
 
 #[derive(Clone)]
@@ -331,7 +351,9 @@ impl VoiceEngine {
         }
         let slot = self.session.lock().await;
         let old = self.audio.settings.borrow().clone();
-        if let Some(session) = slot.as_ref() {
+        // A disconnect may resume the preview while a device is being changed.
+        let mut preview = self.audio.preview.lock().unwrap();
+        let in_call = if let Some(session) = slot.as_ref() {
             let mut io = session.io.lock().unwrap();
             if io.as_ref().is_some_and(|current| {
                 current.failed()
@@ -344,13 +366,11 @@ impl VoiceEngine {
                     status(&self.audio.app, "connected", None);
                 }
             }
-        }
-        let mut preview = self.audio.preview.lock().unwrap();
-        if preview
-            .input
-            .as_ref()
-            .is_some_and(|input| input.failed() || old.input_device != settings.input_device)
-        {
+            io.is_some()
+        } else {
+            false
+        };
+        if preview.needs_input_change(in_call, old.input_device != settings.input_device) {
             preview.input = Some(self.audio.open_io(&settings, None)?);
         }
         if old.mode != settings.mode || old.shortcut != settings.shortcut {
@@ -381,6 +401,16 @@ impl VoiceEngine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn selecting_a_device_retries_a_missing_preview_only_while_it_is_requested() {
+        let mut preview = Preview::default();
+        assert!(!preview.needs_input_change(false, true));
+        preview.requested = true;
+        assert!(!preview.needs_input_change(true, true));
+        assert!(!preview.needs_input_change(false, false));
+        assert!(preview.needs_input_change(false, true));
+    }
+
     #[tokio::test]
     async fn mix_scales_and_mutes_each_listener_track_before_master_gain() {
         let mut mix = Mixer::default();
@@ -390,7 +420,7 @@ mod tests {
                 VoiceTrack {
                     player: id.into(),
                     gain: 1.0,
-                    samples: VecDeque::from(vec![sample; 4]),
+                    samples: VecDeque::from(vec![sample; 5]),
                     _pump: Task(tokio::spawn(std::future::pending())),
                 },
             );
@@ -419,7 +449,17 @@ mod tests {
                 muted: false,
             },
         );
-        assert_eq!(mix.next_sample(0.5), 4096.0 / 32768.0);
+        let mut prefs: AudioSettings = serde_json::from_value(serde_json::json!({
+            "outputGain": 50
+        }))
+        .unwrap();
+        assert!(!prefs.output_muted);
+        prefs.output_muted = true;
+        assert_eq!(mix.next_sample(prefs.playback_gain()), 0.0);
+        assert_eq!(mix.tracks.values().next().unwrap().samples.len(), 1);
+        assert_eq!(serde_json::to_value(&prefs).unwrap()["outputMuted"], true);
+        prefs.output_muted = false;
+        assert_eq!(mix.next_sample(prefs.playback_gain()), 4096.0 / 32768.0);
     }
 }
 
@@ -517,7 +557,11 @@ async fn room_events(
                 {
                     status(app, "connected", None);
                 } else {
-                    status(app, "device-error", Some("请检查声音设置中的麦克风和播放设备"));
+                    status(
+                        app,
+                        "device-error",
+                        Some("请检查声音设置中的麦克风和播放设备"),
+                    );
                 }
             }
             RoomEvent::Disconnected { reason: why } => {

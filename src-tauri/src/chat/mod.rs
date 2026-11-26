@@ -8,7 +8,7 @@ use uuid::Uuid;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatMessage {
-    id: String,
+    pub(crate) id: String,
     author_id: String,
     author_name: String,
     text: String,
@@ -17,6 +17,8 @@ pub(crate) struct ChatMessage {
 
 #[derive(Default)]
 pub(crate) struct Chat(HashMap<String, VecDeque<ChatMessage>>);
+
+pub(crate) const HISTORY_LIMIT: usize = 100;
 
 impl Chat {
     pub fn send(
@@ -35,7 +37,7 @@ impl Chat {
             return Err("消息须为 1–1000 个字符");
         }
         let messages = self.0.entry(target.into()).or_default();
-        if messages.len() >= 100 {
+        if messages.len() >= HISTORY_LIMIT {
             messages.pop_front();
         }
         messages.push_back(ChatMessage {

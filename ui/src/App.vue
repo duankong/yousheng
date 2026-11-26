@@ -1,20 +1,26 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { Activity, ArrowRight, AudioLines, ChevronRight, Circle, CircleAlert, Clipboard, Copy, House, Link2, LoaderCircle, LogOut, Menu, Plus, Radio, Settings2, Trash2, Unlink2, UserRoundPlus, Users, Volume2, X } from 'lucide-vue-next'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
 import SettingsDialog from './features/SettingsDialog.vue'
-import Chat from './features/Chat.vue'
+import Chat, { chatSendHint, type ChatAttempt } from './features/Chat.vue'
 import Members from './features/Members.vue'
 import ProfileEditor from './features/ProfileEditor.vue'
 import PlayerAvatar from './features/PlayerAvatar.vue'
 import { useLobby } from './features/useLobby'
+import { useAudioControls } from './features/useAudioControls'
 import { useUpdater } from './features/useUpdater'
-import type { AudioSettings, Channel, Preferences } from './model'
+import type { Channel, Preferences } from './model'
 
-type Panel = 'join' | 'invite' | 'create' | 'delete' | 'exit' | 'audio' | 'updates' | 'profile' | ''
+type Panel = 'join' | 'invite' | 'create' | 'delete' | 'exit' | 'audio' | 'updates' | 'profile' | 'connection' | ''
 type LocalChannel = Pick<Channel, 'id' | 'name'>
+const transportLabels = { direct: '直连', relay: '中继', local: '本机主持', unknown: '暂未确定' }
+type ConnectionDetails = { transport: keyof typeof transportLabels; rttMs: number | null }
 const panel = ref<Panel>('')
+const details = ref<ConnectionDetails>()
+const detailsRefresh = ref(0)
+const detailsError = ref(false)
 const drawer = ref(false)
 const showPeople = ref(false)
 const invite = ref('')
@@ -24,11 +30,13 @@ const channelName = ref('')
 const channelNameLength = computed(() => Array.from(channelName.value.trim()).length)
 const deletion = ref<LocalChannel>()
 const notice = ref('')
-const muteBusy = ref(false)
 const copyInput = ref<HTMLInputElement>()
 const lastJoin = ref('')
 const joiningChannel = ref('')
 const drafts = ref<Record<string, string>>({})
+const outbox = ref<ChatAttempt[]>([])
+let nextAttemptId = 0
+const lastChatReceipt = ref<{ id: number; elapsedMs?: number; confirmed?: boolean }>()
 let draftLobby = ''
 const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, action,
   localChannels, loadingChannels, channelsError, refreshLocalChannels } = useLobby(link => { pendingInvite.value = link })
@@ -42,6 +50,12 @@ const lobbyStatus = computed(() => {
 })
 const installBlocked = computed(() => busy.value || connected.value || inVoice.value || ['connecting', 'reconnecting'].includes(voice.value.state))
 const updater = useUpdater(preferences, ready, installBlocked)
+const audioControls = useAudioControls(preferences)
+const currentAudio = computed(() => preferences.value && { ...preferences.value.audio, ...audioControls.changes })
+watch(() => audioControls.error, (message, previous) => {
+  if (message && panel.value !== 'audio') error.value = message
+  else if (!message && error.value === previous) error.value = ''
+})
 const dismissedUpdate = ref('')
 const firstRun = computed(() => !!preferences.value && !preferences.value.nickname.trim())
 const editingProfile = computed(() => firstRun.value || panel.value === 'profile')
@@ -49,7 +63,21 @@ const myName = computed(() => preferences.value?.nickname || '本地玩家')
 const navChannels = computed<(LocalChannel & { canDelete?: boolean })[]>(() => snapshot.value?.channels ?? (connected.value ? [] : localChannels.value))
 const heading = computed(() => active.value?.name || (connected.value ? '我的大厅' : '本机频道'))
 const banner = computed(() => (!panel.value && error.value) || offline.value || preferences.value?.shortcutError || '')
-const panelTitle: Record<Panel, string> = { join: '通过邀请加入', invite: '邀请好友', create: '创建语音频道', delete: '删除频道', exit: '退出大厅', audio: '软件设置', updates: '软件设置', profile: '个人资料', '': '' }
+const panelTitle: Record<Panel, string> = { join: '通过邀请加入', invite: '邀请好友', create: '创建语音频道', delete: '删除频道', exit: '退出大厅', audio: '软件设置', updates: '软件设置', profile: '个人资料', connection: '大厅连接详情', '': '' }
+watch([panel, session, detailsRefresh], async ([view, current], _, onCleanup) => {
+  if (view !== 'connection') return
+  details.value = undefined
+  detailsError.value = false
+  if (!current) return
+  let cancelled = false
+  onCleanup(() => { cancelled = true })
+  try {
+    const result = await invoke<ConnectionDetails>('lobby_connection_details')
+    if (!cancelled) details.value = result
+  } catch {
+    if (!cancelled) detailsError.value = true
+  }
+})
 let timer: ReturnType<typeof setTimeout>
 function inform(message: string) { clearTimeout(timer); notice.value = message; timer = setTimeout(() => { notice.value = '' }, 3600) }
 function openPanel(next: Panel) {
@@ -107,7 +135,39 @@ async function joinChannel(id: string) {
   finally { joiningChannel.value = '' }
 }
 async function leaveSession() {
-  if (await leave()) { panel.value = ''; lastJoin.value = ''; drafts.value = {}; draftLobby = '' }
+  if (await leave()) { panel.value = ''; lastJoin.value = ''; drafts.value = {}; outbox.value = []; draftLobby = '' }
+}
+function removeAttempt(id: number) {
+  outbox.value = outbox.value.filter(item => item.id !== id)
+}
+async function sendChat(channelId: string) {
+  const original = drafts.value[channelId] ?? ''
+  const text = original.trim()
+  if (!text || active.value?.id !== channelId) return
+  if (chatSendHint(outbox.value, channelId, text)) return
+  if (Array.from(text).length > 1000) { error.value = '每条消息最多可发送 1000 个字符。'; return }
+  const attempt = reactive<ChatAttempt>({ id: ++nextAttemptId, channelId, original, error: '' })
+  const started = performance.now()
+  lastChatReceipt.value = { id: attempt.id }
+  outbox.value.push(attempt)
+  drafts.value[channelId] = ''
+  error.value = ''
+  try {
+    await invoke('lobby_action', { action: { type: 'chat', channelId, text } })
+    removeAttempt(attempt.id)
+  } catch (reason) {
+    attempt.error = String(reason) || '大厅未返回发送结果'
+  } finally {
+    if (lastChatReceipt.value?.id === attempt.id) {
+      lastChatReceipt.value = { id: attempt.id, elapsedMs: Math.round(performance.now() - started), confirmed: !attempt.error }
+    }
+  }
+}
+function restoreAttempt(id: number) {
+  const item = outbox.value.find(attempt => attempt.id === id)
+  if (!item?.error || item.channelId !== active.value?.id || drafts.value[item.channelId]) return
+  drafts.value[item.channelId] = item.original
+  removeAttempt(id)
 }
 async function openShare() {
   const current = session.value
@@ -127,19 +187,6 @@ async function copyInvite() {
   try { await navigator.clipboard.writeText(shareLink.value); inform('邀请链接已复制'); panel.value = '' }
   catch { openPanel('invite'); await nextTick(); copyInput.value?.select(); error.value = '请按 Ctrl+C 复制已选中的邀请链接。' }
 }
-async function mute() {
-  if (!preferences.value || muteBusy.value) return
-  const audio = { ...preferences.value.audio, muted: !preferences.value.audio.muted }
-  muteBusy.value = true
-  try { await invoke('set_audio', { audio }); preferences.value.audio = audio }
-  catch (reason) { error.value = String(reason) }
-  finally { muteBusy.value = false }
-}
-function audioSaved(audio: AudioSettings) {
-  if (preferences.value) { preferences.value.audio = audio; preferences.value.shortcutError = null }
-  closePanel()
-  inform('声音设置已保存')
-}
 function dismissBanner() {
   if (error.value && !panel.value) error.value = ''
   else if (offline.value) offline.value = ''
@@ -148,7 +195,8 @@ function dismissBanner() {
 watch(() => snapshot.value?.channelId, () => { showPeople.value = false })
 watch(() => session.value?.invite, link => {
   shareLink.value = ''
-  if (link && link !== draftLobby) { drafts.value = {}; draftLobby = link }
+  lastChatReceipt.value = undefined
+  if (link && link !== draftLobby) { drafts.value = {}; outbox.value = []; draftLobby = link }
 })
 watch(offline, message => {
   if (message && !['profile', 'join', 'audio', 'updates'].includes(panel.value)) panel.value = ''
@@ -187,14 +235,16 @@ watch(offline, message => {
         <button class="icon-button mobile-menu" aria-label="展开导航" :aria-expanded="drawer" @click="drawer = true"><Menu /></button>
         <div class="topbar-title"><component :is="active ? Volume2 : House" /><strong>{{ heading }}</strong></div>
         <span class="lobby-status" :data-tone="lobbyStatus.tone" role="status">
-          <component :is="lobbyStatus.icon" aria-hidden="true" />{{ lobbyStatus.label }}
+          <button v-if="snapshot" class="connection-details-button" title="查看大厅连接详情" aria-haspopup="dialog" @click="openPanel('connection')">
+            <Radio aria-hidden="true" />{{ lobbyStatus.label }}<ChevronRight aria-hidden="true" />
+          </button>
+          <template v-else><component :is="lobbyStatus.icon" aria-hidden="true" />{{ lobbyStatus.label }}</template>
         </span>
         <button v-if="connected" class="button invite-button" :disabled="!session" @click="openShare"><UserRoundPlus /> 邀请好友</button>
         <button v-if="snapshot" class="icon-button people-toggle" :aria-label="showPeople ? '关闭成员列表' : '查看成员'" :aria-expanded="showPeople" @click="showPeople = !showPeople"><Users /></button>
       </header>
       <div v-if="banner" class="alert" role="alert"><CircleAlert /><span>{{ banner }}</span>
         <button v-if="banner === offline && lastJoin && !connected" class="text-button" @click="invite = lastJoin; openPanel('join'); enter()">重试</button>
-        <button v-if="banner === preferences?.shortcutError" class="text-button" @click="openPanel('audio')">声音设置</button>
         <button class="icon-button" aria-label="关闭提示" @click="dismissBanner"><X /></button></div>
       <div v-if="updater.available && updater.enabled && dismissedUpdate !== updater.available.version" class="alert update-banner" role="status">
         <span>友声 {{ updater.available.version }} 可以更新了</span>
@@ -224,10 +274,11 @@ watch(offline, message => {
       </div></div>
       <template v-else>
         <div v-if="snapshot" class="workspace" :class="{ 'people-open': showPeople }">
-          <Chat v-if="active" :channel="active" :snapshot="snapshot" :audio="preferences?.audio" :voice-label="voiceLabel" :in-voice="inVoice"
+          <Chat v-if="active" :channel="active" :snapshot="snapshot" :audio="currentAudio" :controls="audioControls" :voice-label="voiceLabel" :in-voice="inVoice"
             :drafts="drafts" @draft="(id, text) => { drafts[id] = text }"
+            :outbox="outbox" @send="sendChat" @restore="restoreAttempt" @dismiss="removeAttempt"
             :can-retry-voice="['device-error', 'error', 'failed', 'disconnected'].includes(voice.state)" :busy="busy"
-            @retry="action({ type: 'join', channelId: active.id })" @mute="mute" @settings="openPanel('audio')" @edit-profile="openPanel('profile')" @leave="action({ type: 'leave' })" @error="error = $event" />
+            @retry="action({ type: 'join', channelId: active.id })" @edit-profile="openPanel('profile')" @leave="action({ type: 'leave' })" />
           <section v-else class="lobby-overview"><div class="overview-title"><h2>语音频道</h2>
               <button class="button" @click="openPanel('create')"><Plus /> 创建频道</button></div>
             <p class="section-description">{{ snapshot.channels.length ? '选择频道，与频道里的队友通话和聊天。' : '创建第一个语音频道，和队友开始聊天。' }}</p>
@@ -244,8 +295,24 @@ watch(offline, message => {
     </main>
     <ProfileEditor v-if="editingProfile && preferences" :preferences="preferences" :first-run="firstRun" @close="closePanel" @saved="profileSaved" />
     <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates') && preferences" :tab="panel" :audio="preferences.audio" :level="level" :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice"
-      :updater="updater" @tab="panel = $event" @close="closePanel" @saved="audioSaved" />
+      :updater="updater" :controls="audioControls" @tab="panel = $event" @close="closePanel" />
     <Dialog v-else-if="panel" :key="panel" :title="panel === 'exit' && session?.isHost ? '停止大厅' : panelTitle[panel]" @close="closePanel">
+      <div v-if="panel === 'connection'">
+        <div role="status">
+          <p v-if="detailsError" class="dialog-desc">暂时无法读取连接信息，请刷新重试。</p>
+          <p v-else-if="!details" class="dialog-desc">正在读取连接信息…</p>
+          <dl v-if="details || lastChatReceipt" class="connection-facts">
+            <template v-if="details">
+              <div><dt>连接方式</dt><dd>{{ transportLabels[details.transport] }}</dd></div>
+              <div v-if="details.transport !== 'local'"><dt>到大厅主机的往返时间</dt><dd>{{ details.rttMs === null ? '暂无数据' : details.rttMs < 1 ? '小于 1 ms' : Math.round(details.rttMs) + ' ms' }}</dd></div>
+            </template>
+            <div v-if="lastChatReceipt"><dt>最近一条文字消息</dt>
+              <dd>{{ lastChatReceipt.elapsedMs === undefined ? '等待大厅确认' : (lastChatReceipt.confirmed ? '主机已确认' : '未确认') + ' · ' + lastChatReceipt.elapsedMs + ' ms' }}</dd></div>
+          </dl>
+          <p v-if="details?.transport === 'local'" class="dialog-desc">大厅在这台电脑上运行。队友可在自己的连接详情中查看到你的网络延迟。</p>
+        </div>
+        <footer v-if="details?.transport !== 'local'" class="dialog-actions"><button class="button" :disabled="!details && !detailsError" @click="detailsRefresh++">刷新</button></footer>
+      </div>
       <form v-if="panel === 'join'" @submit.prevent="enter">
         <p class="dialog-desc">{{ session?.isHost ? '加入新大厅将停止你主持的大厅，所有成员会断开连接，本次聊天记录也会清除。' : (connected ? '加入新大厅将退出当前大厅。' : '输入好友发来的大厅邀请链接。') }}</p>
         <label class="field">大厅邀请链接<input v-model.trim="invite" required spellcheck="false" placeholder="粘贴友声邀请链接" /></label>

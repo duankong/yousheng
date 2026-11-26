@@ -3,13 +3,26 @@ import { computed, ref } from 'vue'
 import { version } from '../../package.json'
 import type { AudioSettings } from '../model'
 import type { Updater } from './useUpdater'
+import type { AudioControls } from './useAudioControls'
 import AudioSettingsView from './AudioSettings.vue'
 import Dialog from './Dialog.vue'
 
-const props = defineProps<{ tab: 'audio' | 'updates'; audio: AudioSettings; level: number; speaking: boolean; connected: boolean; updater: Updater }>()
-const emit = defineEmits<{ close: []; tab: [tab: 'audio' | 'updates']; saved: [audio: AudioSettings] }>()
-const savingAudio = ref(false)
-const locked = computed(() => savingAudio.value || props.updater.saving || props.updater.installing)
+type Tab = 'audio' | 'updates'
+const props = defineProps<{ tab: Tab; audio: AudioSettings; controls: AudioControls; level: number; speaking: boolean; connected: boolean; updater: Updater }>()
+const emit = defineEmits<{ close: []; tab: [tab: Tab] }>()
+const audioForm = ref<InstanceType<typeof AudioSettingsView>>()
+const leaving = ref(false)
+const locked = computed(() => leaving.value || props.updater.saving || props.updater.installing)
+
+async function navigate(to?: Tab) {
+  if (locked.value || to === props.tab) return
+  leaving.value = true
+  try {
+    if (props.tab === 'audio' && audioForm.value && !(await audioForm.value.flush())) return
+    if (to) emit('tab', to)
+    else emit('close')
+  } finally { leaving.value = false }
+}
 
 function toggleUpdates(event: Event) {
   const checkbox = event.target as HTMLInputElement
@@ -20,13 +33,12 @@ function toggleUpdates(event: Event) {
 </script>
 
 <template>
-  <Dialog title="软件设置" wide :dismissible="!locked" @close="emit('close')">
+  <Dialog title="软件设置" wide :dismissible="!locked" @close="navigate()">
     <div class="segmented settings-tabs" role="group" aria-label="设置分类">
-      <button type="button" :aria-pressed="tab === 'audio'" :disabled="locked" @click="emit('tab', 'audio')">声音</button>
-      <button type="button" :aria-pressed="tab === 'updates'" :disabled="locked" @click="emit('tab', 'updates')">软件更新</button>
+      <button type="button" :aria-pressed="tab === 'audio'" :disabled="locked" @click="navigate('audio')">声音</button>
+      <button type="button" :aria-pressed="tab === 'updates'" :disabled="locked" @click="navigate('updates')">软件更新</button>
     </div>
-    <AudioSettingsView v-show="tab === 'audio'" :visible="tab === 'audio'" :audio="audio" :level="level" :speaking="speaking" :connected="connected"
-      @close="emit('close')" @saved="emit('saved', $event)" @saving="savingAudio = $event" />
+    <AudioSettingsView ref="audioForm" v-show="tab === 'audio'" :inert="leaving" :visible="tab === 'audio'" :controls="controls" :audio="audio" :level="level" :speaking="speaking" :connected="connected" />
     <section v-if="tab === 'updates'" class="settings-section update-settings">
       <p class="section-description">友声 GroveCall · 当前版本 {{ version }}</p>
       <label class="switch-row">启动时自动检查更新<input type="checkbox" role="switch" :checked="updater.enabled" :disabled="locked" @change="toggleUpdates" /></label>

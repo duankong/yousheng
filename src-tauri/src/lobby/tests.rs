@@ -20,6 +20,7 @@ fn core(path: &Path) -> Core {
 fn hello(secret: char) -> Op {
     Op::Hello {
         invite_key: INVITE.into(),
+        chat_deltas: false,
         nickname: "同名玩家".into(),
         avatar: String::new(),
         identity: secret.to_string().repeat(64),
@@ -70,7 +71,7 @@ fn avatar_and_nickname_updates_keep_voice_and_actor_identity() {
     assert_eq!(c.members[&guest].avatar, avatar);
     assert!(c.channels.find(&room).unwrap().can_delete(&guest, false));
 
-    let members = c.snapshot(&admin, Some(revision))["members"]
+    let members = c.snapshot(&admin, Some(revision), &mut None)["members"]
         .as_array()
         .unwrap()
         .clone();
@@ -84,7 +85,7 @@ fn avatar_and_nickname_updates_keep_voice_and_actor_identity() {
         text: "报点".into(),
     };
     assert!(c.apply(&guest, chat).is_ok());
-    let state = c.snapshot(&guest, Some(revision));
+    let state = c.snapshot(&guest, Some(revision), &mut None);
     assert_eq!(state["messages"][0]["authorName"], "夜猫");
     assert!(state["members"]
         .as_array()
@@ -112,7 +113,7 @@ fn avatar_and_nickname_updates_keep_voice_and_actor_identity() {
             }
         )
         .is_ok());
-    let state = c.snapshot(&admin, Some(revision));
+    let state = c.snapshot(&admin, Some(revision), &mut None);
     assert_eq!(
         state["members"]
             .as_array()
@@ -168,7 +169,9 @@ fn ownership_survives_restart_and_deleted_room_stays_deleted() {
     let mut c = core(&path);
     let creator = login(&mut c, 'b');
     let room = c.channels.create(&creator, "游戏").unwrap();
-    assert!(!c.snapshot(&creator, None)["admin"].as_bool().unwrap());
+    assert!(!c.snapshot(&creator, None, &mut None)["admin"]
+        .as_bool()
+        .unwrap());
     drop(c);
     let mut c = core(&path);
     let other = login(&mut c, 'c');
@@ -180,10 +183,16 @@ fn ownership_survives_restart_and_deleted_room_stays_deleted() {
             }
         )
         .is_err());
-    assert_eq!(c.snapshot(&other, None)["channels"][0]["canDelete"], false);
+    assert_eq!(
+        c.snapshot(&other, None, &mut None)["channels"][0]["canDelete"],
+        false
+    );
     let owner = login(&mut c, 'b');
     assert_eq!(owner, creator);
-    assert_eq!(c.snapshot(&owner, None)["channels"][0]["canDelete"], true);
+    assert_eq!(
+        c.snapshot(&owner, None, &mut None)["channels"][0]["canDelete"],
+        true
+    );
     assert!(c
         .apply(
             &owner,
@@ -239,12 +248,15 @@ fn chat_is_bounded_scoped_and_cleared_when_an_occupied_room_is_deleted() {
             )
             .is_ok());
     }
-    let history = c.snapshot(&a, None)["messages"].as_array().unwrap().clone();
+    let history = c.snapshot(&a, None, &mut None)["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(history.len(), 100);
     assert_eq!(history[0]["text"], "1");
-    assert_eq!(c.snapshot(&b, None)["messages"], json!([]));
+    assert_eq!(c.snapshot(&b, None, &mut None)["messages"], json!([]));
     join(&mut c, &b, &red);
-    assert_eq!(c.snapshot(&b, None)["messages"], json!(history));
+    assert_eq!(c.snapshot(&b, None, &mut None)["messages"], json!(history));
     let revoked = c.members[&b]
         .membership
         .as_ref()
@@ -260,7 +272,7 @@ fn chat_is_bounded_scoped_and_cleared_when_an_occupied_room_is_deleted() {
         )
         .is_ok());
     assert!(revoked.has_changed().is_err());
-    assert_eq!(c.snapshot(&b, None)["channelId"], Value::Null);
+    assert_eq!(c.snapshot(&b, None, &mut None)["channelId"], Value::Null);
     assert!(c.chat.history(Some(&red)).is_empty());
     assert!(c
         .apply(
@@ -302,6 +314,50 @@ async fn read(ws: &mut TestSocket) -> Value {
 async fn command(ws: &mut TestSocket, op: Value) -> Value {
     ws.send(Frame::Text(op.to_string().into())).await.unwrap();
     read(ws).await
+}
+
+#[tokio::test]
+async fn negotiated_chat_updates_only_send_new_messages_and_keep_old_clients_compatible() {
+    let (_stop, rx) = watch::channel(false);
+    let app = router_with_shutdown(config(), rx).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (mut ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    let hello = json!({"type":"hello","identity":"b".repeat(64),"nickname":"测试","inviteKey":INVITE,"chatDeltas":true});
+    assert_eq!(command(&mut ws, hello).await["type"], "snapshot");
+    let created = command(&mut ws, json!({"type":"create","name":"排位"})).await;
+    let room = &created["channels"][0]["id"];
+    let join = json!({"type":"join","channelId":room});
+    let joined = command(&mut ws, join.clone()).await;
+    assert_eq!(joined["messages"], json!([]));
+    assert_eq!(read(&mut ws).await["type"], "voice");
+
+    let chat = json!({"type":"chat","channelId":room,"text":"收到"});
+    let first = command(&mut ws, chat.clone()).await;
+    let second = command(&mut ws, chat).await;
+    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second["messagesAfter"], first["messages"][0]["id"]);
+    assert_ne!(second["messages"][0]["id"], first["messages"][0]["id"]);
+
+    let left = command(&mut ws, json!({"type":"leave"})).await;
+    assert_eq!(left["messages"], json!([]));
+    let (mut legacy, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+    let hello =
+        json!({"type":"hello","identity":"c".repeat(64),"nickname":"旧版","inviteKey":INVITE});
+    assert_eq!(command(&mut legacy, hello).await["type"], "snapshot");
+    let rejoined = command(&mut legacy, join).await;
+    assert!(rejoined.get("messagesAfter").is_none());
+    assert_eq!(rejoined["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(read(&mut legacy).await["type"], "voice");
+    let third = command(
+        &mut legacy,
+        json!({"type":"chat","channelId":room,"text":"第三条"}),
+    )
+    .await;
+    assert!(third.get("messagesAfter").is_none());
+    assert_eq!(third["messages"].as_array().unwrap().len(), 3);
+    server.abort();
 }
 
 #[tokio::test]

@@ -47,6 +47,7 @@ struct Membership {
 
 struct Member {
     session: Uuid,
+    chat_deltas: bool,
     name: String,
     avatar: String,
     playback: Option<std::net::SocketAddrV4>,
@@ -125,6 +126,8 @@ enum Op {
         invite_key: String,
         nickname: String,
         #[serde(default)]
+        chat_deltas: bool,
+        #[serde(default)]
         avatar: String,
         identity: String,
         playback_address: Option<String>,
@@ -167,6 +170,7 @@ impl Core {
         let Op::Hello {
             invite_key,
             nickname,
+            chat_deltas,
             avatar,
             identity,
             playback_address,
@@ -201,6 +205,7 @@ impl Core {
             id.clone(),
             Member {
                 session,
+                chat_deltas,
                 name: name.into(),
                 avatar,
                 playback,
@@ -213,7 +218,12 @@ impl Core {
         Ok((id, session, rx, previous_room))
     }
 
-    fn snapshot(&self, id: &str, sent_avatar_revision: Option<u64>) -> Value {
+    fn snapshot(
+        &self,
+        id: &str,
+        sent_avatar_revision: Option<u64>,
+        last_message: &mut Option<String>,
+    ) -> Value {
         let me = &self.members[id];
         let admin = self.owner == id;
         let channels: Vec<_> = self.channels.list.iter().map(|c|
@@ -229,8 +239,23 @@ impl Core {
                 member
             })
             .collect();
-        json!({"type":"snapshot", "selfId":id, "admin":admin, "channels":channels, "members":members,
-            "channelId":me.room(), "messages":self.chat.history(me.room())})
+        let history = self.chat.history(me.room());
+        let mut snapshot = json!({"type":"snapshot", "selfId":id, "admin":admin, "channels":channels,
+            "members":members, "channelId":me.room()});
+        let mut messages = history.as_slice();
+        if me.chat_deltas {
+            // A missing or evicted cursor (including after a room change) needs a full window.
+            if let Some(index) = last_message
+                .as_deref()
+                .and_then(|id| history.iter().rposition(|m| m.id == id))
+            {
+                snapshot["messagesAfter"] = json!(history[index].id);
+                messages = &history[index + 1..];
+            }
+            *last_message = history.last().map(|m| m.id.clone());
+        }
+        snapshot["messages"] = json!(messages);
+        snapshot
     }
 
     fn apply(&mut self, id: &str, op: Op) -> Result<Cleanup, &'static str> {
@@ -349,6 +374,7 @@ async fn socket(mut ws: WebSocket, state: Shared) {
     drop(core);
     let mut sent_epoch = None;
     let mut sent_avatar_revision = None;
+    let mut last_message = None;
     let period = Duration::from_secs(15);
     let mut heartbeat = interval_at(Instant::now() + period, period);
     let mut last_seen = Instant::now();
@@ -359,7 +385,7 @@ async fn socket(mut ws: WebSocket, state: Shared) {
                 if changed.is_err() { break; }
                 let core = state.core.lock().await;
                 if !core.active(&id, session) { break; }
-                let snapshot = core.snapshot(&id, sent_avatar_revision);
+                let snapshot = core.snapshot(&id, sent_avatar_revision, &mut last_message);
                 sent_avatar_revision = Some(core.avatar_revision);
                 let member = &core.members[&id];
                 let epoch = member.membership.as_ref().map(|m| m.epoch.clone());

@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::{sync::atomic::Ordering, time::Duration};
 use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
-use tokio::sync::MutexGuard;
+use tokio::sync::RwLockWriteGuard;
 use url::Url;
 
 #[derive(Serialize)]
@@ -66,10 +66,10 @@ pub(super) async fn check_update(
     Ok(info)
 }
 
-fn idle_session(state: &Desktop) -> Result<MutexGuard<'_, Option<Session>>, String> {
+fn idle_session(state: &Desktop) -> Result<RwLockWriteGuard<'_, Option<Session>>, String> {
     let session = state
         .session
-        .try_lock()
+        .try_write()
         .map_err(|_| "大厅状态正在变化，请稍后安装更新")?;
     if session.is_some() || state.closing.load(Ordering::SeqCst) {
         return Err("请先退出或停止大厅，再安装更新".into());

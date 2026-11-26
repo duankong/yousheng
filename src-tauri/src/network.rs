@@ -2,6 +2,7 @@
 //! encrypted WebRTC UDP packets, whether iroh chooses a direct path or relay.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
+use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use iroh::{
     endpoint::{presets, Builder, Connection},
     Endpoint, EndpointAddr, SecretKey,
@@ -248,13 +249,12 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
     let mut flows = Flows::<HostFlow>::new();
     let result = async {
         let mut expire = tokio::time::interval(FLOW_IDLE);
-        let mut next = Box::pin(receive_packet(conn));
+        let mut packets = IncomingPackets::default();
         loop {
             let packet = tokio::select! {
-                packet=&mut next => packet?,
+                packet=packets.receive(conn) => packet?,
                 _=expire.tick()=>{flows.expire();continue;},
             };
-            next.set(receive_packet(conn));
             if packet.len() < 3 {
                 continue;
             }
@@ -322,12 +322,32 @@ async fn send_packet(conn: &Connection, id: u16, payload: &[u8]) -> Result<()> {
     }
 }
 
-async fn receive_packet(conn: &Connection) -> Result<Bytes> {
-    tokio::select! {
-        frame=conn.read_datagram()=>frame.map_err(err),
-        stream=conn.accept_uni()=>{
-            let mut stream=stream.map_err(err)?;
-            Ok(timeout(Duration::from_secs(3),stream.read_to_end(MAX_PACKET+2)).await.map_err(err)?.map_err(err)?.into())
+#[derive(Default)]
+struct IncomingPackets {
+    large: FuturesUnordered<BoxFuture<'static, Option<Bytes>>>,
+}
+
+impl IncomingPackets {
+    async fn receive(&mut self, conn: &Connection) -> Result<Bytes> {
+        // Keep partial DTLS/oversize packets across polls without delaying live audio.
+        // Eight bounded reads use at most about 512 KiB of payload per peer.
+        const MAX_PACKET_READS: usize = 8;
+        loop {
+            tokio::select! {
+                frame = conn.read_datagram() => return frame.map_err(err),
+                stream = conn.accept_uni(), if self.large.len() < MAX_PACKET_READS => {
+                    let mut stream = stream.map_err(err)?;
+                    self.large.push(async move {
+                        timeout(Duration::from_secs(3), stream.read_to_end(MAX_PACKET + 2))
+                            .await.ok()?.ok().map(Bytes::from)
+                    }.boxed());
+                }
+                Some(frame) = self.large.next(), if !self.large.is_empty() => {
+                    if let Some(frame) = frame {
+                        return Ok(frame);
+                    }
+                }
+            }
         }
     }
 }
@@ -391,9 +411,7 @@ impl GuestEndpoint {
         let media_task = tokio::spawn(async move {
             let mut senders = Flows::new();
             let mut buf = vec![0; MAX_PACKET];
-            // A large QUIC stream can be partially read. Retain its future when an
-            // outgoing UDP packet wins select, so that a DTLS flight isn't reset.
-            let mut next = Box::pin(receive_packet(&media_conn));
+            let mut packets = IncomingPackets::default();
             let mut expire = tokio::time::interval(FLOW_IDLE);
             loop {
                 tokio::select! {
@@ -410,9 +428,8 @@ impl GuestEndpoint {
                         senders.insert(source.port(),source);
                         if send_packet(&media_conn,source.port(),&buf[..n]).await.is_err(){break}
                     }
-                    received=&mut next=>{
+                    received=packets.receive(&media_conn)=>{
                         let Ok(frame)=received else{break};
-                        next.set(receive_packet(&media_conn));
                         if frame.len()<3 {continue}
                         if let Some(addr)=senders.get(u16::from_be_bytes([frame[0],frame[1]])) {
                             let _=udp.send_to(&frame[2..],addr).await;
@@ -439,14 +456,19 @@ impl GuestEndpoint {
 
     #[cfg(test)]
     pub(crate) fn selected_transport(&self) -> Option<&'static str> {
+        self.selected_path().map(|(transport, _)| transport)
+    }
+
+    pub(crate) fn selected_path(&self) -> Option<(&'static str, Duration)> {
         self.conn.paths().iter().find(|p| p.is_selected()).map(|p| {
-            if p.is_relay() {
+            let transport = if p.is_relay() {
                 "relay"
             } else if p.is_ip() {
                 "direct"
             } else {
-                "other"
-            }
+                "unknown"
+            };
+            (transport, p.rtt())
         })
     }
 }
@@ -463,6 +485,74 @@ impl Drop for GuestEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_datagram_overtakes_partial_media_stream() {
+        let local_endpoint = || {
+            Endpoint::builder(presets::N0)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .clear_address_lookup()
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+        };
+        let host = local_endpoint().await.unwrap();
+        let guest = local_endpoint().await.unwrap();
+        let port = host
+            .bound_sockets()
+            .iter()
+            .find(|s| s.is_ipv4())
+            .unwrap()
+            .port();
+        let address = EndpointAddr::new(host.id())
+            .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        let (sender, receiver) = timeout(Duration::from_secs(5), async {
+            tokio::join!(guest.connect(address, ALPN), async {
+                host.accept().await.unwrap().await
+            })
+        })
+        .await
+        .unwrap();
+        let (sender, receiver) = (sender.unwrap(), receiver.unwrap());
+        let initial_stream_frames = receiver.stats().frame_rx.stream;
+        let mut slow = sender.open_uni().await.unwrap();
+        let payload = vec![7; 1600];
+        slow.write_all(&payload[..20]).await.unwrap();
+        // Only the prefix of the fallback packet is available when the receiver polls.
+        timeout(Duration::from_secs(2), async {
+            while receiver.stats().frame_rx.stream == initial_stream_frames {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut packets = IncomingPackets::default();
+        let mut next = Box::pin(packets.receive(&receiver));
+        assert!(futures_util::poll!(&mut next).is_pending());
+        let audio = Bytes::from_static(b"fresh audio");
+        sender.send_datagram(audio.clone()).unwrap();
+        let started = Instant::now();
+        let first = timeout(Duration::from_millis(500), next).await;
+        assert!(
+            first.is_ok(),
+            "audio remained blocked for {:?} on a partial stream",
+            started.elapsed()
+        );
+        assert_eq!(first.unwrap().unwrap(), audio);
+        println!(
+            "audio delivered in {:?} with fallback stream still unfinished",
+            started.elapsed()
+        );
+        slow.write_all(&payload[20..]).await.unwrap();
+        slow.finish().unwrap();
+        assert_eq!(
+            &timeout(Duration::from_secs(2), packets.receive(&receiver))
+                .await
+                .unwrap()
+                .unwrap()[..],
+            &payload[..]
+        );
+        sender.close(0u8.into(), b"done");
+    }
 
     #[test]
     fn dormant_media_flows_expire_and_new_channels_replace_old_ports() {

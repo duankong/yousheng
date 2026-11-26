@@ -32,6 +32,7 @@ export type Action = { type: 'create'; name: string }
 export interface AudioSettings {
   mode: 'open' | 'activation' | 'ptt'
   muted: boolean
+  outputMuted: boolean
   threshold: number
   inputGain: number
   outputGain: number

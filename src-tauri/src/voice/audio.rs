@@ -134,7 +134,12 @@ fn play<T: SizedSample + FromSample<f32>>(
         move |buffer: &mut [T], info| {
             let time = info.timestamp();
             let delay = latency(time.playback.duration_since(&time.callback));
-            let master = f32::from(settings.borrow().output_gain) / 100.0;
+            let master = settings.borrow().playback_gain();
+            if master == 0.0 {
+                // Drop the two interpolator samples from the previous, audible callback.
+                prev = 0.0;
+                next = 0.0;
+            }
             let mut mixer = mix.lock().unwrap();
             for frame in buffer.chunks_exact_mut(channels) {
                 while phase >= device_rate {
@@ -360,6 +365,7 @@ mod tests {
     fn speech_hangover_and_ptt_respect_manual_mute() {
         let mut prefs = AudioSettings {
             mode: "activation".into(),
+            output_muted: true,
             ..Default::default()
         };
         let mut gate = Gate::default();

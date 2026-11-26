@@ -83,7 +83,14 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 .lobby-status svg { width: 14px; height: 14px; stroke-width: 2; }
 .lobby-status[data-tone="idle"] { padding-inline: 0; }
 .lobby-status[data-tone="idle"] .lucide-circle { width: 8px; height: 8px; stroke-width: 3; }
-.lobby-status[data-tone="live"] { color: var(--live); background: #eaf4ef; }
+.lobby-status[data-tone="live"] { padding: 0; color: var(--live); background: #eaf4ef; }
+.connection-details-button { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: inherit; }
+.connection-details-button:hover { background: #deece4; }
+.connection-details-button svg:last-child { width: 12px; height: 12px; }
+.connection-facts { margin: 0; }
+.connection-facts div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 12px 0; }
+.connection-facts dt { color: var(--muted); }
+.connection-facts dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
 .lobby-status[data-tone="pending"] { color: var(--accent); background: var(--accent-soft); }
 @media (prefers-reduced-motion: no-preference) {
   .lobby-status[data-tone="pending"] svg { animation: lobby-connecting 1.2s linear infinite; }
@@ -113,10 +120,10 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 .local-list-error { display: flex; align-items: center; gap: 10px; color: var(--danger); }
 .overview-title h2 { font-size: 17px; font-weight: 650; letter-spacing: -.02em; }
 .list-icon, .empty-icon { display: inline-grid; place-items: center; flex: none; }
-.button, .audio-button, .text-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-weight: 550; }
-.button, .audio-button { border-radius: 9px; background: white; border: 1px solid #dedede; color: #404040; padding: 8px 13px; font-size: 13px; white-space: nowrap; }
-.button:hover:not(:disabled), .audio-button:hover:not(:disabled) { border-color: #bdbdbd; background: #f7f7f7; }
-.button svg, .audio-button svg { width: 16px; height: 16px; }
+.button, .text-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-weight: 550; }
+.button { border-radius: 9px; background: white; border: 1px solid #dedede; color: #404040; padding: 8px 13px; font-size: 13px; white-space: nowrap; }
+.button:hover:not(:disabled) { border-color: #bdbdbd; background: #f7f7f7; }
+.button svg { width: 16px; height: 16px; }
 .button.primary, .send { background: var(--ink); color: white; border-color: var(--ink); }
 .button.primary:hover:not(:disabled), .send:hover:not(:disabled) { background: #393939; border-color: #393939; }
 .button.danger { background: var(--danger); color: white; border-color: var(--danger); }
@@ -199,9 +206,6 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 .connection.online { color: var(--live); }
 .connection svg { width: 15px; }
 .retry-voice { color: var(--accent); padding: 3px 5px; }
-.audio-button { padding: 6px 9px; font-size: 12px; }
-.audio-button[aria-pressed=true] { color: var(--danger); background: #fbf1f2; }
-.audio-button[aria-pressed=true]:hover:not(:disabled) { background: #f7e5e7; border-color: #c58d95; }
 .voice-detail { background: #f7f7f7; border-top: 1px solid var(--line); font-size: 12px; padding: 7px 16px; color: #555; }
 .loading { margin: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .dialog { color: inherit; padding: 0; border: 1px solid var(--line); background: white; width: min(425px, calc(100% - 32px)); max-height: calc(100dvh - 50px); border-radius: 16px; box-shadow: 0 20px 80px #00000026; overflow-y: auto; }
@@ -274,7 +278,7 @@ button, .brand, .nav-heading { -webkit-user-select: none; user-select: none; }
 @media (hover: none) { .icon-button.delete-channel { opacity: 1; } }
 
 button { transition: background-color .18s ease, border-color .18s ease, color .18s ease, box-shadow .18s ease, transform .18s ease; }
-.button:active:not(:disabled), .audio-button:active:not(:disabled), .send:active:not(:disabled) { transform: scale(.97); }
+.button:active:not(:disabled), .send:active:not(:disabled) { transform: scale(.97); }
 .switch-row input, .switch-row input::after { transition: background-color .2s ease, left .2s ease; }
 .dialog[open] { animation: dialog-arrive .2s cubic-bezier(.2, .8, .2, 1) both; }
 .dialog[open]::backdrop { animation: backdrop-arrive .2s ease both; }
