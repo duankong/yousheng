@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import { ChevronDown, ChevronRight, CircleAlert, Clipboard, Copy, Link2, LoaderCircle, Power, Settings2, UserRoundPlus, X } from 'lucide-vue-next'
+import { Activity, ChevronDown, CircleAlert, Clipboard, Copy, Link2, LoaderCircle, Power, RotateCw, Settings2, UserRoundPlus, X } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
 import SettingsDialog from './features/SettingsDialog.vue'
@@ -8,6 +8,7 @@ import Chat, { chatSendHint, type ChatAttempt } from './features/Chat.vue'
 import Members from './features/Members.vue'
 import ProfileEditor from './features/ProfileEditor.vue'
 import PlayerAvatar from './features/PlayerAvatar.vue'
+import RoomAudioControls from './features/RoomAudioControls.vue'
 import { useLobby } from './features/useLobby'
 import { useAudioControls } from './features/useAudioControls'
 import { useUpdater } from './features/useUpdater'
@@ -50,9 +51,12 @@ const myName = computed(() => preferences.value?.nickname || '本地玩家')
 const banner = computed(() => (!panel.value && error.value) || offline.value || preferences.value?.shortcutError || '')
 const visibleHistory = computed(() => showHistory.value ? history.value : history.value.slice(0, 2))
 const blocked = computed(() => busy.value || updater.installing || !ready.value || firstRun.value)
-const inviteAction = computed(() => session.value?.isHost ? { icon: UserRoundPlus, title: '邀请好友', caption: '分享我的邀请链接' }
-  : busy.value ? { icon: LoaderCircle, title: '正在开启房间…', caption: '' }
-    : { icon: Power, title: '开启房间', caption: '本机房间已关闭' })
+const inviteAction = computed(() => session.value?.isHost ? { icon: UserRoundPlus, title: '邀请好友' }
+  : busy.value ? { icon: LoaderCircle, title: '正在开启房间…' }
+    : { icon: Power, title: '开启房间' })
+const homeStatus = computed(() => session.value?.isHost ? '等待好友加入'
+  : ready.value && !firstRun.value && !busy.value ? '房间未开启' : '')
+const canRetryVoice = computed(() => ['device-error', 'error', 'failed', 'disconnected'].includes(voice.value.state))
 
 watch([panel, session, detailsRefresh], async ([view, current], _, onCleanup) => {
   if (view !== 'connection') return
@@ -225,13 +229,6 @@ watch(offline, message => {
         <img src="/grovecall.png" width="31" height="31" alt="" />
         <strong>友声</strong><span>GroveCall</span>
       </div>
-      <div class="account">
-        <button class="profile-edit" :disabled="!preferences || blocked" aria-label="编辑个人资料" title="编辑个人资料" @click="openPanel('profile')">
-          <PlayerAvatar class="profile-avatar mine" :name="myName" :avatar="preferences?.avatar" person />
-          <span class="nickname">{{ myName }}</span>
-        </button>
-        <button class="button settings-link" :disabled="!preferences || blocked" @click="openPanel('audio')"><Settings2 aria-hidden="true" />软件设置</button>
-      </div>
     </header>
 
     <main class="main-view">
@@ -246,27 +243,31 @@ watch(offline, message => {
       </div>
 
       <div v-if="active && snapshot && session" :key="session.id" class="workspace">
-        <Chat v-model="draft" :snapshot="snapshot" :host="session.isHost" :controls="audioControls"
-          :voice-label="voiceLabel" :voice-message="voice.message" :in-voice="inVoice" :outbox="outbox" :busy="blocked"
-          :can-retry-voice="['device-error', 'error', 'failed', 'disconnected'].includes(voice.state)" :retrying-voice="retryingVoice"
-          @send="sendChat" @restore="restoreAttempt" @dismiss="removeAttempt" @retry="retryVoice"
-          @edit-profile="openPanel('profile')" @leave="leaveRoom" @connection="openPanel('connection')" />
+        <Chat v-model="draft" :snapshot="snapshot" :host="session.isHost" :outbox="outbox" :busy="blocked"
+          @send="sendChat" @restore="restoreAttempt" @dismiss="removeAttempt"
+          @edit-profile="openPanel('profile')" @leave="leaveRoom" />
         <Members :snapshot="snapshot" :speakers="speakers" :peers="preferences?.peers ?? {}" :controls="audioControls" :busy="blocked"
           @invite="openShare" @edit-profile="openPanel('profile')" @save="savePeer" />
       </div>
       <div v-else class="home-view">
-        <div class="room-actions">
-          <button class="room-action room-action-primary" :disabled="blocked" :aria-haspopup="session?.isHost ? 'dialog' : undefined" @click="inviteOrOpenRoom">
-            <span class="action-icon"><component :is="inviteAction.icon" aria-hidden="true" :class="{ 'room-spinner': !session && busy }" /></span>
-            <span class="action-label"><b>{{ inviteAction.title }}</b><small v-if="inviteAction.caption">{{ inviteAction.caption }}</small></span>
-            <ChevronRight class="action-chevron" aria-hidden="true" />
-          </button>
-          <button class="room-action" :disabled="blocked" aria-haspopup="dialog" @click="askJoin()">
-            <span class="action-icon"><Link2 aria-hidden="true" /></span>
-            <span class="action-label"><b>加入房间</b><small>粘贴好友的邀请链接</small></span>
-            <ChevronRight class="action-chevron" aria-hidden="true" />
-          </button>
-        </div>
+        <section class="home-hero" aria-labelledby="home-title">
+          <div>
+            <h1 id="home-title">我的房间</h1>
+            <p class="home-status" :class="{ 'is-live': session?.isHost }" role="status">{{ homeStatus }}</p>
+            <div class="room-actions">
+              <button class="button primary room-action" :disabled="blocked" :aria-haspopup="session?.isHost ? 'dialog' : undefined" @click="inviteOrOpenRoom">
+                <component :is="inviteAction.icon" aria-hidden="true" :class="{ 'room-spinner': !session && busy }" />
+                {{ inviteAction.title }}
+              </button>
+              <button class="button room-action" :disabled="blocked" aria-haspopup="dialog" @click="askJoin()">
+                <Link2 aria-hidden="true" />加入房间
+              </button>
+            </div>
+          </div>
+          <div class="home-art" aria-hidden="true">
+            <img src="/grovecall.png" width="164" height="164" alt="" />
+          </div>
+        </section>
         <section class="history" aria-labelledby="history-title">
           <header class="history-heading">
             <h2 id="history-title">历史房间</h2>
@@ -286,6 +287,31 @@ watch(offline, message => {
         </section>
       </div>
     </main>
+
+    <footer class="control-bar" aria-label="个人和通话控制">
+      <p v-if="active && voice.message" class="voice-detail" role="status">{{ voice.message }}</p>
+      <div class="control-row">
+        <div class="personal-controls">
+          <button type="button" class="profile-edit" :disabled="!preferences || blocked" aria-label="编辑个人资料" aria-haspopup="dialog" title="编辑个人资料" @click="openPanel('profile')">
+            <PlayerAvatar class="mine" :name="myName" :avatar="preferences?.avatar" person />
+            <span class="nickname">{{ myName }}</span>
+          </button>
+          <button type="button" class="button settings-link" :disabled="!preferences || blocked" aria-haspopup="dialog" @click="openPanel('audio')">
+            <Settings2 aria-hidden="true" />软件设置
+          </button>
+        </div>
+        <div v-if="active" class="voice-status">
+          <button type="button" class="connection" :class="{ online: inVoice }" title="查看房间连接详情" aria-haspopup="dialog" @click="openPanel('connection')">
+            <span role="status">{{ voiceLabel }}</span><Activity aria-hidden="true" />
+          </button>
+          <button v-if="canRetryVoice" type="button" :disabled="blocked || retryingVoice" class="text-button retry-voice" @click="retryVoice">
+            <RotateCw aria-hidden="true" />重试语音
+          </button>
+        </div>
+        <RoomAudioControls :controls="audioControls" :dialog-open="!!panel || firstRun" />
+      </div>
+      <Transition name="notice"><div v-if="notice" class="toast" role="status"><Clipboard aria-hidden="true" />{{ notice }}</div></Transition>
+    </footer>
 
     <ProfileEditor v-if="editingProfile && preferences" :preferences="preferences" :first-run="firstRun" @close="closePanel" @saved="profileSaved" />
     <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates' || panel === 'diagnostics') && preferences" :tab="panel" :level="level"
@@ -333,6 +359,5 @@ watch(offline, message => {
         </footer>
       </div>
     </Dialog>
-    <Transition name="notice"><div v-if="notice" class="toast" role="status"><Clipboard aria-hidden="true" />{{ notice }}</div></Transition>
   </div>
 </template>

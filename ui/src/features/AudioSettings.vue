@@ -110,7 +110,7 @@ onBeforeUnmount(() => { void flush() })
           </select>
         </label>
         <label class="range-label" for="audio-output-gain"><span>播放音量</span><output>{{ draft.outputGain }}%</output>
-          <input id="audio-output-gain" :value="draft.outputGain" type="range" min="0" :max="audioGainLimits.outputGain" @input="controls.change('outputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
+          <input id="audio-output-gain" :value="draft.outputGain" type="range" min="0" :max="audioGainLimits.outputGain" @input="controls.change('outputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.finishGain('outputGain')" />
         </label>
         <label class="switch-row">麦克风降噪<input :checked="draft.noiseSuppression" type="checkbox" role="switch" @change="controls.change('noiseSuppression', ($event.target as HTMLInputElement).checked)" /></label>
         <label class="switch-row">回声消除<input :checked="draft.echoCancellation" type="checkbox" role="switch" @change="controls.change('echoCancellation', ($event.target as HTMLInputElement).checked)" /></label>

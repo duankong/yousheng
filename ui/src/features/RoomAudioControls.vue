@@ -1,21 +1,27 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
-import { Mic, MicOff, Volume2, VolumeX } from 'lucide-vue-next'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { LoaderCircle, Mic, MicOff, Volume2, VolumeX } from 'lucide-vue-next'
 import { audioGainLimits, type AudioControls } from './useAudioControls'
 
-const props = defineProps<{ controls: AudioControls }>()
+const props = defineProps<{ controls: AudioControls; dialogOpen: boolean }>()
 const audio = computed(() => props.controls.effective)
 const items = [
   { gain: 'inputGain', mute: 'muted', name: '麦克风音量', muteLabel: '麦克风静音', off: '关闭麦克风', on: '取消麦克风静音', icon: Mic, mutedIcon: MicOff },
   { gain: 'outputGain', mute: 'outputMuted', name: '扬声器音量', muteLabel: '扬声器静音', off: '关闭扬声器', on: '恢复扬声器声音', icon: Volume2, mutedIcon: VolumeX },
 ] as const
 type Gain = (typeof items)[number]['gain']
+type Mute = (typeof items)[number]['mute']
+const toggles = ref<HTMLElement>()
 const open = ref<Gain>()
 let dragging = false
 let hoverTimer: ReturnType<typeof setTimeout> | undefined
 
+function mutePending(mute: Mute) {
+  return audio.value?.[mute] !== props.controls.current?.[mute]
+}
 function show(gain: Gain, hovering = false) {
-  if (dragging) return
+  if (!audio.value || dragging || props.dialogOpen) return
+  if (hovering && open.value !== gain && toggles.value?.querySelector('.gain-control:has(.volume-popover) :focus-visible')) return
   clearTimeout(hoverTimer)
   // A diagonal move to the open slider briefly crosses the adjacent button.
   if (hovering && open.value && open.value !== gain) {
@@ -42,29 +48,40 @@ function startDrag(event: PointerEvent) {
   slider.setPointerCapture(event.pointerId)
 }
 function endDrag(gain: Gain, event: PointerEvent) {
+  if (!dragging) return
   dragging = false
+  void props.controls.flush()
   const group = (event.currentTarget as HTMLElement).closest('.gain-control')
   if (!group?.contains(document.elementFromPoint(event.clientX, event.clientY))) closeSoon(gain)
 }
-function dismiss(event: KeyboardEvent) {
-  const group = event.currentTarget as HTMLElement
-  dragging = false
-  group.querySelector('button')?.focus()
+function hide() {
   clearTimeout(hoverTimer)
   open.value = undefined
+  if (dragging) {
+    dragging = false
+    void props.controls.flush()
+  }
 }
-onBeforeUnmount(() => clearTimeout(hoverTimer))
+function dismiss(event: KeyboardEvent) {
+  const group = event.currentTarget as HTMLElement
+  group.querySelector('button')?.focus()
+  hide()
+}
+watch(() => props.dialogOpen, dialogOpen => { if (dialogOpen) hide() })
+onBeforeUnmount(hide)
 </script>
 
 <template>
-  <div class="call-toggles" role="group" aria-label="通话声音控制">
+  <div ref="toggles" class="call-toggles" role="group" aria-label="声音快捷控制">
     <div v-for="item in items" :key="item.gain" class="gain-control"
       @pointerenter="show(item.gain, true)" @pointerleave="leave"
       @focusin="show(item.gain)" @focusout="blur(item.gain, $event)" @keydown.esc.stop.prevent="dismiss">
       <button type="button" class="icon-button" :disabled="!audio" :aria-label="item.muteLabel"
-        :aria-pressed="!!audio?.[item.mute]" :title="audio?.[item.mute] ? item.on : item.off"
+        :aria-pressed="!!controls.current?.[item.mute]" :aria-busy="mutePending(item.mute) || undefined"
+        :title="mutePending(item.mute) ? '正在应用声音设置…' : audio?.[item.mute] ? item.on : item.off"
         @click="audio && controls.change(item.mute, !audio[item.mute])">
-        <component :is="audio?.[item.mute] ? item.mutedIcon : item.icon" aria-hidden="true" />
+        <LoaderCircle v-if="mutePending(item.mute)" class="room-spinner" aria-hidden="true" />
+        <component v-else :is="audio?.[item.mute] ? item.mutedIcon : item.icon" aria-hidden="true" />
       </button>
       <div v-if="audio && open === item.gain" class="volume-popover">
         <div class="volume-card" :style="{ '--volume-level': audio[item.gain] / audioGainLimits[item.gain] }">
@@ -72,7 +89,8 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
             :aria-label="item.name" aria-orientation="vertical" :aria-valuetext="audio[item.gain] + '%'"
             @pointerdown="startDrag"
             @pointerup="endDrag(item.gain, $event)" @pointercancel="endDrag(item.gain, $event)"
-            @input="controls.change(item.gain, ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
+            @lostpointercapture="endDrag(item.gain, $event)"
+            @input="controls.change(item.gain, ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.finishGain(item.gain)" />
           <span class="volume-value" aria-hidden="true">{{ audio[item.gain] }}%</span>
         </div>
       </div>
@@ -81,13 +99,23 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
 </template>
 
 <style scoped>
-.call-toggles { display: flex; gap: 2px; margin-inline-start: auto; }
+.call-toggles { display: flex; flex: none; gap: 4px; }
 .gain-control { position: relative; }
 .icon-button { width: 36px; height: 36px; }
 .gain-control:has(.volume-popover) > .icon-button[aria-pressed=false] { color: var(--accent); background: var(--accent-soft); }
 .icon-button[aria-pressed=true] { color: var(--danger); background: #fbf1f2; }
 .icon-button[aria-pressed=true]:hover { background: #f7e5e7; }
-.volume-popover { position: absolute; z-index: 3; inset-inline: 0; bottom: 100%; padding-bottom: 5px; display: grid; justify-items: center; }
+.volume-popover {
+  position: absolute;
+  z-index: 3;
+  inset-inline: 0;
+  bottom: 100%;
+  padding-bottom: 5px;
+  display: grid;
+  justify-items: center;
+  animation: volume-arrive .14s ease-out both;
+}
+@keyframes volume-arrive { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .volume-card {
   --volume-fill: color-mix(in srgb, var(--accent) 82%, white);
   --volume-track-length: 96px;

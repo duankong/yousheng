@@ -10,15 +10,12 @@ export function chatSendHint(attempts: ChatAttempt[], text: string): string {
 
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import { Activity, RotateCw } from 'lucide-vue-next'
 import type { Snapshot } from '../model'
-import RoomAudioControls from './RoomAudioControls.vue'
-import type { AudioControls } from './useAudioControls'
 import PlayerAvatar from './PlayerAvatar.vue'
 
-const props = defineProps<{ snapshot: Snapshot; host: boolean; outbox: ChatAttempt[]; controls: AudioControls; voiceLabel: string; voiceMessage?: string; inVoice: boolean; canRetryVoice: boolean; retryingVoice: boolean; busy: boolean }>()
+const props = defineProps<{ snapshot: Snapshot; host: boolean; outbox: ChatAttempt[]; busy: boolean }>()
 const draft = defineModel<string>({ required: true })
-const emit = defineEmits<{ leave: []; retry: []; send: []; restore: [id: number]; dismiss: [id: number]; editProfile: []; connection: [] }>()
+const emit = defineEmits<{ leave: []; send: []; restore: [id: number]; dismiss: [id: number]; editProfile: [] }>()
 const sendHint = computed(() => chatSendHint(props.outbox, draft.value))
 const log = ref<HTMLElement>()
 const atBottom = ref(true)
@@ -83,16 +80,6 @@ function keydown(event: KeyboardEvent) {
       </div>
       <p v-if="sendHint" class="send-hint" role="status">{{ sendHint }}</p>
     </form>
-    <footer class="call-controls">
-      <div class="voice-status">
-        <button type="button" class="connection" :class="{ online: inVoice }" title="查看房间连接详情" aria-haspopup="dialog" @click="emit('connection')">
-          <span role="status">{{ voiceLabel }}</span><Activity aria-hidden="true" />
-        </button>
-        <button v-if="canRetryVoice" :disabled="busy || retryingVoice" class="text-button retry-voice" @click="emit('retry')"><RotateCw aria-hidden="true" />重试语音</button>
-      </div>
-      <RoomAudioControls :controls="controls" />
-    </footer>
-    <p v-if="voiceMessage" class="voice-detail" role="status">{{ voiceMessage }}</p>
   </section>
 </template>
 
@@ -137,13 +124,4 @@ function keydown(event: KeyboardEvent) {
 .send:hover:not(:disabled) { background: #393939; }
 .send:disabled { background: var(--panel); color: var(--muted); opacity: 1; }
 .send-hint { margin-top: 5px; font-size: 11px; color: var(--muted); }
-.call-controls { display: flex; align-items: center; flex: none; min-height: 38px; gap: 6px; margin-top: 7px; }
-.voice-status { display: flex; align-items: center; flex: 1; min-width: 0; gap: 4px; }
-.connection { display: inline-flex; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 6px; color: var(--muted); font-size: 12px; }
-.connection::before { content: ''; width: 7px; height: 7px; flex: none; border-radius: 50%; background: #aaa; }
-.connection.online::before { background: var(--live); }
-.connection:hover { background: var(--panel); }
-.connection svg, .retry-voice svg { width: 13px; height: 13px; }
-.retry-voice { color: var(--accent); padding: 3px 5px; }
-.voice-detail { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
 </style>

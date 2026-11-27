@@ -345,6 +345,7 @@ pub(crate) async fn join_microphone(
 pub struct VoiceEngine {
     session: AsyncMutex<Option<Session>>,
     audio: AudioControls,
+    speaker_preview: AsyncMutex<()>,
 }
 
 impl VoiceEngine {
@@ -358,6 +359,7 @@ impl VoiceEngine {
                 capture_control: Arc::new(CaptureControl::default()),
                 mix: Default::default(),
             },
+            speaker_preview: AsyncMutex::new(()),
         }
     }
 
@@ -529,6 +531,27 @@ impl VoiceEngine {
         );
         self.audio.settings.send_replace(settings);
         Ok(())
+    }
+
+    pub async fn preview_speaker_volume(&self, expected_gain: u16) -> Result<(), String> {
+        let _preview = self.speaker_preview.lock().await;
+        let (device, gain) = {
+            let slot = self.session.lock().await;
+            let settings = self.audio.settings.borrow().clone();
+            let gain = settings.playback_gain();
+            if gain == 0.0 || settings.output_gain != expected_gain {
+                return Ok(());
+            }
+            if let Some(session) = slot.as_ref() {
+                let io = session.io.lock().await;
+                if io.as_ref().is_some_and(|io| io.preview_speaker(gain)) {
+                    return Ok(());
+                }
+            }
+            (settings.output_device, gain)
+        };
+        audio::speaker_preview::play_on_device(&device, self.audio.capture_control.clone(), gain)
+            .await
     }
 
     pub async fn devices(&self) -> Result<AudioDevices, String> {

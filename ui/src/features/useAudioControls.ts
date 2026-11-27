@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type { AudioSettings, PeerSettings, Preferences } from '../model'
 
 export const audioGainLimits = { inputGain: 200, outputGain: 150 } as const
+type AudioGain = keyof typeof audioGainLimits
 const defaultPeer: PeerSettings = { volume: 100, muted: false }
 
 export function useAudioControls(preferences: Ref<Preferences | undefined>) {
@@ -17,6 +18,8 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
   const peerChanges = reactive(new Map<string, PeerSettings>())
   let timer: ReturnType<typeof setTimeout> | undefined
   let writing: Promise<boolean> | undefined
+  let speakerGainBefore: number | undefined
+  let speakerRevision = 0
 
   async function drain() {
     let success = true
@@ -55,11 +58,35 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
   function change<K extends keyof AudioSettings>(key: K, value: AudioSettings[K], dragging = false) {
     const audio = effective.value
     if (!audio || audio[key] === value) return
+    if (key === 'outputGain') {
+      speakerGainBefore ??= audio.outputGain
+      ++speakerRevision
+    }
     pending.value = { ...pending.value, [key]: value }
     error.value = ''
     // A sustained drag previews periodically. Pointer release and navigation flush immediately.
     if (!dragging) void flush()
     else if (!timer) timer = setTimeout(flush, 120)
+  }
+
+  async function finishGain(key: AudioGain) {
+    if (key === 'inputGain') {
+      await flush()
+      return
+    }
+    const before = speakerGainBefore
+    speakerGainBefore = undefined
+    const revision = speakerRevision
+    const audio = effective.value
+    const saved = await flush()
+    if (!saved || !audio || before === undefined || audio.outputGain === before ||
+        audio.outputGain === 0 || audio.outputMuted || revision !== speakerRevision ||
+        effective.value?.outputMuted || current.value?.outputGain !== audio.outputGain) return
+    try {
+      await invoke('preview_speaker_volume', { gain: audio.outputGain })
+    } catch (reason) {
+      if (revision === speakerRevision) error.value = '扬声器试听失败：' + String(reason)
+    }
   }
 
   function peerSettings(id: string) {
@@ -79,7 +106,7 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
     } finally { peerChanges.delete(id) }
   }
 
-  return reactive({ current, effective, error, change, flush, peerSettings, peerSaving, savePeer })
+  return reactive({ current, effective, error, change, flush, finishGain, peerSettings, peerSaving, savePeer })
 }
 
 export type AudioControls = ReturnType<typeof useAudioControls>

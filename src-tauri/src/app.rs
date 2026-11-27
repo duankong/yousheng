@@ -470,6 +470,10 @@ async fn monitor_microphone(state: State<'_, Desktop>, active: bool) -> Result<(
     state.voice.monitor(active).await
 }
 #[tauri::command]
+async fn preview_speaker_volume(state: State<'_, Desktop>, gain: u16) -> Result<(), String> {
+    state.voice.preview_speaker_volume(gain).await
+}
+#[tauri::command]
 async fn set_audio(
     app: AppHandle,
     state: State<'_, Desktop>,
@@ -655,6 +659,7 @@ pub fn run() {
             set_peer,
             list_devices,
             monitor_microphone,
+            preview_speaker_volume,
             take_invite
         ])
         .build(tauri::generate_context!())

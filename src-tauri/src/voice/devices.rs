@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait},
-    BuildStreamError, Device, SampleFormat, Stream, SupportedStreamConfig,
-    SupportedStreamConfigRange,
+    BuildStreamError, Device, SampleFormat, SupportedStreamConfig, SupportedStreamConfigRange,
 };
 use serde::Serialize;
 
@@ -99,11 +98,11 @@ pub(super) fn select(id: &str, input: bool) -> Result<Device, String> {
 
 // Some WASAPI drivers report a float mix format but only accept integer PCM
 // when a client opens the stream. Probe alternatives only after that rejection.
-pub(super) fn open_stream(
+pub(super) fn open_stream<T>(
     device: &Device,
     input: bool,
-    mut build: impl FnMut(&SupportedStreamConfig) -> Result<Stream, BuildStreamError>,
-) -> Result<Stream, String> {
+    mut build: impl FnMut(&SupportedStreamConfig) -> Result<T, BuildStreamError>,
+) -> Result<T, String> {
     let kind = if input { "麦克风" } else { "扬声器" };
     let name = device.name().unwrap_or_else(|_| "未知设备".into());
     let default = if input {

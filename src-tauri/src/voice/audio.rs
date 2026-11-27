@@ -23,6 +23,8 @@ use livekit::webrtc::{
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
+use speaker_preview::SpeakerTone;
+
 pub(super) const RATE: u32 = 48_000;
 pub(super) const BLOCK: usize = 480;
 
@@ -111,6 +113,10 @@ impl CaptureControl {
 
     pub(super) fn set_monitoring(&self, active: bool) {
         self.monitor.store(active, Ordering::Relaxed);
+    }
+
+    fn playback_gain(&self) -> f32 {
+        f32::from_bits(self.playback_gain.load(Ordering::Relaxed))
     }
 
     fn blocked_prefix(&self, block: &CaptureBlock, now: Instant) -> usize {
@@ -418,6 +424,7 @@ fn play<T: SizedSample + FromSample<f32>>(
     config: &cpal::StreamConfig,
     mix: Arc<Mutex<Mixer>>,
     control: Arc<CaptureControl>,
+    preview: Arc<AtomicU32>,
     reference: Arc<ArrayQueue<ReferenceBlock>>,
     err: ErrorCallback,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
@@ -428,6 +435,7 @@ where
     let device_rate = config.sample_rate.0;
     let mut reference_framer = Framer::new(device_rate);
     let mut playback = Playback::new(device_rate);
+    let mut tone = SpeakerTone::new(device_rate);
     let mut priority = devices::CallbackPriority::default();
     device.build_output_stream(
         config,
@@ -447,10 +455,14 @@ where
                 reference_framer.reset();
                 None
             };
-            let master = f32::from_bits(control.playback_gain.load(Ordering::Relaxed));
+            let master = control.playback_gain();
+            let requested = preview.swap(0, Ordering::Relaxed);
+            if requested != 0 && requested == master.to_bits() {
+                tone.start(master);
+            }
             let frames = buffer.chunks_exact_mut(channels);
             let mut index = 0;
-            playback.render(frames, master, &mix, |frame, sample| {
+            let mut write_frame = |frame: &mut [T], sample: f32| {
                 let output = T::from_sample(sample.clamp(-1.0, 0.999_969_5));
                 frame.fill(output);
                 if let Some(packet_start) = packet_start {
@@ -466,17 +478,30 @@ where
                     );
                     index += 1;
                 }
-            });
+            };
+            if tone.keep_playing_at(master) {
+                // Include the local cue in the echo-canceller's playback reference.
+                playback.render(frames, master, &mix, |frame, sample| {
+                    write_frame(frame, sample + tone.next_sample());
+                });
+            } else {
+                playback.render(frames, master, &mix, write_frame);
+            }
         },
         err,
         None,
     )
 }
 
+struct SpeakerOutput {
+    stream: cpal::Stream,
+    preview: Arc<AtomicU32>,
+}
+
 pub(super) struct AudioIo {
     worker: Task,
     input: cpal::Stream,
-    output: Option<cpal::Stream>,
+    output: Option<SpeakerOutput>,
     failed: Arc<AtomicBool>,
 }
 
@@ -486,7 +511,7 @@ pub(super) struct PreparedAudioIo {
     control: Arc<CaptureControl>,
     source: Option<NativeAudioSource>,
     input: cpal::Stream,
-    output: Option<cpal::Stream>,
+    output: Option<SpeakerOutput>,
     capture: Arc<CaptureQueue>,
     reference: Arc<ArrayQueue<ReferenceBlock>>,
     failed: Arc<AtomicBool>,
@@ -506,9 +531,19 @@ macro_rules! build_stream {
     };
 }
 
+pub(super) mod speaker_preview;
+
 impl AudioIo {
     pub(super) fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn preview_speaker(&self, gain: f32) -> bool {
+        let Some(output) = self.output.as_ref().filter(|_| !self.failed()) else {
+            return false;
+        };
+        output.preview.store(gain.to_bits(), Ordering::Relaxed);
+        true
     }
 
     pub(super) async fn stop(self) {
@@ -550,7 +585,8 @@ impl PreparedAudioIo {
         })?;
         let output = if source.is_some() {
             let output = devices::select(&prefs.output_device, false)?;
-            Some(devices::open_stream(&output, false, |format| {
+            let preview = Arc::new(AtomicU32::new(0));
+            let stream = devices::open_stream(&output, false, |format| {
                 build_stream!(
                     format.sample_format(),
                     play,
@@ -558,10 +594,12 @@ impl PreparedAudioIo {
                     &format.config(),
                     mix.clone(),
                     control.clone(),
+                    preview.clone(),
                     reference.clone(),
                     error_handler(app, &failed, "扬声器")
                 )
-            })?)
+            })?;
+            Some(SpeakerOutput { stream, preview })
         } else {
             None
         };
@@ -592,6 +630,7 @@ impl PreparedAudioIo {
         } = self;
         if let Some(output) = &output {
             output
+                .stream
                 .play()
                 .map_err(|e| format!("无法启动播放设备：{e}"))?;
         }
@@ -799,6 +838,34 @@ async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speaker_tone_is_brief_and_scales_with_the_selected_gain() {
+        for rate in [44_100, 48_000] {
+            let render = |gain| {
+                let mut tone = SpeakerTone::new(rate);
+                assert_eq!(tone.next_sample(), 0.0);
+                tone.start(gain);
+                let samples: Vec<_> = (0..rate / 10).map(|_| tone.next_sample()).collect();
+                assert_eq!(samples[0], 0.0);
+                assert_eq!(samples.last(), Some(&0.0));
+                assert_eq!(tone.next_sample(), 0.0);
+                samples.into_iter().map(f32::abs).fold(0.0, f32::max)
+            };
+            let normal = render(1.0);
+            assert!((0.05..0.2).contains(&normal));
+            assert!((render(0.25) / normal - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn speaker_tone_cancels_when_output_is_muted() {
+        let mut tone = SpeakerTone::new(48_000);
+        tone.start(1.0);
+        assert!(tone.keep_playing_at(1.0));
+        assert!(!tone.keep_playing_at(0.0));
+        assert!(!tone.keep_playing_at(1.0));
+    }
 
     #[tokio::test]
     #[ignore = "measures the local microphone without publishing audio"]
