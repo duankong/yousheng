@@ -1,46 +1,14 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
-use std::path::Path;
 use tokio_tungstenite::{connect_async, tungstenite::Message as Frame};
 
 const INVITE: &str = "this-test-invite-is-public";
 
-fn core(path: &Path) -> Core {
-    Core {
-        owner: player_id(&"a".repeat(64)).unwrap(),
-        invite: Sha256::digest(INVITE.as_bytes()).into(),
-        channels: Channels::open(path).unwrap(),
-        chat: Chat::default(),
-        members: BTreeMap::new(),
-        avatar_revision: 0,
-        pending: BTreeMap::new(),
-    }
-}
-
-fn hello(secret: char) -> Op {
-    Op::Hello {
-        invite_key: INVITE.into(),
-        chat_deltas: false,
-        nickname: "同名玩家".into(),
-        avatar: String::new(),
-        identity: secret.to_string().repeat(64),
-        playback_address: None,
-    }
-}
-
-fn login(c: &mut Core, secret: char) -> String {
-    c.login(hello(secret)).unwrap().0
-}
-
-fn join(c: &mut Core, id: &str, room: &str) {
-    c.apply(
-        id,
-        Op::Join {
-            channel_id: room.into(),
-        },
-    )
-    .ok()
-    .unwrap();
+fn hello(secret: char, name: &str) -> Value {
+    json!({
+        "type":"hello", "roomProtocol":2, "inviteKey":INVITE,
+        "identity":secret.to_string().repeat(64), "nickname":name,
+    })
 }
 
 fn jpeg_url(bytes: &[u8]) -> String {
@@ -48,247 +16,10 @@ fn jpeg_url(bytes: &[u8]) -> String {
     format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes))
 }
 
-#[test]
-fn avatar_and_nickname_updates_keep_voice_and_actor_identity() {
-    let mut c = core(Path::new(":memory:"));
-    let avatar = jpeg_url(include_bytes!("test-avatar.jpg"));
-    let guest = login(&mut c, 'b');
-    let admin = login(&mut c, 'a');
-    let room = c.channels.create(&guest, "排位").unwrap();
-    join(&mut c, &guest, &room);
-    let session = c.members[&guest].session;
-    let epoch = c.members[&guest].membership.as_ref().unwrap().epoch.clone();
-    let revision = c.avatar_revision;
-    let op = serde_json::from_value(json!({"type":"profile","id":admin,
-        "nickname":"  夜猫  ","avatar":avatar}))
-    .unwrap();
-    assert!(matches!(c.apply(&guest, op), Ok(Cleanup::None)));
-    assert!(c.active(&guest, session));
-    assert_eq!(c.members[&guest].membership.as_ref().unwrap().epoch, epoch);
-    assert_eq!(c.members[&guest].room(), Some(room.as_str()));
-    assert_eq!(c.members[&admin].name, "同名玩家");
-    assert_eq!(c.members[&guest].name, "夜猫");
-    assert_eq!(c.members[&guest].avatar, avatar);
-    assert!(c.channels.find(&room).unwrap().can_delete(&guest, false));
-
-    let members = c.snapshot(&admin, Some(revision), &mut None)["members"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        members.iter().find(|m| m["id"] == guest).unwrap()["avatar"],
-        avatar
-    );
-    let revision = c.avatar_revision;
-    let chat = Op::Chat {
-        channel_id: room.clone(),
-        text: "报点".into(),
-    };
-    assert!(c.apply(&guest, chat).is_ok());
-    let state = c.snapshot(&guest, Some(revision), &mut None);
-    assert_eq!(state["messages"][0]["authorName"], "夜猫");
-    assert!(state["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|m| m.get("avatar").is_none()));
-    assert!(c
-        .apply(
-            &guest,
-            Op::Profile {
-                nickname: "换错了".into(),
-                avatar: "data:text/plain,hi".into()
-            }
-        )
-        .is_err());
-    assert_eq!(c.members[&guest].name, "夜猫");
-    assert_eq!(c.avatar_revision, revision);
-
-    assert!(c
-        .apply(
-            &guest,
-            Op::Profile {
-                nickname: "夜猫".into(),
-                avatar: String::new()
-            }
-        )
-        .is_ok());
-    let state = c.snapshot(&admin, Some(revision), &mut None);
-    assert_eq!(
-        state["members"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["id"] == guest)
-            .unwrap()["avatar"],
-        ""
-    );
-}
-
-#[test]
-fn hello_accepts_old_clients_and_rejects_invalid_or_oversize_pictures() {
-    let mut c = core(Path::new(":memory:"));
-    let mut hello =
-        json!({"type":"hello","identity":"b".repeat(64),"nickname":"玩家","inviteKey":INVITE});
-    let first = c
-        .login(serde_json::from_value(hello.clone()).unwrap())
-        .unwrap()
-        .0;
-    assert!(c.members[&first].avatar.is_empty());
-
-    let jpeg = include_bytes!("test-avatar.jpg");
-    hello["avatar"] = jpeg_url(jpeg).into();
-    let rejoined = c
-        .login(serde_json::from_value(hello.clone()).unwrap())
-        .unwrap()
-        .0;
-    assert_eq!(first, rejoined);
-    assert_eq!(c.members[&first].avatar, hello["avatar"]);
-    let session = c.members[&first].session;
-    let mut wide = jpeg.to_vec();
-    let frame = wide.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
-    wide[frame + 7..frame + 9].copy_from_slice(&97u16.to_be_bytes());
-    for invalid in [
-        jpeg_url(&wide),
-        jpeg_url(&jpeg[..20]),
-        jpeg_url(&vec![0; 8193]),
-        "https://example.org/avatar.jpg".into(),
-        "data:image/jpeg;base64,invalid?".into(),
-    ] {
-        hello["avatar"] = invalid.into();
-        assert!(c
-            .login(serde_json::from_value(hello.clone()).unwrap())
-            .is_err());
-        assert!(c.active(&first, session));
-    }
-}
-
-#[test]
-fn ownership_survives_restart_and_deleted_room_stays_deleted() {
-    let path = std::env::temp_dir().join(format!("duipin-{}.sqlite", Uuid::new_v4()));
-    let mut c = core(&path);
-    let creator = login(&mut c, 'b');
-    let room = c.channels.create(&creator, "游戏").unwrap();
-    assert!(!c.snapshot(&creator, None, &mut None)["admin"]
-        .as_bool()
-        .unwrap());
-    drop(c);
-    let mut c = core(&path);
-    let other = login(&mut c, 'c');
-    assert!(c
-        .apply(
-            &other,
-            Op::Delete {
-                channel_id: room.clone()
-            }
-        )
-        .is_err());
-    assert_eq!(
-        c.snapshot(&other, None, &mut None)["channels"][0]["canDelete"],
-        false
-    );
-    let owner = login(&mut c, 'b');
-    assert_eq!(owner, creator);
-    assert_eq!(
-        c.snapshot(&owner, None, &mut None)["channels"][0]["canDelete"],
-        true
-    );
-    assert!(c
-        .apply(
-            &owner,
-            Op::Delete {
-                channel_id: room.clone()
-            }
-        )
-        .is_ok());
-    drop(c);
-    let mut c = core(&path);
-    assert!(c.channels.find(&room).is_err());
-    let replacement = c.channels.create(&creator, "游戏").unwrap();
-    assert_ne!(replacement, room);
-    let admin = login(&mut c, 'a');
-    assert!(c
-        .apply(
-            &admin,
-            Op::Delete {
-                channel_id: replacement
-            }
-        )
-        .is_ok());
-    drop(c);
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn chat_is_bounded_scoped_and_cleared_when_an_occupied_room_is_deleted() {
-    let mut c = core(Path::new(":memory:"));
-    let a = login(&mut c, 'a');
-    let b = login(&mut c, 'b');
-    let red = c.channels.create(&a, "红").unwrap();
-    let blue = c.channels.create(&b, "蓝").unwrap();
-    join(&mut c, &a, &red);
-    join(&mut c, &b, &blue);
-    assert!(c
-        .apply(
-            &b,
-            Op::Chat {
-                channel_id: red.clone(),
-                text: "forged".into()
-            }
-        )
-        .is_err());
-    for n in 0..101 {
-        assert!(c
-            .apply(
-                &a,
-                Op::Chat {
-                    channel_id: red.clone(),
-                    text: n.to_string()
-                }
-            )
-            .is_ok());
-    }
-    let history = c.snapshot(&a, None, &mut None)["messages"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(history.len(), 100);
-    assert_eq!(history[0]["text"], "1");
-    assert_eq!(c.snapshot(&b, None, &mut None)["messages"], json!([]));
-    join(&mut c, &b, &red);
-    assert_eq!(c.snapshot(&b, None, &mut None)["messages"], json!(history));
-    let revoked = c.members[&b]
-        .membership
-        .as_ref()
-        .unwrap()
-        .revoked
-        .subscribe();
-    assert!(c
-        .apply(
-            &a,
-            Op::Delete {
-                channel_id: red.clone()
-            }
-        )
-        .is_ok());
-    assert!(revoked.has_changed().is_err());
-    assert_eq!(c.snapshot(&b, None, &mut None)["channelId"], Value::Null);
-    assert!(c.chat.history(Some(&red)).is_empty());
-    assert!(c
-        .apply(
-            &b,
-            Op::Chat {
-                channel_id: red,
-                text: "late".into()
-            }
-        )
-        .is_err());
-}
-
 fn config() -> Config {
     Config {
-        database: ":memory:".into(),
         owner_identity: "a".repeat(64),
+        owner_nickname: "主机".into(),
         invite_key: INVITE.into(),
         livekit_key: "test-only-api".into(),
         livekit_secret: "this-is-a-local-integration-test-secret".into(),
@@ -299,6 +30,50 @@ fn config() -> Config {
 type TestSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+struct TestRoom {
+    url: String,
+    http: String,
+    stop: watch::Sender<bool>,
+    control: RoomControl,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl TestRoom {
+    async fn start(config: Config) -> Self {
+        let (stop, rx) = watch::channel(false);
+        let (app, control) = router_with_shutdown(config, rx).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        TestRoom {
+            url: format!("ws://{addr}/ws"),
+            http: format!("http://{addr}"),
+            stop,
+            control,
+            server,
+        }
+    }
+
+    async fn connect(&self) -> TestSocket {
+        connect_async(&self.url).await.unwrap().0
+    }
+
+    async fn login(&self, secret: char, name: &str) -> (TestSocket, Value) {
+        let mut ws = self.connect().await;
+        send_op(&mut ws, hello(secret, name)).await;
+        let snapshot = read(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+        (ws, snapshot)
+    }
+}
+
+impl Drop for TestRoom {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.server.abort();
+    }
+}
+
 async fn read(ws: &mut TestSocket) -> Value {
     timeout(Duration::from_secs(3), async {
         loop {
@@ -308,60 +83,162 @@ async fn read(ws: &mut TestSocket) -> Value {
         }
     })
     .await
-    .unwrap()
+    .expect("room did not send an event")
 }
 
-async fn command(ws: &mut TestSocket, op: Value) -> Value {
+async fn event(ws: &mut TestSocket, accept: impl Fn(&Value) -> bool) -> Value {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let result = read(ws).await;
+            if accept(&result) {
+                return result;
+            }
+        }
+    })
+    .await
+    .expect("room did not send the expected event")
+}
+
+async fn send_op(ws: &mut TestSocket, op: Value) {
     ws.send(Frame::Text(op.to_string().into())).await.unwrap();
-    read(ws).await
+}
+
+async fn token(ws: &mut TestSocket) -> String {
+    event(ws, |v| v["type"] == "voice" && v["token"].is_string()).await["token"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]
-async fn negotiated_chat_updates_only_send_new_messages_and_keep_old_clients_compatible() {
-    let (_stop, rx) = watch::channel(false);
-    let app = router_with_shutdown(config(), rx).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (mut ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    let hello = json!({"type":"hello","identity":"b".repeat(64),"nickname":"测试","inviteKey":INVITE,"chatDeltas":true});
-    assert_eq!(command(&mut ws, hello).await["type"], "snapshot");
-    let created = command(&mut ws, json!({"type":"create","name":"排位"})).await;
-    let room = &created["channels"][0]["id"];
-    let join = json!({"type":"join","channelId":room});
-    let joined = command(&mut ws, join.clone()).await;
-    assert_eq!(joined["messages"], json!([]));
-    assert_eq!(read(&mut ws).await["type"], "voice");
+async fn guest_enters_the_hosts_only_room_without_a_second_join() {
+    let room = TestRoom::start(config()).await;
+    let (mut host, host_state) = room.login('a', "主机").await;
+    assert_eq!(host_state["roomName"], "主机 的房间");
+    assert_eq!(host_state["roomProtocol"], 2);
+    assert_eq!(host_state["members"].as_array().unwrap().len(), 1);
+    assert!(host_state.get("channels").is_none());
+    assert!(timeout(Duration::from_millis(120), host.next())
+        .await
+        .is_err());
+    let id = &host_state["roomId"];
+    let (mut guest, guest_state) = room.login('b', "好友").await;
+    assert_eq!(guest_state["roomId"], *id);
+    assert_eq!(guest_state["ownerId"], host_state["selfId"]);
+    assert_eq!(guest_state["ownerNickname"], "主机");
+    assert_eq!(guest_state["members"].as_array().unwrap().len(), 2);
+    token(&mut guest).await;
+    token(&mut host).await;
+    send_op(&mut guest, json!({"type":"chat","roomId":id,"text":"你好"})).await;
+    let received = read(&mut host).await;
+    assert_eq!(received["messages"][0]["text"], "你好");
+    assert_eq!(received["messages"][0]["authorId"], guest_state["selfId"]);
+}
 
-    let chat = json!({"type":"chat","channelId":room,"text":"收到"});
-    let first = command(&mut ws, chat.clone()).await;
-    let second = command(&mut ws, chat).await;
-    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(second["messagesAfter"], first["messages"][0]["id"]);
-    assert_ne!(second["messages"][0]["id"], first["messages"][0]["id"]);
-
-    let left = command(&mut ws, json!({"type":"leave"})).await;
-    assert_eq!(left["messages"], json!([]));
-    let (mut legacy, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    let hello =
-        json!({"type":"hello","identity":"c".repeat(64),"nickname":"旧版","inviteKey":INVITE});
-    assert_eq!(command(&mut legacy, hello).await["type"], "snapshot");
-    let rejoined = command(&mut legacy, join).await;
-    assert!(rejoined.get("messagesAfter").is_none());
-    assert_eq!(rejoined["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(read(&mut legacy).await["type"], "voice");
-    let third = command(
-        &mut legacy,
-        json!({"type":"chat","channelId":room,"text":"第三条"}),
+#[tokio::test]
+async fn unsupported_versions_and_invalid_avatars_leave_existing_members_connected() {
+    let room = TestRoom::start(config()).await;
+    let (mut host, initial) = room.login('a', "主机").await;
+    let mut legacy = room.connect().await;
+    let mut old_hello = hello('b', "旧版");
+    old_hello.as_object_mut().unwrap().remove("roomProtocol");
+    send_op(&mut legacy, old_hello).await;
+    let rejected = read(&mut legacy).await;
+    assert_eq!(rejected["type"], "error");
+    assert!(rejected["message"].as_str().unwrap().contains("更新"));
+    let jpeg = include_bytes!("test-avatar.jpg");
+    let mut wide = jpeg.to_vec();
+    let frame = wide.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+    wide[frame + 7..frame + 9].copy_from_slice(&97u16.to_be_bytes());
+    for invalid in [
+        jpeg_url(&wide),
+        jpeg_url(&jpeg[..20]),
+        jpeg_url(&vec![0; 8193]),
+        "https://example.org/avatar.jpg".into(),
+        "data:image/jpeg;base64,invalid?".into(),
+    ] {
+        let mut replacement = room.connect().await;
+        let mut op = hello('a', "替换了");
+        op["avatar"] = invalid.into();
+        send_op(&mut replacement, op).await;
+        assert_eq!(read(&mut replacement).await["type"], "error");
+    }
+    send_op(
+        &mut host,
+        json!({"type":"chat","roomId":initial["roomId"],"text":"仍在线"}),
     )
     .await;
-    assert!(third.get("messagesAfter").is_none());
-    assert_eq!(third["messages"].as_array().unwrap().len(), 3);
-    server.abort();
+    let after = read(&mut host).await;
+    assert_eq!(after["ownerNickname"], "主机");
+    assert_eq!(after["members"].as_array().unwrap().len(), 1);
+    assert_eq!(after["messages"][0]["text"], "仍在线");
 }
 
 #[tokio::test]
-async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
+async fn chat_is_bounded_and_updates_only_send_new_messages() {
+    let room = TestRoom::start(config()).await;
+    let (mut host, initial) = room.login('a', "主机").await;
+    let id = &initial["roomId"];
+    send_op(
+        &mut host,
+        json!({"type":"chat","roomId":"wrong-room","text":"无效","requestId":1}),
+    )
+    .await;
+    assert!(read(&mut host).await["error"].is_string());
+    let mut previous = Value::Null;
+    for n in 0..101 {
+        send_op(
+            &mut host,
+            json!({"type":"chat","roomId":id,"text":n.to_string()}),
+        )
+        .await;
+        let delta = read(&mut host).await;
+        assert_eq!(delta["messagesAfter"], previous);
+        assert_eq!(delta["messages"].as_array().unwrap().len(), 1);
+        previous = delta["messages"][0]["id"].clone();
+    }
+    let (_guest, first) = room.login('b', "好友").await;
+    assert!(first.get("messagesAfter").is_none());
+    let history = first["messages"].as_array().unwrap();
+    assert_eq!(history.len(), 100);
+    assert_eq!(history[0]["text"], "1");
+    assert_eq!(history[99]["text"], "100");
+    let reopened = TestRoom::start(config()).await;
+    let (_host, fresh) = reopened.login('a', "主机").await;
+    assert_ne!(fresh["roomId"], *id);
+    assert_eq!(fresh["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn room_refuses_an_update_shutdown_with_guests_and_rejects_an_inflight_join_on_stop() {
+    let room = TestRoom::start(config()).await;
+    let (mut host, _) = room.login('a', "主机").await;
+    let (mut guest, _) = room.login('b', "好友").await;
+    assert!(room.control.stop_if_empty(&room.stop).await.is_err());
+    assert!(!*room.stop.borrow());
+    guest.close(None).await.unwrap();
+    event(&mut host, |v| {
+        v["type"] == "snapshot" && v["members"].as_array().is_some_and(|m| m.len() == 1)
+    })
+    .await;
+    let mut incoming = room.connect().await;
+    room.control.stop_if_empty(&room.stop).await.unwrap();
+    let _ = incoming
+        .send(Frame::Text(hello('c', "好友 2").to_string().into()))
+        .await;
+    if let Some(Ok(Frame::Text(text))) = timeout(Duration::from_secs(2), incoming.next())
+        .await
+        .unwrap()
+    {
+        let next: Value = serde_json::from_str(&text).unwrap();
+        assert_ne!(next["type"], "snapshot");
+    }
+    let closed = event(&mut host, |v| v["type"] == "offline").await;
+    assert_eq!(closed["message"], "房间已关闭");
+}
+
+#[tokio::test]
+async fn websocket_rejoin_keeps_chat_live_while_stale_voice_cleanup_finishes() {
     use axum::{http::HeaderMap, routing::post, Json};
     let sf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = config();
@@ -407,69 +284,25 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
             }),
         );
     let sf = tokio::spawn(async move { axum::serve(sf_listener, sf).await.unwrap() });
-    let (stop, rx) = watch::channel(false);
-    let app = router_with_shutdown(cfg, rx).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (mut ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    ws.send(Frame::Text(
-        json!({"type":"hello","inviteKey":INVITE,"nickname":"玩家","identity":"b".repeat(64)})
-            .to_string()
-            .into(),
-    ))
-    .await
-    .unwrap();
-    let snapshot = read(&mut ws).await;
-    assert_eq!(snapshot["type"], "snapshot");
-    assert_eq!(snapshot["admin"], false);
-    let denied = command(
-        &mut ws,
-        json!({"type":"join","channelId":"unknown","requestId":41}),
-    )
-    .await;
-    assert_eq!(denied["requestId"], 41);
-    assert!(denied["error"].is_string());
-    ws.send(Frame::Text(
-        json!({"type":"create","name":"频道","requestId":42})
-            .to_string()
-            .into(),
-    ))
-    .await
-    .unwrap();
-    assert_eq!(
-        read(&mut ws).await,
-        json!({"type":"result","requestId":42,"error":null})
-    );
-    let room = read(&mut ws).await["channels"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    ws.send(Frame::Text(
-        json!({"type":"join","channelId":room}).to_string().into(),
-    ))
-    .await
-    .unwrap();
-    assert_eq!(read(&mut ws).await["channelId"], room);
-    let voice = read(&mut ws).await;
-    assert_eq!(voice["type"], "voice");
-    let ticket = voice["token"].as_str().unwrap();
+    let room = TestRoom::start(cfg).await;
+    let (mut host, host_snapshot) = room.login('a', "主机").await;
+    let (mut guest, guest_snapshot) = room.login('b', "好友").await;
+    let room_id = &host_snapshot["roomId"];
+    let old_host = token(&mut host).await;
+    let old_guest = token(&mut guest).await;
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let endpoint = format!("http://{addr}/rtc/validate");
-    assert_eq!(
-        http.get(&endpoint)
+    let validate = |ticket: String| {
+        http.get(format!("{}/rtc/validate", room.http))
             .bearer_auth(ticket)
             .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap(),
-        "success"
-    );
-    let (mut signal, _) = connect_async(format!("ws://{addr}/rtc/v1?access_token={ticket}"))
-        .await
-        .unwrap();
+    };
+    assert_eq!(validate(old_guest.clone()).await.unwrap().status(), 200);
+    let (mut signal, _) = connect_async(format!(
+        "{}/rtc/v1?access_token={old_guest}",
+        room.http.replacen("http", "ws", 1)
+    ))
+    .await
+    .unwrap();
     let frame = prost::Message::encode_to_vec(&livekit_protocol::SignalResponse {
         message: Some(livekit_protocol::signal_response::Message::Pong(42)),
     });
@@ -486,279 +319,125 @@ async fn websocket_login_and_gateway_reject_stale_tokens_after_leave() {
             .into_data(),
         frame
     );
-    ws.send(Frame::Text(json!({"type":"leave"}).to_string().into()))
-        .await
-        .unwrap();
-    assert_eq!(read(&mut ws).await["channelId"], Value::Null);
-    let (removal, ack) = timeout(Duration::from_secs(2), kicks.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(removal, json!({"room":room,"identity":snapshot["selfId"]}));
+
+    guest.close(None).await.unwrap();
+    let idle = event(&mut host, |v| v["type"] == "voice").await;
+    assert_eq!(idle, json!({"type":"voice","roomId":room_id,"token":null}));
     assert!(!matches!(
         timeout(Duration::from_secs(2), signal.next()).await,
         Err(_) | Ok(Some(Ok(Frame::Binary(_))))
     ));
-    assert_eq!(
-        http.get(&endpoint)
-            .bearer_auth(ticket)
-            .send()
+    assert_eq!(validate(old_guest.clone()).await.unwrap().status(), 403);
+    assert_eq!(validate(old_host.clone()).await.unwrap().status(), 403);
+    let (mut guest, rejoined) = room.login('b', "好友").await;
+    assert_eq!(rejoined["selfId"], guest_snapshot["selfId"]);
+    assert_eq!(rejoined["members"].as_array().unwrap().len(), 2);
+    send_op(
+        &mut guest,
+        json!({"type":"chat","roomId":room_id,"text":"语音恢复前也能聊天","requestId":42}),
+    )
+    .await;
+    let ack = event(&mut guest, |v| v["type"] == "result").await;
+    assert_eq!(ack, json!({"type":"result","requestId":42,"error":null}));
+    let chat = event(&mut host, |v| {
+        v["messages"][0]["text"] == "语音恢复前也能聊天"
+    })
+    .await;
+    assert_eq!(chat["roomId"], *room_id);
+    let mut removed = BTreeSet::new();
+    for _ in 0..2 {
+        let (removal, ack) = timeout(Duration::from_secs(2), kicks.recv())
             .await
             .unwrap()
-            .status(),
-        403
-    );
-    // A single rejoin waits for the private removal; the previous ticket stays revoked.
-    ws.send(Frame::Text(
-        json!({"type":"join","channelId":room,"requestId":43})
-            .to_string()
-            .into(),
-    ))
-    .await
-    .unwrap();
-    assert!(timeout(Duration::from_millis(120), ws.next())
-        .await
-        .is_err());
-    ack.send(()).unwrap();
+            .unwrap();
+        assert_eq!(removal["room"], *room_id);
+        removed.insert(removal["identity"].as_str().unwrap().to_owned());
+        ack.send(()).unwrap();
+    }
     assert_eq!(
-        read(&mut ws).await,
+        removed,
+        BTreeSet::from([
+            host_snapshot["selfId"].as_str().unwrap().to_owned(),
+            guest_snapshot["selfId"].as_str().unwrap().to_owned()
+        ])
+    );
+    let fresh_host = token(&mut host).await;
+    let fresh_guest = token(&mut guest).await;
+    for (old, fresh) in [(old_host, fresh_host), (old_guest, fresh_guest)] {
+        assert_eq!(validate(old).await.unwrap().status(), 403);
+        assert_eq!(validate(fresh).await.unwrap().status(), 200);
+    }
+    send_op(&mut guest, json!({"type":"retryVoice", "requestId":43})).await;
+    assert_eq!(
+        event(&mut guest, |v| v["type"] == "result").await,
         json!({"type":"result","requestId":43,"error":null})
     );
-    assert_eq!(read(&mut ws).await["channelId"], room);
-    let fresh = read(&mut ws).await;
     assert_eq!(
-        http.get(&endpoint)
-            .bearer_auth(fresh["token"].as_str().unwrap())
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        validate(token(&mut guest).await).await.unwrap().status(),
         200
     );
+    room.stop.send_replace(true);
     assert_eq!(
-        http.get(&endpoint)
-            .bearer_auth(ticket)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        403
+        event(&mut guest, |v| v["type"] == "offline").await["message"],
+        "房间已关闭"
     );
-    stop.send(true).unwrap();
-    assert!(!matches!(
-        timeout(Duration::from_secs(2), ws.next()).await,
-        Err(_) | Ok(Some(Ok(Frame::Text(_))))
-    ));
-    server.abort();
     sf.abort();
 }
 
 #[tokio::test]
-#[ignore = "requires DUIPIN_TEST_SFU pointing to the packaged LiveKit Server executable"]
-async fn packaged_livekit_admits_member_and_destroys_deleted_room() {
-    use std::process::Stdio;
-    let executable = std::env::var_os("DUIPIN_TEST_SFU").expect("set DUIPIN_TEST_SFU");
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut cfg = config();
-    cfg.livekit_http_url = format!("http://127.0.0.1:{port}");
-    let yaml = format!("port: {port}\nbind_addresses: [127.0.0.1]\nrtc:\n  udp_port: {udp}\n  tcp_port: 0\n  node_ip: 127.0.0.1\n  enable_loopback_candidate: true\nkeys:\n  {}: {}\n",cfg.livekit_key,cfg.livekit_secret);
-    let mut process = tokio::process::Command::new(executable);
-    #[cfg(windows)]
-    process.creation_flags(0x08000000);
-    let mut sfu = process
-        .args(["--config-body", &yaml])
-        .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    timeout(Duration::from_secs(15), async {
-        while tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err()
-        {
-            assert!(
-                sfu.try_wait().unwrap().is_none(),
-                "packaged SFU exited before startup"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let signer = Media::new(&cfg).unwrap();
-    let base = cfg.livekit_http_url.clone();
-    let (_stop, stopping) = watch::channel(false);
-    let app = router_with_shutdown(cfg, stopping).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (mut ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    let me = command(
-        &mut ws,
-        json!({"type":"hello","identity":"b".repeat(64),"inviteKey":INVITE,"nickname":"测试"}),
-    )
-    .await;
-    let room = command(&mut ws, json!({"type":"create","name":"测试频道"})).await["channels"][0]
-        ["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(
-        command(&mut ws, json!({"type":"join","channelId":room})).await["channelId"],
-        room
-    );
-    let ticket = read(&mut ws).await["token"].as_str().unwrap().to_owned();
-    let endpoint = format!("http://{addr}/rtc/validate");
-    assert_eq!(
-        http.get(&endpoint)
-            .bearer_auth(&ticket)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
-    let (mut media_ws, _) =
-        connect_async(format!("ws://{addr}/rtc?protocol=15&access_token={ticket}"))
-            .await
-            .unwrap();
-    let first = timeout(Duration::from_secs(4), media_ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(matches!(first,Frame::Binary(bytes) if !bytes.is_empty()));
-    let admin = signer
-        .token("test-service", "", "", json!({"roomList":true}))
-        .unwrap();
-    let list = || async {
-        http.post(format!("{base}/twirp/livekit.RoomService/ListRooms"))
-            .bearer_auth(&admin)
-            .json(&json!({"names":[room]}))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap()
-    };
-    assert_eq!(list().await["rooms"][0]["name"], room);
-    let snapshot = command(&mut ws, json!({"type":"delete","channelId":room})).await;
-    assert_eq!(snapshot["channelId"], Value::Null);
-    assert_eq!(snapshot["selfId"], me["selfId"]);
-    assert_eq!(
-        http.get(&endpoint)
-            .bearer_auth(ticket)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        403
-    );
-    timeout(Duration::from_secs(5), async {
-        while list().await["rooms"]
-            .as_array()
-            .is_some_and(|rooms| !rooms.is_empty())
-        {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-    })
-    .await
-    .unwrap();
-    server.abort();
-    sfu.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn two_sockets_observe_profile_changes_without_leaving_the_channel() {
-    let (_stop, stopping) = watch::channel(false);
-    let app = router_with_shutdown(config(), stopping).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let (mut host, _) = connect_async(&url).await.unwrap();
-    let host_state = command(
-        &mut host,
-        json!({"type":"hello","inviteKey":INVITE,"identity":"a".repeat(64),"nickname":"主机"}),
-    )
-    .await;
-    assert_eq!(host_state["admin"], true);
-    let created = command(&mut host, json!({"type":"create","name":"排位"})).await;
-    let room = created["channels"][0]["id"].as_str().unwrap();
-    command(&mut host, json!({"type":"join","channelId":room})).await;
-    assert_eq!(read(&mut host).await["type"], "voice");
-
-    let (mut guest, _) = connect_async(&url).await.unwrap();
-    let guest_state = command(
+async fn two_sockets_observe_profile_changes_without_interrupting_voice_or_chat() {
+    let room = TestRoom::start(config()).await;
+    let (mut host, _) = room.login('a', "主机").await;
+    let (mut guest, guest_state) = room.login('b', "旧昵称").await;
+    let id = &guest_state["roomId"];
+    let guest_id = &guest_state["selfId"];
+    token(&mut host).await;
+    token(&mut guest).await;
+    send_op(
         &mut guest,
-        json!({"type":"hello","inviteKey":INVITE,"identity":"b".repeat(64),"nickname":"旧昵称"}),
+        json!({"type":"chat","roomId":id,"text":"改名前"}),
     )
     .await;
-    let guest_id = guest_state["selfId"].as_str().unwrap();
-    assert_eq!(
-        read(&mut host).await["members"].as_array().unwrap().len(),
-        2
-    );
-    command(&mut guest, json!({"type":"join","channelId":room})).await;
-    assert_eq!(read(&mut guest).await["type"], "voice");
-    read(&mut host).await;
-
-    command(
-        &mut guest,
-        json!({"type":"chat","channelId":room,"text":"改名前"}),
-    )
-    .await;
-    let old_message = read(&mut host).await["messages"][0].clone();
-    assert_eq!(old_message["authorName"], "旧昵称");
-
+    let old_chat = read(&mut host).await["messages"][0].clone();
+    assert_eq!(old_chat["authorName"], "旧昵称");
     let portrait = jpeg_url(include_bytes!("test-avatar.jpg"));
     for avatar in [&portrait[..], ""] {
-        let ack = command(
+        send_op(
             &mut guest,
-            json!({"type":"profile","nickname":"新昵称","avatar":avatar,"requestId":7}),
+            json!({"type":"profile","nickname":"  新昵称  ","avatar":avatar,"requestId":7}),
         )
         .await;
-        assert_eq!(ack, json!({"type":"result","requestId":7,"error":null}));
-        let (local, remote) = tokio::join!(read(&mut guest), read(&mut host));
-        for state in [local, remote] {
-            let members = state["members"].as_array().unwrap();
-            let changed = members.iter().find(|m| m["id"] == guest_id).unwrap();
-            assert_eq!(changed["name"], "新昵称");
-            assert_eq!(changed["avatar"], avatar);
-            assert_eq!(members.len(), 2);
-            assert!(members.iter().all(|m| m["channelId"] == room));
-            assert_eq!(state["channelId"], room);
-            assert_eq!(state["messages"][0], old_message);
-        }
-        command(
+        let reply = event(&mut guest, |v| v["type"] == "result").await;
+        assert_eq!(reply, json!({"type":"result","requestId":7,"error":null}));
+        let remote = read(&mut host).await;
+        let members = remote["members"].as_array().unwrap();
+        let changed = members.iter().find(|m| m["id"] == *guest_id).unwrap();
+        assert_eq!(changed["name"], "新昵称");
+        assert_eq!(changed["avatar"], avatar);
+        assert_eq!(members.len(), 2);
+        assert_eq!(remote["roomId"], *id);
+        assert!(remote["messagesAfter"].is_string());
+        assert_eq!(remote["messages"], json!([]));
+        send_op(
             &mut guest,
-            json!({"type":"chat","channelId":room,"text":"改名后"}),
+            json!({"type":"chat","roomId":id,"text":"改名后"}),
         )
         .await;
         let remote = read(&mut host).await;
-        let newest = remote["messages"].as_array().unwrap().last().unwrap();
-        assert_eq!(newest["authorId"], guest_id);
-        assert_eq!(newest["authorName"], "新昵称");
+        assert_eq!(remote["messages"][0]["authorId"], *guest_id);
+        assert_eq!(remote["messages"][0]["authorName"], "新昵称");
         assert!(remote["members"]
             .as_array()
             .unwrap()
             .iter()
             .all(|m| m.get("avatar").is_none()));
     }
-    server.abort();
+    send_op(
+        &mut host,
+        json!({"type":"profile","nickname":"新房主名","avatar":""}),
+    )
+    .await;
+    let updated = event(&mut guest, |v| v["roomName"] == "新房主名 的房间").await;
+    assert_eq!(updated["ownerNickname"], "新房主名");
+    assert_eq!(updated["ownerId"], guest_state["ownerId"]);
 }

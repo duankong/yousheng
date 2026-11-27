@@ -1,5 +1,7 @@
 use super::{Desktop, Session};
+use crate::client::emit_room;
 use serde::Serialize;
+use serde_json::json;
 use std::{sync::atomic::Ordering, time::Duration};
 use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -75,21 +77,29 @@ pub(super) async fn check_update(
     Ok(info)
 }
 
-fn idle_session(state: &Desktop) -> Result<RwLockWriteGuard<'_, Option<Session>>, String> {
+fn install_session<'a>(
+    state: &'a Desktop,
+    expected: Option<&str>,
+) -> Result<RwLockWriteGuard<'a, Option<Session>>, String> {
     let session = state
         .session
         .try_write()
-        .map_err(|_| "大厅状态正在变化，请稍后安装更新")?;
-    if session.is_some() || state.closing.load(Ordering::SeqCst) {
-        return Err("请先退出或停止大厅，再安装更新".into());
+        .map_err(|_| "房间状态正在变化，请稍后安装更新")?;
+    if session.as_ref().map(|s| s.id.as_str()) != expected || state.closing.load(Ordering::SeqCst) {
+        return Err("房间状态已变化，请重新确认安装".into());
+    }
+    if session.as_ref().is_some_and(|s| s.host.is_none()) {
+        return Err("请先退出好友的房间，再安装更新".into());
     }
     Ok(session)
 }
 
 #[tauri::command]
 pub(super) async fn install_update(
+    app: AppHandle,
     state: State<'_, Desktop>,
     version: String,
+    session_id: Option<String>,
 ) -> Result<(), String> {
     let available = state
         .available_update
@@ -99,17 +109,29 @@ pub(super) async fn install_update(
         .as_ref()
         .filter(|candidate| candidate.version == version)
         .ok_or("请重新检查更新后再安装")?;
-    drop(idle_session(&state)?);
+    drop(install_session(&state, session_id.as_deref())?);
     let bytes = update
         .download(|_, _| {}, || {})
         .await
         .map_err(|e| format!("下载或验证更新失败：{e}"))?;
-    // A player may have opened a lobby during the download. Hold the same lock
-    // that host_lobby and join_lobby use until the Windows installer takes over.
-    let _session = idle_session(&state)?;
-    update
-        .install(bytes)
-        .map_err(|e| format!("启动更新安装程序失败：{e}"))
+    let mut session = install_session(&state, session_id.as_deref())?;
+    if let Some(host) = session.as_ref().and_then(|s| s.host.as_ref()) {
+        host.stop_if_empty().await?;
+    }
+    if let Some(current) = session.take() {
+        state.teardown(current).await;
+    }
+    if let Err(error) = update.install(bytes) {
+        if let Some(id) = session_id {
+            emit_room(
+                &app,
+                &id,
+                json!({"type":"offline","message":"本机房间已为更新关闭"}),
+            );
+        }
+        return Err(format!("启动更新安装程序失败：{error}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

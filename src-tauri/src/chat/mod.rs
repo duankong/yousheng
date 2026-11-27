@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -16,31 +16,20 @@ pub(crate) struct ChatMessage {
 }
 
 #[derive(Default)]
-pub(crate) struct Chat(HashMap<String, VecDeque<ChatMessage>>);
+pub(crate) struct Chat(VecDeque<ChatMessage>);
 
 pub(crate) const HISTORY_LIMIT: usize = 100;
 
 impl Chat {
-    pub fn send(
-        &mut self,
-        current: Option<&str>,
-        target: &str,
-        player: &str,
-        name: &str,
-        text: &str,
-    ) -> Result<(), &'static str> {
-        if current != Some(target) {
-            return Err("只能发言到当前频道");
-        }
+    pub fn send(&mut self, player: &str, name: &str, text: &str) -> Result<(), &'static str> {
         let text = text.trim();
         if text.is_empty() || text.chars().count() > 1000 {
             return Err("消息须为 1–1000 个字符");
         }
-        let messages = self.0.entry(target.into()).or_default();
-        if messages.len() >= HISTORY_LIMIT {
-            messages.pop_front();
+        if self.0.len() >= HISTORY_LIMIT {
+            self.0.pop_front();
         }
-        messages.push_back(ChatMessage {
+        self.0.push_back(ChatMessage {
             id: Uuid::new_v4().to_string(),
             author_id: player.into(),
             author_name: name.into(),
@@ -53,15 +42,7 @@ impl Chat {
         Ok(())
     }
 
-    pub fn history(&self, current: Option<&str>) -> Vec<&ChatMessage> {
-        current
-            .and_then(|id| self.0.get(id))
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    pub fn clear(&mut self, id: &str) {
-        self.0.remove(id);
+    pub fn history(&self) -> &VecDeque<ChatMessage> {
+        &self.0
     }
 }

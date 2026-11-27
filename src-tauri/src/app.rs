@@ -1,10 +1,9 @@
 use crate::{
-    channels::{ChannelPreview, Channels},
-    client::{Client, ClientCommands},
+    client::{emit_room, AcceptedRoom, Client, ClientCommands},
     host::Host,
     network::{GuestEndpoint, Ticket},
     player_profile,
-    preferences::{Preferences, Profile},
+    preferences::{Preferences, Profile, RecentRoom},
     voice::{AudioSettings, PeerGain, VoiceEngine},
 };
 use serde::Serialize;
@@ -22,6 +21,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 mod updates;
 
 struct Session {
+    id: String,
     client: Client,
     host: Option<Host>,
     guest: Option<GuestEndpoint>,
@@ -35,6 +35,27 @@ struct Desktop {
     closing: AtomicBool,
 }
 impl Desktop {
+    fn activate(&self, app: AppHandle, accepted: AcceptedRoom, session_id: &str) -> Client {
+        let notify = app.clone();
+        let id = session_id.to_owned();
+        accepted.activate(
+            app,
+            self.voice.clone(),
+            session_id.to_owned(),
+            move |message| {
+                // The socket task has to finish before teardown can join it.
+                tokio::spawn(async move {
+                    let state = notify.state::<Desktop>();
+                    let mut slot = state.session.write().await;
+                    if let Some(session) = slot.take_if(|session| session.id == id) {
+                        state.teardown(session).await;
+                        emit_room(&notify, &id, json!({"type":"offline","message":message}));
+                    }
+                });
+            },
+        )
+    }
+
     async fn teardown(&self, session: Session) {
         session.client.close().await;
         self.voice.disconnect().await;
@@ -50,8 +71,12 @@ impl Desktop {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionInfo {
+    id: String,
     invite: String,
     is_host: bool,
+    snapshot: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -64,7 +89,7 @@ struct ConnectionDetails {
 #[tauri::command]
 async fn lobby_connection_details(state: State<'_, Desktop>) -> Result<ConnectionDetails, String> {
     let slot = state.session.read().await;
-    let session = slot.as_ref().ok_or("大厅已断开")?;
+    let session = slot.as_ref().ok_or("房间已断开")?;
     let (transport, rtt_ms) = match &session.guest {
         None => ("local", None),
         Some(guest) => match guest.selected_path() {
@@ -86,50 +111,42 @@ fn executable(app: &AppHandle) -> Result<PathBuf, String> {
     }
     Ok(installed)
 }
-fn save_name(profile: &mut Profile, name: &str) -> Result<(), String> {
-    if profile.settings.nickname == name {
-        return Ok(());
-    }
-    let mut next = profile.settings.clone();
-    next.nickname = name.to_owned();
-    profile.save(next)
-}
-
 #[tauri::command]
 async fn host_lobby(
     app: AppHandle,
     state: State<'_, Desktop>,
-    nickname: String,
+    session_id: String,
 ) -> Result<ConnectionInfo, String> {
-    let name = player_profile::nickname(&nickname)?;
     let mut slot = state.session.write().await;
     if let Some(session) = slot.take() {
         state.teardown(session).await;
     }
-    let mut profile = state.profile.lock().await;
-    save_name(&mut profile, name)?;
+    let profile = state.profile.lock().await;
+    let name = player_profile::nickname(&profile.settings.nickname)?;
     let host = Host::start(&profile, &executable(&app)?).await?;
     let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name,"avatar":profile.settings.avatar});
     drop(profile);
-    let result = Client::open(app, state.voice.clone(), host.gateway, hello).await;
-    match result {
-        Ok(client) => {
-            let info = ConnectionInfo {
-                invite: host.invite.clone(),
-                is_host: true,
-            };
-            *slot = Some(Session {
-                client,
-                host: Some(host),
-                guest: None,
-            });
-            Ok(info)
-        }
+    let accepted = match AcceptedRoom::connect(host.gateway, hello).await {
+        Ok(accepted) => accepted,
         Err(e) => {
             host.close().await;
-            Err(e)
+            return Err(e);
         }
-    }
+    };
+    let info = ConnectionInfo {
+        id: session_id.clone(),
+        invite: host.invite.clone(),
+        is_host: true,
+        snapshot: accepted.snapshot().clone(),
+        history_error: None,
+    };
+    *slot = Some(Session {
+        id: session_id.clone(),
+        client: state.activate(app, accepted, &session_id),
+        host: Some(host),
+        guest: None,
+    });
+    Ok(info)
 }
 
 #[tauri::command]
@@ -140,7 +157,7 @@ async fn share_host_invite(state: State<'_, Desktop>) -> Result<String, String> 
         let host = slot
             .as_ref()
             .and_then(|s| s.host.as_ref())
-            .ok_or("本机大厅已关闭")?;
+            .ok_or("本机房间已关闭")?;
         host.overlay.share_invite(key)
     };
     invite.await
@@ -150,66 +167,109 @@ async fn share_host_invite(state: State<'_, Desktop>) -> Result<String, String> 
 async fn join_lobby(
     app: AppHandle,
     state: State<'_, Desktop>,
+    session_id: String,
     invite: String,
-    nickname: String,
 ) -> Result<ConnectionInfo, String> {
+    let invite = invite.trim().to_owned();
     let ticket = Ticket::parse(&invite)?;
-    let name = player_profile::nickname(&nickname)?;
+    let host_id = ticket.address.id;
     let mut slot = state.session.write().await;
-    let mut profile = state.profile.lock().await;
-    if ticket.address.id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
-        return Err("这是本机大厅的邀请，请选择「开启大厅」".into());
+    if slot.as_ref().is_some_and(|s| {
+        s.client.is_connected() && s.guest.as_ref().is_some_and(|g| g.host_id() == host_id)
+    }) {
+        return Err("你已在这个房间".into());
     }
-    save_name(&mut profile, name)?;
-    let id = profile.player_credential(&ticket.address.id.to_string());
+    let profile = state.profile.lock().await;
+    if host_id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
+        return Err("这是本机房间的邀请".into());
+    }
+    let name = player_profile::nickname(&profile.settings.nickname)?.to_owned();
+    let host_id = host_id.to_string();
+    let id = profile.player_credential(&host_id);
     let avatar = profile.settings.avatar.clone();
     drop(profile);
+
+    let guest = GuestEndpoint::start(&ticket).await?;
+    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
+    let accepted = match AcceptedRoom::connect(guest.gateway, hello).await {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            guest.close().await;
+            return Err(e);
+        }
+    };
+
+    // The target has admitted us. Retire the old socket and microphone before
+    // publishing the new room or letting it open a media session.
     if let Some(session) = slot.take() {
         state.teardown(session).await;
     }
-    let guest = GuestEndpoint::start(&ticket).await?;
-    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
-    match Client::open(app, state.voice.clone(), guest.gateway, hello).await {
-        Ok(client) => {
-            *slot = Some(Session {
-                client,
-                host: None,
-                guest: Some(guest),
-            });
-            Ok(ConnectionInfo {
-                invite,
-                is_host: false,
-            })
-        }
-        Err(e) => {
-            guest.close().await;
-            Err(e)
-        }
-    }
+    let snapshot = accepted.snapshot().clone();
+    let nickname = snapshot["ownerNickname"]
+        .as_str()
+        .expect("checked by room handshake");
+    let history_error = state
+        .profile
+        .lock()
+        .await
+        .remember_room(&host_id, nickname, &invite)
+        .err();
+    *slot = Some(Session {
+        id: session_id.clone(),
+        client: state.activate(app, accepted, &session_id),
+        host: None,
+        guest: Some(guest),
+    });
+    Ok(ConnectionInfo {
+        id: session_id,
+        invite,
+        is_host: false,
+        snapshot,
+        history_error,
+    })
 }
 
 #[tauri::command]
-async fn leave_lobby(state: State<'_, Desktop>) -> Result<(), String> {
+async fn leave_lobby(state: State<'_, Desktop>, session_id: String) -> Result<(), String> {
     let mut slot = state.session.write().await;
+    if slot.as_ref().is_some_and(|s| s.id != session_id) {
+        return Err("房间已切换".into());
+    }
     if let Some(session) = slot.take() {
         state.teardown(session).await;
     }
     Ok(())
 }
 #[tauri::command]
-async fn lobby_action(state: State<'_, Desktop>, action: Value) -> Result<(), String> {
-    send_lobby_action(&state.session, action).await
+async fn lobby_action(
+    state: State<'_, Desktop>,
+    session_id: String,
+    action: Value,
+) -> Result<(), String> {
+    send_lobby_action(&state.session, &session_id, action).await
 }
 
-fn current_commands(session: &RwLock<Option<Session>>) -> Result<Option<ClientCommands>, String> {
+fn current_commands(
+    session: &RwLock<Option<Session>>,
+    session_id: Option<&str>,
+) -> Result<Option<ClientCommands>, String> {
     let slot = session
         .try_read()
-        .map_err(|_| "大厅正在切换，操作未发送".to_owned())?;
+        .map_err(|_| "房间正在切换，操作未发送".to_owned())?;
+    if let Some(id) = session_id {
+        if slot.as_ref().is_some_and(|s| s.id != id) {
+            return Err("房间已切换，操作未发送".into());
+        }
+    }
     Ok(slot.as_ref().map(|s| s.client.commands.clone()))
 }
 
-async fn send_lobby_action(session: &RwLock<Option<Session>>, action: Value) -> Result<(), String> {
-    let commands = current_commands(session)?.ok_or("请先加入大厅")?;
+async fn send_lobby_action(
+    session: &RwLock<Option<Session>>,
+    session_id: &str,
+    action: Value,
+) -> Result<(), String> {
+    let commands = current_commands(session, Some(session_id))?.ok_or("请先加入房间")?;
     commands.send(action).await
 }
 
@@ -222,21 +282,22 @@ mod command_tests {
     async fn slow_ack_does_not_block_another_action_or_session_switch() {
         let (client, mut old_peer) = crate::client::tests::command_peer();
         let slot = Arc::new(RwLock::new(Some(Session {
+            id: "old".into(),
             client,
             host: None,
             guest: None,
         })));
-        let send = |text: &'static str| {
+        let send = |id: &'static str, text: &'static str| {
             let slot = slot.clone();
             tokio::spawn(async move {
-                send_lobby_action(&slot, json!({"type":"text","text":text})).await
+                send_lobby_action(&slot, id, json!({"type":"text","text":text})).await
             })
         };
-        let first = send("first");
+        let first = send("old", "first");
         let (_, first_ack) = old_peer.recv().await.unwrap();
         let details_reader = slot.read().await;
-        let original = current_commands(&slot).unwrap().unwrap();
-        let second = send("second");
+        let original = current_commands(&slot, Some("old")).unwrap().unwrap();
+        let second = send("old", "second");
         let (second_message, second_ack) =
             tokio::time::timeout(Duration::from_secs(1), old_peer.recv())
                 .await
@@ -250,11 +311,12 @@ mod command_tests {
                 .try_write()
                 .expect("pending commands must allow session replacement");
             assert!(
-                send_lobby_action(&slot, json!({"type":"text","text":"stale"}))
+                send_lobby_action(&slot, "old", json!({"type":"text","text":"stale"}))
                     .await
                     .is_err()
             );
             switching.replace(Session {
+                id: "new".into(),
                 client: new_client,
                 host: None,
                 guest: None,
@@ -265,7 +327,13 @@ mod command_tests {
             .send(json!({"type":"profile","nickname":"old"}))
             .await
             .is_err());
-        let third = send("third");
+        assert_eq!(
+            send_lobby_action(&slot, "old", json!({"type":"text","text":"stale"}))
+                .await
+                .unwrap_err(),
+            "房间已切换，操作未发送"
+        );
+        let third = send("new", "third");
         let (third_message, third_ack) = new_peer.recv().await.unwrap();
         assert_eq!(third_message["text"], "third");
         third_ack.send(Ok(())).unwrap();
@@ -284,9 +352,8 @@ async fn get_preferences(state: State<'_, Desktop>) -> Result<Preferences, Strin
 }
 
 #[tauri::command]
-async fn list_local_channels(state: State<'_, Desktop>) -> Result<Vec<ChannelPreview>, String> {
-    let path = state.profile.lock().await.channel_database();
-    Channels::preview(&path)
+async fn list_room_history(state: State<'_, Desktop>) -> Result<Vec<RecentRoom>, String> {
+    state.profile.lock().await.room_history()
 }
 
 #[derive(Serialize)]
@@ -306,7 +373,7 @@ async fn set_profile(
 ) -> Result<ProfileUpdate, String> {
     let name = player_profile::nickname(&nickname)?;
     player_profile::validate_avatar(&avatar)?;
-    let commands = current_commands(&state.session);
+    let commands = current_commands(&state.session, None);
     let mut profile = state.profile.lock().await;
     let mut preferences = profile.settings.clone();
     preferences.nickname = name.into();
@@ -324,7 +391,7 @@ async fn set_profile(
         Err(error) => Err(error),
     };
     let profile_sync_error = sync.err().map(|error| {
-        format!("个人资料已保存在本机。当前大厅同步失败，重进大厅后将使用新资料。{error}")
+        format!("个人资料已保存在本机。当前房间同步失败，重新加入后将使用新资料。{error}")
     });
     Ok(ProfileUpdate {
         preferences,
@@ -508,7 +575,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_profile,
-            list_local_channels,
+            list_room_history,
             host_lobby,
             share_host_invite,
             join_lobby,

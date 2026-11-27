@@ -47,7 +47,7 @@ function toggleUpdates(event: Event) {
       <div v-if="updater.available" class="update-version">
         <h3>发现新版本 {{ updater.available.version }}</h3>
         <ReleaseNotes v-if="updater.available.notes.trim()" :notes="updater.available.notes" />
-        <p class="section-description">{{ updater.installBlocked ? '请先退出或停止大厅，再安装更新。' : '安装更新会关闭友声。' }}</p>
+        <p class="section-description">{{ updater.installBlocked ? '请先结束当前通话并返回首页，再安装更新。' : '安装更新会关闭本机空房间，并重新启动友声。' }}</p>
       </div>
       <p v-if="updater.error" class="form-error" role="alert">{{ updater.error }}</p>
       <p class="section-description" role="status">{{ updater.installing ? '正在下载并验证更新…' : updater.checking ? '正在检查更新…' : updater.status }}</p>

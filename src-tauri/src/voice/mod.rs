@@ -1,21 +1,23 @@
 mod audio;
 mod devices;
+#[cfg(test)]
+mod scenario_playback;
+
+#[cfg(test)]
+pub(crate) use scenario_playback::ScenarioPlayback;
 
 use futures_util::StreamExt;
 use livekit::{
     prelude::*,
     webrtc::{
         audio_source::{native::NativeAudioSource, AudioSourceOptions},
-        audio_stream::native::NativeAudioStream,
+        audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions},
     },
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tauri::{AppHandle, Emitter};
@@ -24,8 +26,13 @@ use tokio::{
     task::JoinHandle,
 };
 
-use audio::AudioIo;
+use audio::{AudioIo, CaptureControl, PreparedAudioIo, BLOCK, RATE};
 pub use devices::AudioDevices;
+
+// Decoded WebRTC sink frames are typically 10 ms each.
+const SDK_PCM_QUEUE_FRAMES: usize = 3;
+const NORMAL_PLAYOUT_SAMPLES: usize = 4 * BLOCK;
+const MIN_PCM_QUEUE_SAMPLES: usize = 6 * BLOCK;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -105,6 +112,7 @@ struct VoiceTrack {
 struct Mixer {
     tracks: HashMap<TrackSid, VoiceTrack>,
     peers: HashMap<String, PeerGain>,
+    callback_samples: usize,
 }
 
 impl Mixer {
@@ -125,13 +133,46 @@ impl Mixer {
         }
     }
 
-    fn next_sample(&mut self, master: f32) -> f32 {
-        let sum: f32 = self
-            .tracks
-            .values_mut()
-            .map(|track| f32::from(track.samples.pop_front().unwrap_or_default()) * track.gain)
-            .sum();
-        (sum * master / 32768.0).clamp(-1.0, 1.0)
+    fn playout_limit(&self) -> usize {
+        // Keep at most 40 ms on typical devices. A longer device callback
+        // needs enough PCM for its full request plus one incoming sink frame.
+        NORMAL_PLAYOUT_SAMPLES.max(self.callback_samples.saturating_add(BLOCK))
+    }
+
+    fn pcm_queue_capacity(&self) -> usize {
+        MIN_PCM_QUEUE_SAMPLES.max(self.playout_limit())
+    }
+
+    fn mix_block(&mut self, output: &mut [f32], muted: bool, callback_samples: Option<usize>) {
+        let limit = if let Some(callback_samples) = callback_samples {
+            self.callback_samples = callback_samples;
+            self.playout_limit()
+        } else {
+            usize::MAX
+        };
+        output.fill(0.0);
+        for track in self.tracks.values_mut() {
+            let stale = track.samples.len().saturating_sub(limit);
+            let count = (track.samples.len() - stale).min(output.len());
+            let queued = track.samples.drain(..stale + count);
+            if !muted && track.gain != 0.0 {
+                for (mixed, sample) in output.iter_mut().zip(queued.skip(stale)) {
+                    *mixed += f32::from(sample) * track.gain;
+                }
+            }
+        }
+    }
+
+    fn push_remote_pcm(&mut self, sid: &TrackSid, samples: &[i16]) -> bool {
+        let limit = self.pcm_queue_capacity();
+        let Some(track) = self.tracks.get_mut(sid) else {
+            return false;
+        };
+        let samples = &samples[samples.len().saturating_sub(limit)..];
+        let stale = track.samples.len().saturating_sub(limit - samples.len());
+        track.samples.drain(..stale);
+        track.samples.extend(samples.iter().copied());
+        true
     }
 }
 
@@ -148,10 +189,18 @@ fn silence(app: &AppHandle) {
 }
 
 struct Session {
-    room: Room,
+    room: Arc<Room>,
     source: NativeAudioSource,
-    io: Arc<Mutex<Option<AudioIo>>>,
+    io: Arc<AsyncMutex<Option<AudioIo>>>,
     events: Task,
+}
+
+fn call_is_active(state: ConnectionState) -> bool {
+    state != ConnectionState::Disconnected
+}
+
+fn call_owns_input(state: ConnectionState, has_io: bool) -> bool {
+    call_is_active(state) || has_io
 }
 
 #[derive(Default)]
@@ -173,31 +222,65 @@ struct AudioControls {
     app: AppHandle,
     preview: Arc<Mutex<Preview>>,
     settings: watch::Sender<AudioSettings>,
-    pressed: Arc<AtomicBool>,
+    capture_control: Arc<CaptureControl>,
     mix: Arc<Mutex<Mixer>>,
 }
 
 impl AudioControls {
-    fn open_io(
+    fn prepare_io(
         &self,
         settings: &AudioSettings,
         source: Option<&NativeAudioSource>,
-    ) -> Result<AudioIo, String> {
-        AudioIo::open(
+    ) -> Result<PreparedAudioIo, String> {
+        PreparedAudioIo::open(
             &self.app,
             settings,
             self.settings.subscribe(),
-            self.pressed.clone(),
+            self.capture_control.clone(),
             self.mix.clone(),
             source.cloned(),
         )
+    }
+
+    async fn replace_call_io(
+        &self,
+        current: &mut Option<AudioIo>,
+        settings: &AudioSettings,
+        room: &Room,
+        source: &NativeAudioSource,
+    ) -> Result<(), String> {
+        // Keep a working device if the replacement format or endpoint fails to open.
+        let replacement = self.prepare_io(settings, Some(source))?;
+        if let Some(old) = current.take() {
+            old.stop().await;
+        }
+        let preview_input = self.preview.lock().unwrap().input.take();
+        if let Some(preview_input) = preview_input {
+            preview_input.stop().await;
+        }
+        if !call_is_active(room.connection_state()) {
+            return Ok(());
+        }
+        match replacement.start() {
+            Ok(started) => {
+                *current = Some(started);
+                Ok(())
+            }
+            Err(error) => {
+                status(&self.app, "device-error", Some(&error));
+                Err(error)
+            }
+        }
     }
 
     fn resume_preview(&self) {
         let mut preview = self.preview.lock().unwrap();
         if preview.requested && preview.input.is_none() {
             let prefs = self.settings.borrow().clone();
-            match self.open_io(&prefs, None) {
+            match self
+                .prepare_io(&prefs, None)
+                .and_then(PreparedAudioIo::start)
+            {
                 Ok(input) => preview.input = Some(input),
                 Err(e) => status(&self.app, "device-error", Some(&e)),
             }
@@ -245,7 +328,7 @@ impl VoiceEngine {
                 app,
                 preview: Default::default(),
                 settings: watch::channel(AudioSettings::default()).0,
-                pressed: Arc::new(AtomicBool::new(false)),
+                capture_control: Arc::new(CaptureControl::default()),
                 mix: Default::default(),
             },
         }
@@ -267,7 +350,14 @@ impl VoiceEngine {
             }
         };
         let settings = self.audio.settings.borrow().clone();
-        let audio = match self.audio.open_io(&settings, Some(&source)) {
+        let audio = self
+            .audio
+            .prepare_io(&settings, Some(&source))
+            .and_then(|io| {
+                self.audio.preview.lock().unwrap().input.take();
+                io.start()
+            });
+        let audio = match audio {
             Ok(audio) => audio,
             Err(e) => {
                 tokio::spawn(async move {
@@ -275,16 +365,18 @@ impl VoiceEngine {
                 });
                 silence(&self.audio.app);
                 status(&self.audio.app, "device-error", Some(&e));
+                self.audio.resume_preview();
                 return;
             }
         };
-        self.audio.preview.lock().unwrap().input.take();
-        let io = Arc::new(Mutex::new(Some(audio)));
+        let io = Arc::new(AsyncMutex::new(Some(audio)));
+        let room = Arc::new(room);
         status(&self.audio.app, "connected", None);
         let events = Task(tokio::spawn(room_events(
             self.audio.clone(),
             events,
             io.clone(),
+            room.clone(),
             source.clone(),
         )));
         *slot = Some(Session {
@@ -304,7 +396,10 @@ impl VoiceEngine {
         // Join before clearing the shared mixer so a stale subscription cannot reinsert a track.
         let mut events = session.events;
         let _ = (&mut events.0).await;
-        session.io.lock().unwrap().take();
+        let audio = session.io.lock().await.take();
+        if let Some(audio) = audio {
+            audio.stop().await;
+        }
         self.audio.mix.lock().unwrap().tracks.clear();
         silence(&self.audio.app);
         let _ = tokio::time::timeout(Duration::from_secs(4), close).await;
@@ -322,11 +417,16 @@ impl VoiceEngine {
 
     pub async fn monitor(&self, active: bool) -> Result<(), String> {
         let slot = self.session.lock().await;
-        let in_call = slot
-            .as_ref()
-            .is_some_and(|s| s.io.lock().unwrap().is_some());
+        let call = match slot.as_ref() {
+            Some(session) => Some((session, session.io.lock().await)),
+            None => None,
+        };
+        let in_call = call.as_ref().is_some_and(|(session, io)| {
+            call_owns_input(session.room.connection_state(), io.is_some())
+        });
         let mut preview = self.audio.preview.lock().unwrap();
         preview.requested = active;
+        self.audio.capture_control.set_monitoring(active);
         if !active || in_call {
             if preview.input.take().is_some() {
                 let _ = self
@@ -336,7 +436,9 @@ impl VoiceEngine {
             }
         } else if preview.input.as_ref().is_none_or(AudioIo::failed) {
             let prefs = self.audio.settings.borrow().clone();
-            preview.input = Some(self.audio.open_io(&prefs, None)?);
+            let input = self.audio.prepare_io(&prefs, None)?;
+            preview.input.take();
+            preview.input = Some(input.start()?);
         }
         Ok(())
     }
@@ -351,31 +453,39 @@ impl VoiceEngine {
         }
         let slot = self.session.lock().await;
         let old = self.audio.settings.borrow().clone();
-        // A disconnect may resume the preview while a device is being changed.
-        let mut preview = self.audio.preview.lock().unwrap();
-        let in_call = if let Some(session) = slot.as_ref() {
-            let mut io = session.io.lock().unwrap();
-            if io.as_ref().is_some_and(|current| {
-                current.failed()
-                    || old.input_device != settings.input_device
-                    || old.output_device != settings.output_device
-            }) {
-                let replacement = self.audio.open_io(&settings, Some(&session.source))?;
-                *io = Some(replacement);
+        let mut call = match slot.as_ref() {
+            Some(session) => Some((session, session.io.lock().await)),
+            None => None,
+        };
+        let in_call = if let Some((session, io)) = &mut call {
+            if call_is_active(session.room.connection_state())
+                && io.as_ref().is_none_or(|current| {
+                    current.failed()
+                        || old.input_device != settings.input_device
+                        || old.output_device != settings.output_device
+                })
+            {
+                self.audio
+                    .replace_call_io(io, &settings, &session.room, &session.source)
+                    .await?;
                 if session.room.connection_state() == ConnectionState::Connected {
                     status(&self.audio.app, "connected", None);
                 }
             }
-            io.is_some()
+            call_owns_input(session.room.connection_state(), io.is_some())
         } else {
             false
         };
+        let mut preview = self.audio.preview.lock().unwrap();
         if preview.needs_input_change(in_call, old.input_device != settings.input_device) {
-            preview.input = Some(self.audio.open_io(&settings, None)?);
+            let input = self.audio.prepare_io(&settings, None)?;
+            preview.input.take();
+            preview.input = Some(input.start()?);
         }
-        if old.mode != settings.mode || old.shortcut != settings.shortcut {
-            self.set_ptt(false);
-        }
+        self.audio.capture_control.configure(
+            &settings,
+            old.mode != settings.mode || old.shortcut != settings.shortcut,
+        );
         self.audio.settings.send_replace(settings);
         Ok(())
     }
@@ -393,13 +503,48 @@ impl VoiceEngine {
     }
 
     pub fn set_ptt(&self, pressed: bool) {
-        self.audio.pressed.store(pressed, Ordering::Relaxed);
+        self.audio.capture_control.set_ptt(pressed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnected_call_cannot_recover_audio() {
+        assert!(!call_is_active(ConnectionState::Disconnected));
+        assert!(call_is_active(ConnectionState::Connected));
+        assert!(call_is_active(ConnectionState::Reconnecting));
+    }
+
+    #[test]
+    fn recoverable_call_reserves_input_until_call_audio_is_stopped() {
+        assert!(call_owns_input(ConnectionState::Connected, false));
+        assert!(call_owns_input(ConnectionState::Reconnecting, false));
+        assert!(call_owns_input(ConnectionState::Disconnected, true));
+        assert!(!call_owns_input(ConnectionState::Disconnected, false));
+    }
+
+    fn add_track(mix: &mut Mixer, id: &str, samples: VecDeque<i16>) -> TrackSid {
+        let sid: TrackSid = format!("TR_{id}").try_into().unwrap();
+        mix.tracks.insert(
+            sid.clone(),
+            VoiceTrack {
+                player: id.into(),
+                gain: 1.0,
+                samples,
+                _pump: Task(tokio::spawn(std::future::pending())),
+            },
+        );
+        sid
+    }
+
+    fn played_sample(mix: &Mutex<Mixer>, master: f32) -> f32 {
+        let mut sample = 0.0;
+        audio::Playback::new(48_000).render(0..2, master, mix, |_, value| sample = value);
+        sample
+    }
 
     #[test]
     fn selecting_a_device_retries_a_missing_preview_only_while_it_is_requested() {
@@ -412,37 +557,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playout_discards_stale_pcm_before_reaching_the_speaker() {
+        let mut mix = Mixer::default();
+        let sid = add_track(&mut mix, "one", VecDeque::new());
+        mix.push_remote_pcm(&sid, &[2048; 2880]);
+        mix.push_remote_pcm(&sid, &[4096; 1920]);
+        assert_eq!(played_sample(&Mutex::new(mix), 1.0), 0.125);
+    }
+
+    #[tokio::test]
+    async fn playout_queue_adapts_to_the_device_callback_length() {
+        let mix = Mutex::new(Mixer::default());
+        let sid = add_track(&mut mix.lock().unwrap(), "one", VecDeque::new());
+        let mut playback = audio::Playback::new(44_100);
+        playback.render(0..2205, 1.0, &mix, |_, _| {});
+        mix.lock().unwrap().push_remote_pcm(&sid, &[4096; 2400]);
+        let mut played = 0.0;
+        playback.render(0..2205, 1.0, &mix, |_, sample| played = sample);
+        assert_eq!(played, 0.125);
+
+        mix.lock().unwrap().push_remote_pcm(&sid, &[4096; 480]);
+        mix.lock().unwrap().push_remote_pcm(&sid, &[8192; 1920]);
+        assert_eq!(played_sample(&mix, 1.0), 0.25);
+    }
+
+    #[tokio::test]
+    async fn playout_keeps_all_pcm_when_the_device_callback_gets_longer() {
+        let mix = Mutex::new(Mixer::default());
+        let sid = add_track(&mut mix.lock().unwrap(), "one", VecDeque::new());
+        let mut playback = audio::Playback::new(44_100);
+        playback.render(0..441, 1.0, &mix, |_, _| {});
+
+        let levels = [2048, 4096, 6144, 8192, 10240];
+        for level in levels {
+            mix.lock().unwrap().push_remote_pcm(&sid, &[level; BLOCK]);
+        }
+
+        let mut played = [0.0; 2205];
+        playback.render(0..played.len(), 1.0, &mix, |frame, sample| {
+            played[frame] = sample;
+        });
+        for (block, level) in played.chunks_exact(441).zip(levels) {
+            let expected = f32::from(level) / 32768.0;
+            assert!(
+                block.iter().all(|&sample| sample == expected),
+                "expected a full block at {expected}, got {} to {}",
+                block[0],
+                block[440]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resampled_playout_is_continuous_across_mix_blocks_and_callbacks() {
+        let queued: VecDeque<i16> = (0..1600).map(|index| 2048 + index * 8).collect();
+        let render = |callbacks: &[usize]| {
+            let mix = Mutex::new(Mixer::default());
+            add_track(&mut mix.lock().unwrap(), "one", queued.clone());
+            let mut playback = audio::Playback::new(44_100);
+            let mut played = Vec::new();
+            for &frames in callbacks {
+                playback.render(0..frames, 1.0, &mix, |_, sample| played.push(sample));
+            }
+            played
+        };
+        let played = render(&[143, 955, 233]);
+        assert_eq!(played, render(&[1331]));
+        assert_eq!(played[0], 0.0);
+        assert_eq!(played[441], 5880.0 / 32768.0);
+        assert_eq!(played[882], 9720.0 / 32768.0);
+    }
+
+    #[tokio::test]
     async fn mix_scales_and_mutes_each_listener_track_before_master_gain() {
         let mut mix = Mixer::default();
         for (id, sample) in [("one", 2048), ("two", 4096)] {
-            mix.tracks.insert(
-                format!("TR_{id}").try_into().unwrap(),
-                VoiceTrack {
-                    player: id.into(),
-                    gain: 1.0,
-                    samples: VecDeque::from(vec![sample; 5]),
-                    _pump: Task(tokio::spawn(std::future::pending())),
-                },
-            );
+            add_track(&mut mix, id, VecDeque::from(vec![sample; 10]));
         }
-        assert_eq!(mix.next_sample(1.0), 6144.0 / 32768.0);
-        mix.set_peer_gain(
+        let mix = Mutex::new(mix);
+        assert_eq!(played_sample(&mix, 1.0), 6144.0 / 32768.0);
+        mix.lock().unwrap().set_peer_gain(
             "one".into(),
             PeerGain {
                 volume: 200,
                 muted: false,
             },
         );
-        assert_eq!(mix.next_sample(1.0), 8192.0 / 32768.0);
-        mix.set_peer_gain(
+        assert_eq!(played_sample(&mix, 1.0), 8192.0 / 32768.0);
+        mix.lock().unwrap().set_peer_gain(
             "one".into(),
             PeerGain {
                 volume: 200,
                 muted: true,
             },
         );
-        assert_eq!(mix.next_sample(1.0), 4096.0 / 32768.0);
-        mix.set_peer_gain(
+        assert_eq!(played_sample(&mix, 1.0), 4096.0 / 32768.0);
+        mix.lock().unwrap().set_peer_gain(
             "one".into(),
             PeerGain {
                 volume: 200,
@@ -455,18 +665,59 @@ mod tests {
         .unwrap();
         assert!(!prefs.output_muted);
         prefs.output_muted = true;
-        assert_eq!(mix.next_sample(prefs.playback_gain()), 0.0);
-        assert_eq!(mix.tracks.values().next().unwrap().samples.len(), 1);
+        assert_eq!(played_sample(&mix, prefs.playback_gain()), 0.0);
+        assert!(mix
+            .lock()
+            .unwrap()
+            .tracks
+            .values()
+            .all(|track| track.samples.len() == 2));
         assert_eq!(serde_json::to_value(&prefs).unwrap()["outputMuted"], true);
         prefs.output_muted = false;
-        assert_eq!(mix.next_sample(prefs.playback_gain()), 4096.0 / 32768.0);
+        assert_eq!(played_sample(&mix, prefs.playback_gain()), 4096.0 / 32768.0);
     }
+}
+
+fn attach_remote_track(mix: &Arc<Mutex<Mixer>>, track: RemoteAudioTrack, player: String) {
+    let sid = track.sid();
+    let mut stream = NativeAudioStream::with_options(
+        track.rtc_track(),
+        RATE as i32,
+        1,
+        NativeAudioStreamOptions {
+            queue_size_frames: Some(SDK_PCM_QUEUE_FRAMES),
+        },
+    );
+    let weak = Arc::downgrade(mix);
+    let key = sid.clone();
+    let capacity = mix.lock().unwrap().pcm_queue_capacity();
+    let samples = VecDeque::with_capacity(capacity);
+    let mut mix = mix.lock().unwrap();
+    let gain = mix.gain(&player);
+    let pump = Task(tokio::spawn(async move {
+        while let Some(frame) = stream.next().await {
+            let Some(mix) = weak.upgrade() else { break };
+            if !mix.lock().unwrap().push_remote_pcm(&key, &frame.data) {
+                break;
+            }
+        }
+    }));
+    mix.tracks.insert(
+        sid,
+        VoiceTrack {
+            player,
+            gain,
+            samples,
+            _pump: pump,
+        },
+    );
 }
 
 async fn room_events(
     audio: AudioControls,
     mut events: mpsc::UnboundedReceiver<RoomEvent>,
-    io: Arc<Mutex<Option<AudioIo>>>,
+    io: Arc<AsyncMutex<Option<AudioIo>>>,
+    room: Arc<Room>,
     source: NativeAudioSource,
 ) {
     let mut reason = None;
@@ -479,12 +730,11 @@ async fn room_events(
         let event = tokio::select! {
             event = events.recv() => match event { Some(event) => event, None => break },
             _ = retry.tick() => {
-                let mut current = io.lock().unwrap();
-                if current.as_ref().is_some_and(AudioIo::failed) {
+                let mut current = io.lock().await;
+                if call_is_active(room.connection_state()) && current.as_ref().is_none_or(AudioIo::failed) {
                     let settings = audio.settings.borrow().clone();
-                    if let Ok(replacement) = audio.open_io(&settings, Some(&source)) {
-                        *current = Some(replacement);
-                        if network_ready { status(app, "connected", None); }
+                    if audio.replace_call_io(&mut current, &settings, &room, &source).await.is_ok() {
+                        if network_ready && current.is_some() { status(app, "connected", None); }
                     }
                 }
                 continue;
@@ -496,38 +746,7 @@ async fn room_events(
                 participant,
                 ..
             } => {
-                let player = participant.identity().to_string();
-                let sid = track.sid();
-                let mut stream = NativeAudioStream::new(track.rtc_track(), 48_000, 1);
-                let weak = Arc::downgrade(mix);
-                let key = sid.clone();
-                let mut mix = mix.lock().unwrap();
-                let gain = mix.gain(&player);
-                let pump = Task(tokio::spawn(async move {
-                    while let Some(frame) = stream.next().await {
-                        let Some(mix) = weak.upgrade() else { break };
-                        let mut mix = mix.lock().unwrap();
-                        let Some(track) = mix.tracks.get_mut(&key) else {
-                            break;
-                        };
-                        let limit = 48_000 / 10; // Bound extra playout delay to 100 ms.
-                        let excess = (track.samples.len() + frame.data.len()).saturating_sub(limit);
-                        let remove = excess.min(track.samples.len());
-                        track.samples.drain(..remove);
-                        track
-                            .samples
-                            .extend(frame.data.iter().skip(excess - remove).copied());
-                    }
-                }));
-                mix.tracks.insert(
-                    sid,
-                    VoiceTrack {
-                        player,
-                        gain,
-                        samples: VecDeque::with_capacity(4800),
-                        _pump: pump,
-                    },
-                );
+                attach_remote_track(mix, track, participant.identity().to_string());
             }
             RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(track),
@@ -551,7 +770,7 @@ async fn room_events(
                 network_ready = true;
                 if io
                     .lock()
-                    .unwrap()
+                    .await
                     .as_ref()
                     .is_some_and(|audio| !audio.failed())
                 {
@@ -571,7 +790,10 @@ async fn room_events(
             _ => (),
         }
     }
-    io.lock().unwrap().take();
+    let mut current = io.lock().await;
+    if let Some(current) = current.take() {
+        current.stop().await;
+    }
     mix.lock().unwrap().tracks.clear();
     silence(app);
     status(app, "disconnected", reason.as_deref());

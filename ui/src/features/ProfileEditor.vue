@@ -87,7 +87,7 @@ async function save() {
     <form @submit.prevent="save">
       <div class="portrait-row">
         <button type="button" class="portrait-button" aria-label="更换头像" :disabled="processing || saving" @click="picker?.click()">
-          <PlayerAvatar :name="nickname" :avatar="avatar" class="portrait-preview mine" />
+          <PlayerAvatar :name="nickname" :avatar="avatar" class="portrait-preview mine" person />
           <span class="portrait-camera"><Camera aria-hidden="true" /></span>
         </button>
         <div class="portrait-actions">
@@ -113,6 +113,7 @@ async function save() {
 .portrait-row { display: flex; align-items: center; gap: 16px; margin: 20px 0; }
 .portrait-button { padding: 0; border: 0; border-radius: 18px; background: transparent; position: relative; }
 .portrait-preview { width: 68px; height: 68px; border-radius: 18px; font-size: 24px; }
+.portrait-preview :deep(svg) { width: 28px; height: 28px; }
 .portrait-camera { position: absolute; right: -3px; bottom: -3px; display: grid; place-items: center; width: 24px; height: 24px; background: white; border: 1px solid var(--line); border-radius: 50%; color: var(--accent); }
 .portrait-camera svg { width: 14px; height: 14px; }
 .portrait-actions { display: grid; justify-items: start; gap: 6px; }

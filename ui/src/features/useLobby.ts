@@ -1,23 +1,37 @@
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { Action, Channel, LobbyEvent, Preferences, Session, Snapshot, VoiceStatus } from '../model'
+import type { LobbyEvent, Preferences, RecentRoom, Session, Snapshot, VoiceStatus } from '../model'
+
+interface RoomSession {
+  session: Session
+  snapshot: Snapshot
+}
+
+function withAvatars(snapshot: Snapshot, previous?: Snapshot): Snapshot {
+  const avatars = new Map(previous?.members.map(member => [member.id, member.avatar]))
+  const members = snapshot.members.map(member => member.avatar === undefined
+    ? { ...member, avatar: avatars.get(member.id) }
+    : member)
+  return { ...snapshot, members }
+}
 
 export function useLobby(openInvite: (link: string) => void) {
   const preferences = ref<Preferences>()
-  const session = ref<Session>()
-  const snapshot = ref<Snapshot>()
+  const current = shallowRef<RoomSession>()
+  const session = computed(() => current.value?.session)
+  const snapshot = computed(() => current.value?.snapshot)
+  const active = computed(() => !!current.value && (!current.value.session.isHost || current.value.snapshot.members.length > 1))
   const ready = ref(false)
-  const localChannels = ref<Pick<Channel, 'id' | 'name'>[]>([])
-  const loadingChannels = ref(false)
-  const channelsError = ref('')
+  const history = ref<RecentRoom[]>([])
+  const historyLoading = ref(false)
+  const historyError = ref('')
   const busy = ref(false)
   const offline = ref('')
   const error = ref('')
   const speakers = ref<string[]>([])
   const level = ref(0)
   const voice = ref<VoiceStatus>({ state: 'disconnected' })
-  const active = computed(() => snapshot.value?.channels.find(c => c.id === snapshot.value?.channelId))
   const inVoice = computed(() => ['connected', 'online', 'ready'].includes(voice.value.state))
   const voiceLabel = computed(() => {
     if (inVoice.value) return '语音已连接'
@@ -29,54 +43,59 @@ export function useLobby(openInvite: (link: string) => void) {
   })
   const removers: UnlistenFn[] = []
   let disposed = false
-  let offlineVersion = 0
-  let localVersion = 0
+  let historyVersion = 0
+  let manuallyClosed = false
+  let restoreWhenIdle = false
+  let pending: { id: string; snapshot?: Snapshot; offline?: string; error?: string } | undefined
 
-  async function refreshLocalChannels() {
-    const version = ++localVersion
-    loadingChannels.value = true
-    channelsError.value = ''
+  async function refreshHistory() {
+    const version = ++historyVersion
+    historyLoading.value = true
+    historyError.value = ''
     try {
-      const channels = await invoke<Pick<Channel, 'id' | 'name'>[]>('list_local_channels')
-      if (version === localVersion) localChannels.value = channels
+      const rooms = await invoke<RecentRoom[]>('list_room_history')
+      if (version === historyVersion) history.value = rooms
     } catch (reason) {
-      if (version === localVersion) channelsError.value = String(reason)
+      if (version === historyVersion) historyError.value = String(reason)
     } finally {
-      if (version === localVersion) loadingChannels.value = false
+      if (version === historyVersion) historyLoading.value = false
     }
   }
 
-  watch([snapshot, session], ([state, current]) => {
-    if (state && current?.isHost) {
-      localVersion++
-      localChannels.value = state.channels.map(({ id, name }) => ({ id, name }))
-      loadingChannels.value = false
-      channelsError.value = ''
-    }
-  })
-
   function clearSession() {
-    snapshot.value = undefined
-    session.value = undefined
+    current.value = undefined
     speakers.value = []
     level.value = 0
     voice.value = { state: 'disconnected' }
   }
 
+  function restoreHost() {
+    if (busy.value || !restoreWhenIdle) return
+    restoreWhenIdle = false
+    if (!manuallyClosed && !current.value) void run(() => openSession(undefined, true))
+  }
+
+  function disconnected(message: string, isHost: boolean) {
+    clearSession()
+    offline.value = message || '房间连接已断开'
+    if (!isHost) {
+      restoreWhenIdle = true
+      restoreHost()
+    }
+  }
+
   function eventReceived(event: LobbyEvent) {
-    if (event.type === 'snapshot') {
-      const previous = new Map(snapshot.value?.members.map(member => [member.id, member.avatar]))
-      for (const member of event.members) {
-        if (member.avatar === undefined) member.avatar = previous.get(member.id) || ''
-      }
-      snapshot.value = event
-      offline.value = ''
-    } else if (event.type === 'offline') {
-      offlineVersion++
-      if (session.value?.isHost) void refreshLocalChannels()
-      clearSession()
-      offline.value = event.message || '大厅暂时离线'
-    } else { error.value = event.message }
+    if (pending?.id === event.sessionId) {
+      if (event.type === 'snapshot') pending.snapshot = withAvatars(event, pending.snapshot)
+      else if (event.type === 'offline') pending.offline = event.message || '房间连接已断开'
+      else pending.error = event.message
+      return
+    }
+    const room = current.value
+    if (!room || room.session.id !== event.sessionId) return
+    if (event.type === 'snapshot') current.value = { session: room.session, snapshot: withAvatars(event, room.snapshot) }
+    else if (event.type === 'offline') disconnected(event.message, room.session.isHost)
+    else error.value = event.message
   }
 
   async function subscribe<T>(name: string, handle: (payload: T) => void) {
@@ -87,7 +106,6 @@ export function useLobby(openInvite: (link: string) => void) {
 
   onMounted(async () => {
     if (!isTauri()) return
-    void refreshLocalChannels()
     try {
       let pendingInvite = ''
       await Promise.all([
@@ -101,32 +119,40 @@ export function useLobby(openInvite: (link: string) => void) {
         }),
         subscribe<{ level: number }>('voice-level', e => { level.value = e.level }),
         subscribe<string[]>('speakers', ids => { speakers.value = ids }),
-        subscribe<string>('invite-open', value => { if (ready.value) openInvite(value); else pendingInvite = value }),
+        subscribe<string>('invite-open', link => { if (ready.value) openInvite(link); else pendingInvite = link }),
       ])
       preferences.value = await invoke<Preferences>('get_preferences')
       const startupInvite = await invoke<string | null>('take_invite')
       ready.value = true
-      if (pendingInvite || startupInvite) openInvite(pendingInvite || startupInvite!)
+      void refreshHistory()
+      if (preferences.value.nickname.trim()) void connect()
+      const link = pendingInvite || startupInvite
+      if (link) openInvite(link)
     } catch (reason) { error.value = String(reason) }
   })
   onBeforeUnmount(() => { disposed = true; removers.forEach(off => off()) })
 
-  async function openSession(invite?: string) {
-    const nickname = preferences.value?.nickname.trim()
-    if (!nickname) throw new Error('请先设置昵称')
-    offline.value = ''
-    if (session.value || snapshot.value) {
-      const wasHost = session.value?.isHost
-      await invoke('leave_lobby')
-      clearSession()
-      if (wasHost) void refreshLocalChannels()
-    }
-    const version = offlineVersion
-    const result = invite
-      ? await invoke<Session>('join_lobby', { nickname, invite })
-      : await invoke<Session>('host_lobby', { nickname })
-    if (version !== offlineVersion) throw new Error('大厅连接已断开')
-    session.value = result
+  async function openSession(invite?: string, keepNotice = false) {
+    if (!preferences.value?.nickname.trim()) throw new Error('请先设置昵称')
+    const attempt = { id: crypto.randomUUID() } as NonNullable<typeof pending>
+    pending = attempt
+    try {
+      const result = invite
+        ? await invoke<Session & { snapshot: Snapshot; historyError?: string }>('join_lobby', { sessionId: attempt.id, invite })
+        : await invoke<Session & { snapshot: Snapshot }>('host_lobby', { sessionId: attempt.id })
+      if (attempt.offline) {
+        disconnected(attempt.offline, result.isHost)
+        throw new Error(attempt.offline)
+      }
+      const { id, isHost, invite: acceptedInvite } = result
+      current.value = { session: { id, isHost, invite: acceptedInvite }, snapshot: attempt.snapshot ?? result.snapshot }
+      if (!keepNotice) offline.value = ''
+      if (attempt.error) error.value = attempt.error
+      if (!isHost) {
+        void refreshHistory()
+        if ('historyError' in result && typeof result.historyError === 'string') error.value = result.historyError
+      }
+    } finally { pending = undefined }
   }
 
   async function run(operation: () => Promise<void>) {
@@ -136,30 +162,39 @@ export function useLobby(openInvite: (link: string) => void) {
     try {
       await operation()
       return true
-    } catch (reason) { error.value = String(reason); return false }
-    finally { busy.value = false }
+    } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason); return false }
+    finally {
+      busy.value = false
+      restoreHost()
+    }
   }
 
-  function connect(invite?: string) { return run(() => openSession(invite)) }
+  function connect(invite?: string) {
+    return run(async () => {
+      if (!invite) manuallyClosed = false
+      await openSession(invite)
+    })
+  }
 
   function leave() {
+    const room = session.value
+    if (!room) return Promise.resolve(false)
     return run(async () => {
-      const wasHost = session.value?.isHost
-      await invoke('leave_lobby')
+      await invoke('leave_lobby', { sessionId: room.id })
       clearSession()
       offline.value = ''
-      if (wasHost) void refreshLocalChannels()
+      if (room.isHost) manuallyClosed = true
+      else restoreWhenIdle = true
     })
   }
 
-  function action(action: Action, startLocal = false) {
+  function retryVoice() {
     return run(async () => {
-      if (startLocal && !session.value && !snapshot.value) await openSession()
-      await invoke('lobby_action', { action })
+      const room = session.value
+      if (room && active.value) await invoke('lobby_action', { sessionId: room.id, action: { type: 'retryVoice' } })
     })
   }
 
-  return { preferences, session, snapshot, ready, busy, offline, error, speakers, level,
-    voice, active, inVoice, voiceLabel, connect, leave, action,
-    localChannels, loadingChannels, channelsError, refreshLocalChannels }
+  return { preferences, session, snapshot, ready, busy, offline, error, speakers, level, voice,
+    active, inVoice, voiceLabel, connect, leave, retryVoice, history, historyLoading, historyError, refreshHistory }
 }

@@ -1,19 +1,20 @@
-use crate::voice::VoiceEngine;
+use crate::{lobby::ROOM_PROTOCOL, voice::VoiceEngine};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tauri::{AppHandle, Emitter};
 use tokio::{
+    net::TcpStream,
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{timeout, timeout_at, Instant},
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 type Reply = oneshot::Sender<Result<(), String>>;
 
 const QUEUE_TIMEOUT: &str = "操作排队超时，未发送";
-const DISCONNECTED: &str = "大厅连接已断开";
+const DISCONNECTED: &str = "房间连接已断开";
 
 struct Command {
     action: Value,
@@ -57,7 +58,7 @@ impl ClientCommands {
                 reply,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => "大厅操作队列已满，未发送".to_owned(),
+                mpsc::error::TrySendError::Full(_) => "房间操作队列已满，未发送".to_owned(),
                 mpsc::error::TrySendError::Closed(_) => DISCONNECTED.to_owned(),
             });
         async move {
@@ -68,7 +69,7 @@ impl ClientCommands {
                     // Closing first decides a simultaneous timeout/dispatch without a late send.
                     dispatch.close();
                     if dispatch.try_recv().is_ok() {
-                        Err("主机未确认操作，请查看当前频道状态".into())
+                        Err("主机未确认操作，请查看房间记录".into())
                     } else {
                         Err(QUEUE_TIMEOUT.into())
                     }
@@ -105,37 +106,80 @@ pub struct Client {
     tasks: Vec<JoinHandle<()>>,
 }
 
-impl Client {
-    pub async fn open(
-        app: AppHandle,
-        voice: Arc<VoiceEngine>,
-        port: u16,
-        mut hello: Value,
-    ) -> Result<Self, String> {
+pub(crate) struct AcceptedRoom {
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    base: String,
+    initial: Value,
+    messages: Vec<Value>,
+}
+
+pub(crate) fn emit_room(app: &AppHandle, session_id: &str, mut event: Value) {
+    event["sessionId"] = session_id.into();
+    let _ = app.emit("lobby-event", event);
+}
+
+impl AcceptedRoom {
+    pub(crate) async fn connect(port: u16, mut hello: Value) -> Result<Self, String> {
         let base = format!("ws://127.0.0.1:{port}");
         let (mut ws, _) = timeout(Duration::from_secs(10), connect_async(format!("{base}/ws")))
             .await
-            .map_err(|_| "大厅连接超时".to_owned())?
-            .map_err(|e| format!("无法连接大厅：{e}"))?;
-        hello["chatDeltas"] = true.into();
+            .map_err(|_| "房间连接超时".to_owned())?
+            .map_err(|e| format!("无法连接房间：{e}"))?;
+        hello["roomProtocol"] = ROOM_PROTOCOL.into();
         ws.send(Message::Text(hello.to_string().into()))
             .await
             .map_err(|e| e.to_string())?;
         let first = timeout(Duration::from_secs(10), ws.next())
             .await
-            .map_err(|_| "大厅没有回应".to_owned())?
-            .ok_or("大厅已关闭")?
+            .map_err(|_| "房间没有回应".to_owned())?
+            .ok_or("房间已关闭")?
             .map_err(|e| e.to_string())?;
         let mut initial: Value = serde_json::from_str(first.to_text().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         if initial["type"] != "snapshot" {
-            return Err(initial["message"].as_str().unwrap_or("加入大厅失败").into());
+            return Err(initial["message"].as_str().unwrap_or("加入房间失败").into());
+        }
+        if initial["roomProtocol"].as_u64() != Some(ROOM_PROTOCOL) {
+            return Err("房间版本不兼容，请和房主更新到相同版本后再试".into());
+        }
+        if !["roomId", "roomName", "ownerId", "ownerNickname", "selfId"]
+            .iter()
+            .all(|key| initial[*key].as_str().is_some_and(|s| !s.is_empty()))
+            || !initial["members"].is_array()
+        {
+            return Err("房间状态无效".into());
         }
         let mut messages = Vec::new();
         if !complete_chat(&mut initial, &mut messages) {
-            return Err("大厅聊天记录同步失败".into());
+            return Err("房间聊天记录同步失败".into());
         }
-        let _ = app.emit("lobby-event", &initial);
+        Ok(Self {
+            ws,
+            base,
+            initial,
+            messages,
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> &Value {
+        &self.initial
+    }
+
+    pub(crate) fn activate(
+        self,
+        app: AppHandle,
+        voice: Arc<VoiceEngine>,
+        session_id: String,
+        disconnected: impl FnOnce(String) + Send + 'static,
+    ) -> Client {
+        let Self {
+            mut ws,
+            base,
+            initial,
+            mut messages,
+        } = self;
+        let room = initial["roomId"].clone();
+        emit_room(&app, &session_id, initial);
         let (commands, mut outgoing) = mpsc::channel::<Command>(64);
         let (target, mut wanted) = watch::channel::<Option<String>>(None);
         let audio = tokio::spawn(async move {
@@ -155,15 +199,15 @@ impl Client {
             voice.disconnect().await;
         });
         let socket = tokio::spawn(async move {
-            let mut joined = initial["channelId"].clone();
             let mut sequence = 0u64;
             let mut waiting: HashMap<u64, Reply> = HashMap::new();
+            let mut closure = "房间连接已断开，可从历史房间重新加入".to_owned();
             loop {
                 tokio::select! {
                     next=outgoing.recv()=>match next {
                         Some(command)=>{
                             let Some((mut data,reply))=command.begin() else {continue};
-                            let Some(fields)=data.as_object_mut() else {let _=reply.send(Err("无效的大厅操作".into()));continue};
+                            let Some(fields)=data.as_object_mut() else {let _=reply.send(Err("无效的房间操作".into()));continue};
                             waiting.retain(|_,r|!r.is_closed());
                             sequence+=1;
                             fields.insert("requestId".into(),sequence.into());
@@ -181,18 +225,17 @@ impl Client {
                                     let _=reply.send(result);
                                 },
                                 Some("snapshot")=>{
-                                    if event["channelId"]!=joined {
-                                        joined=event["channelId"].clone();
-                                        messages.clear();
-                                        target.send_replace(None);
-                                    }
-                                    if !complete_chat(&mut event, &mut messages) { break; }
-                                    let _=app.emit("lobby-event",event);
+                                    if event["roomId"] != room || !complete_chat(&mut event, &mut messages) { break; }
+                                    emit_room(&app, &session_id, event);
                                 }
-                                Some("voice")=>if !joined.is_null() && event["channelId"]==joined {
+                                Some("voice")=>if event["roomId"] == room {
                                     target.send_replace(event["token"].as_str().map(str::to_owned));
                                 },
-                                Some("error")=>{let _=app.emit("lobby-event",event);}
+                                Some("error")=>emit_room(&app, &session_id, event),
+                                Some("offline")=>{
+                                    if let Some(message)=event["message"].as_str() { closure=message.to_owned(); }
+                                    break;
+                                }
                                 _=>{}
                             }
                         }
@@ -202,17 +245,22 @@ impl Client {
                     }
                 }
             }
+            drop(outgoing);
             drop(target);
-            let _ = app.emit(
-                "lobby-event",
-                json!({"type":"offline","message":"大厅连接已断开，可通过原邀请重新加入"}),
-            );
+            disconnected(closure);
         });
-        Ok(Self {
+        Client {
             commands: ClientCommands(commands),
             tasks: vec![socket, audio],
-        })
+        }
     }
+}
+
+impl Client {
+    pub(crate) fn is_connected(&self) -> bool {
+        !self.commands.0.is_closed()
+    }
+
     pub async fn close(self) {
         for task in self.tasks {
             task.abort();
@@ -224,6 +272,7 @@ impl Client {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use serde_json::json;
 
     pub(crate) struct CommandPeer(mpsc::Receiver<Command>);
 
@@ -251,7 +300,7 @@ pub(crate) mod tests {
         let expired = commands.send_before(json!("expired"), Instant::now());
         assert_eq!(
             commands.send(json!("overflow")).await.unwrap_err(),
-            "大厅操作队列已满，未发送"
+            "房间操作队列已满，未发送"
         );
         assert_eq!(expired.await.unwrap_err(), QUEUE_TIMEOUT);
         assert!(queue.recv().await.unwrap().begin().is_none());
@@ -273,10 +322,7 @@ pub(crate) mod tests {
             .send_before(json!("sent"), Instant::now() + Duration::from_millis(100));
         let (action, _pending_ack) = peer.recv().await.unwrap();
         assert_eq!(action, "sent");
-        assert_eq!(
-            result.await.unwrap_err(),
-            "主机未确认操作，请查看当前频道状态"
-        );
+        assert_eq!(result.await.unwrap_err(), "主机未确认操作，请查看房间记录");
     }
 
     #[test]

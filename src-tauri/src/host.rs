@@ -17,6 +17,7 @@ use tokio::{
 
 pub struct Host {
     media: Child,
+    room: lobby::RoomControl,
     stop: watch::Sender<bool>,
     serve: JoinHandle<()>,
     pub overlay: network::HostEndpoint,
@@ -115,10 +116,10 @@ impl Host {
         .await?;
         let credential = profile.player_credential(&overlay.id());
         let (stop, mut stopping) = watch::channel(false);
-        let router = lobby::router_with_shutdown(
+        let (router, room) = lobby::router_with_shutdown(
             lobby::Config {
-                database: profile.channel_database(),
                 owner_identity: credential.clone(),
+                owner_nickname: profile.settings.nickname.clone(),
                 invite_key: profile.invite_key.clone(),
                 livekit_key: api_key,
                 livekit_secret: api_secret,
@@ -136,6 +137,7 @@ impl Host {
         let invite = overlay.invite(&profile.invite_key)?;
         Ok(Self {
             media,
+            room,
             stop,
             serve,
             overlay,
@@ -143,6 +145,10 @@ impl Host {
             invite,
             credential,
         })
+    }
+
+    pub(crate) async fn stop_if_empty(&self) -> Result<(), String> {
+        self.room.stop_if_empty(&self.stop).await
     }
 
     pub async fn close(mut self) {

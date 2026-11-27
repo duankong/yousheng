@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue'
-import { HeadphoneOff, Headphones, Mic, MicOff } from 'lucide-vue-next'
+import { Mic, MicOff, Volume2, VolumeX } from 'lucide-vue-next'
 import type { AudioSettings } from '../model'
 import type { AudioControls } from './useAudioControls'
 
 defineProps<{ audio?: AudioSettings; controls: AudioControls }>()
 const items = [
   { gain: 'inputGain', mute: 'muted', name: '麦克风音量', muteLabel: '麦克风静音', off: '关闭麦克风', on: '取消麦克风静音', icon: Mic, mutedIcon: MicOff, max: 200 },
-  { gain: 'outputGain', mute: 'outputMuted', name: '频道音量', muteLabel: '频道声音静音', off: '关闭频道声音', on: '恢复频道声音', icon: Headphones, mutedIcon: HeadphoneOff, max: 150 },
+  { gain: 'outputGain', mute: 'outputMuted', name: '扬声器音量', muteLabel: '扬声器静音', off: '关闭扬声器', on: '恢复扬声器声音', icon: Volume2, mutedIcon: VolumeX, max: 150 },
 ] as const
 type Gain = (typeof items)[number]['gain']
 const open = ref<Gain>()
@@ -57,7 +57,7 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
 </script>
 
 <template>
-  <div class="call-toggles" role="group" aria-label="频道语音控制">
+  <div class="call-toggles" role="group" aria-label="通话声音控制">
     <div v-for="item in items" :key="item.gain" class="gain-control"
       @pointerenter="show(item.gain, true)" @pointerleave="leave"
       @focusin="show(item.gain)" @focusout="blur(item.gain, $event)" @keydown.esc.stop.prevent="dismiss">

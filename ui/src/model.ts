@@ -1,33 +1,24 @@
-export interface Channel {
-  id: string
-  name: string
-  ownerId: string
-  canDelete: boolean
-}
-
 export interface Member {
   id: string
   name: string
   avatar?: string
-  channelId: string | null
 }
 
 export interface Snapshot {
   type: 'snapshot'
+  roomProtocol: 2
+  roomId: string
+  roomName: string
+  ownerId: string
+  ownerNickname: string
   selfId: string
-  admin: boolean
-  channels: Channel[]
   members: Member[]
-  channelId: string | null
   messages: { id: string; authorId: string; authorName: string; text: string; time: number }[]
 }
 
-export type LobbyEvent = Snapshot | { type: 'error' | 'offline'; message: string }
-export interface Session { invite: string; isHost: boolean }
-export type Action = { type: 'create'; name: string }
-  | { type: 'leave' }
-  | { type: 'join' | 'delete'; channelId: string }
-  | { type: 'chat'; channelId: string; text: string }
+export type LobbyEvent = (Snapshot | { type: 'error' | 'offline'; message: string }) & { sessionId: string }
+export interface Session { id: string; invite: string; isHost: boolean }
+export interface RecentRoom { hostId: string; nickname: string; invite: string; lastJoinedAt: number }
 
 export interface AudioSettings {
   mode: 'open' | 'activation' | 'ptt'

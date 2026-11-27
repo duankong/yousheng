@@ -7,6 +7,36 @@ use cpal::{
 };
 use serde::Serialize;
 
+#[derive(Default)]
+pub(super) struct CallbackPriority {
+    #[cfg(windows)]
+    registration: Option<usize>,
+}
+
+impl CallbackPriority {
+    pub(super) fn enter(&mut self) {
+        #[cfg(windows)]
+        if self.registration.is_none() {
+            use windows_sys::{core::w, Win32::System::Threading::AvSetMmThreadCharacteristicsW};
+            let mut index = 0;
+            // SAFETY: The task name is null-terminated and index is valid for this call.
+            let registration = unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut index) };
+            self.registration = Some(registration as usize);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CallbackPriority {
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.filter(|&handle| handle != 0) {
+            use windows_sys::Win32::System::Threading::AvRevertMmThreadCharacteristics;
+            // SAFETY: WASAPI runs and drops the callback on the same stream thread.
+            unsafe { AvRevertMmThreadCharacteristics(registration as _) };
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct DeviceInfo {
     pub id: String,

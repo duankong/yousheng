@@ -1,8 +1,8 @@
 [package]
 name = "duipin"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
-description = "友声 GroveCall · Windows 游戏组队语音与频道聊天"
+description = "友声 GroveCall · Windows 游戏组队语音与房间聊天"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -17,6 +17,7 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
 cpal = "0.16"
+crossbeam-queue = "0.3.12"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 hmac = "0.12"
@@ -28,7 +29,6 @@ livekit-protocol = "0.9"
 prost = "0.14"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -37,6 +37,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.28"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [profile.dev]
 debug = 0

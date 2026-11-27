@@ -1,16 +1,20 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { AudioLines, SlidersHorizontal, VolumeX, Users, X } from 'lucide-vue-next'
+import { AudioLines, SlidersHorizontal, UserRoundPlus, VolumeX, X } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
 import type { Member, PeerSettings, Snapshot } from '../model'
 import PlayerAvatar from './PlayerAvatar.vue'
-const props = defineProps<{ snapshot: Snapshot; speakers: string[]; peers: Record<string, PeerSettings> }>()
-const emit = defineEmits<{ saved: [id: string, settings: PeerSettings]; error: [error: string]; editProfile: [] }>()
+const props = defineProps<{ snapshot: Snapshot; speakers: string[]; peers: Record<string, PeerSettings>; busy: boolean }>()
+const emit = defineEmits<{ saved: [id: string, settings: PeerSettings]; error: [error: string]; editProfile: []; invite: [] }>()
 const editId = ref('')
 const edit = ref<PeerSettings>({ volume: 100, muted: false })
-const busy = ref(false)
-const visible = computed(() => props.snapshot.members.filter(m => !props.snapshot.channelId || m.channelId === props.snapshot.channelId))
+const saving = ref(false)
+const visible = computed(() => [...props.snapshot.members].sort((a, b) => Number(b.id === props.snapshot.ownerId) - Number(a.id === props.snapshot.ownerId)))
 watch(visible, list => { if (!list.some(m => m.id === editId.value)) editId.value = '' })
+function role(member: Member) {
+  if (member.id === props.snapshot.selfId) return member.id === props.snapshot.ownerId ? '我（房主）' : '我'
+  return member.id === props.snapshot.ownerId ? '房主' : '队友'
+}
 function select(member: Member) {
   editId.value = member.id === editId.value ? '' : member.id
   edit.value = { ...(props.peers[member.id] ?? { volume: 100, muted: false }) }
@@ -18,17 +22,19 @@ function select(member: Member) {
 async function save() {
   const id = editId.value
   const settings = { ...edit.value }
-  busy.value = true
+  saving.value = true
   try {
     await invoke('set_peer', { id, ...settings })
     emit('saved', id, settings)
   } catch (reason) { emit('error', String(reason)); edit.value = { ...(props.peers[id] ?? { volume: 100, muted: false }) } }
-  finally { busy.value = false }
+  finally { saving.value = false }
 }
 </script>
 
 <template>
-  <aside class="members"><h3><Users />{{ snapshot.channelId ? '频道成员' : '大厅成员' }} <span class="number">{{ visible.length }}</span></h3>
+  <aside class="members" aria-labelledby="member-title">
+    <header class="member-heading"><h2 id="member-title">成员</h2><span class="number" role="status">{{ visible.length }} 人</span></header>
+    <button class="button tinted member-invite" :disabled="busy" aria-haspopup="dialog" @click="emit('invite')"><UserRoundPlus aria-hidden="true" />邀请好友</button>
     <ul><li v-for="member in visible" :key="member.id">
       <div class="member-row">
         <PlayerAvatar :name="member.name" :avatar="member.avatar" :editable="member.id === snapshot.selfId"
@@ -36,20 +42,29 @@ async function save() {
         <div class="member-info"><strong>{{ member.name }}</strong>
           <small v-if="speakers.includes(member.id)" class="speech"><AudioLines /> 正在发言</small>
           <small v-else-if="peers[member.id]?.muted" class="peer-muted"><VolumeX /> 本地已静音</small>
-          <small v-else>{{ member.id === snapshot.selfId ? '我自己' : (snapshot.channels.find(c => c.id === member.channelId)?.name ?? '在大厅') }}</small>
+          <small v-else>{{ role(member) }}</small>
         </div>
-        <button v-if="member.id !== snapshot.selfId" :disabled="busy" class="peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal /><span>音量</span></button>
+        <button v-if="member.id !== snapshot.selfId" :disabled="busy || saving" class="peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal aria-hidden="true" /><span>音量</span></button>
       </div>
       <div v-if="editId === member.id" class="peer-panel">
         <div class="peer-head"><b>个人收听</b><button class="icon-button" aria-label="收起音量设置" @click="editId = ''"><X /></button></div>
-        <label class="range-label"><span>音量</span><output>{{ edit.volume }}%</output><input v-model.number="edit.volume" type="range" min="0" max="200" :disabled="busy" @change="save" /></label>
-        <label class="switch-row">我不听此人<input v-model="edit.muted" type="checkbox" role="switch" :disabled="busy" @change="save" /></label>
+        <label class="range-label"><span>音量</span><output>{{ edit.volume }}%</output><input v-model.number="edit.volume" type="range" min="0" max="200" :disabled="busy || saving" @change="save" /></label>
+        <label class="switch-row">我不听此人<input v-model="edit.muted" type="checkbox" role="switch" :disabled="busy || saving" @change="save" /></label>
       </div>
     </li></ul>
   </aside>
 </template>
 
 <style scoped>
+.members { min-width: 0; min-height: 0; border-inline-start: 1px solid var(--line); background: #fafaf9; padding: 16px 12px; overflow: auto; }
+.member-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.member-heading h2 { font-size: 14px; }
+.number { flex: none; border-radius: 5px; background: white; padding: 2px 6px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.member-invite { width: 100%; margin-top: 12px; }
+.members ul { list-style: none; margin: 9px 0 0; padding: 0; }
+.member-row { display: flex; align-items: center; gap: 8px; min-height: 46px; padding-block: 6px; }
+.member-info { min-width: 0; flex: 1; }
+.member-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .peer-button {
   display: inline-flex;
   align-items: center;
@@ -68,7 +83,20 @@ async function save() {
   background: #f0f0f0;
 }
 .member-info small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
 }
+.member-info small svg { width: 11px; height: 11px; vertical-align: -2px; }
+.member-info small.speech { color: var(--live); }
+.member-info small.peer-muted { color: var(--danger); }
+.peer-button svg { width: 14px; height: 14px; }
+.peer-panel { padding: 9px; margin: 2px 0 7px; border: 1px solid var(--line); border-radius: 8px; background: white; font-size: 12px; }
+.peer-head { display: flex; align-items: center; justify-content: space-between; }
+.peer-head .icon-button { height: 23px; width: 23px; }
+.peer-head .icon-button svg { width: 13px; }
+.peer-panel .range-label, .peer-panel .switch-row { font-size: 11px; }
+.peer-panel .switch-row input:checked { background: var(--danger); }
 </style>

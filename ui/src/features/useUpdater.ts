@@ -4,7 +4,7 @@ import type { Preferences } from '../model'
 
 interface Update { version: string; notes: string }
 
-export function useUpdater(preferences: Ref<Preferences | undefined>, ready: Ref<boolean>, installBlocked: Ref<boolean>) {
+export function useUpdater(preferences: Ref<Preferences | undefined>, ready: Ref<boolean>, installBlocked: Ref<boolean>, sessionId: () => string | null) {
   const enabled = computed(() => preferences.value?.autoUpdate ?? true)
   const saving = ref(false)
   const checking = ref(false)
@@ -56,7 +56,7 @@ export function useUpdater(preferences: Ref<Preferences | undefined>, ready: Ref
     installing.value = true
     error.value = ''
     try {
-      await invoke('install_update', { version: update.version })
+      await invoke('install_update', { version: update.version, sessionId: sessionId() })
       status.value = '安装程序已启动'
       available.value = null
     } catch (reason) { error.value = '安装更新失败：' + String(reason) }

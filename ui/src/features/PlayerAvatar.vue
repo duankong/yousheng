@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { UserRound } from 'lucide-vue-next'
 
-const props = defineProps<{ name: string; avatar?: string; editable?: boolean }>()
+const props = defineProps<{ name: string; avatar?: string; editable?: boolean; person?: boolean }>()
 const emit = defineEmits<{ edit: [] }>()
 const failedSource = ref('')
 const source = computed(() => props.avatar?.startsWith('data:image/jpeg;base64,') && props.avatar !== failedSource.value ? props.avatar : '')
@@ -14,6 +15,7 @@ const initial = computed(() => Array.from(props.name.trim())[0] || '我')
     :title="editable ? '编辑我的资料' : undefined" :aria-hidden="editable ? undefined : true"
     @click="editable && emit('edit')">
     <img v-if="source" :src="source" alt="" @error="failedSource = source" />
+    <UserRound v-else-if="person || editable" aria-hidden="true" />
     <template v-else>{{ initial }}</template>
   </component>
 </template>

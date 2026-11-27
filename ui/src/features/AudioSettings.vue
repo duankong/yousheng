@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Mic, Headphones, AudioWaveform } from 'lucide-vue-next'
+import { Mic, Volume2, AudioWaveform } from 'lucide-vue-next'
 import { modes, type AudioSettings, type Devices } from '../model'
 import type { AudioControls } from './useAudioControls'
 
@@ -98,7 +98,7 @@ onBeforeUnmount(() => { void flush() })
         </div>
         <p v-if="monitorError" class="form-error" role="alert">{{ monitorError }}</p>
       </section>
-      <section class="settings-section"><h3><Headphones /> 播放与音效</h3>
+      <section class="settings-section"><h3><Volume2 /> 扬声器与音效</h3>
         <label class="field">输出设备
           <select :value="draft.outputDevice" @change="controls.change('outputDevice', ($event.target as HTMLSelectElement).value)">
             <option value="">系统默认设备</option>

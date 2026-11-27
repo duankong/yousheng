@@ -1,4 +1,4 @@
-use super::{Cleanup, Config, Core, Membership, Shared};
+use super::{Config, Core, Membership, Shared};
 use axum::{
     extract::{
         ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
@@ -12,7 +12,6 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::btree_map::Entry,
     net::SocketAddrV4,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -82,11 +81,11 @@ impl Media {
         )
     }
 
-    pub fn voice(&self, id: &str, name: &str, m: &Membership) -> Value {
-        let grant = json!({"roomJoin":true,"room":m.room,"canPublish":true,"canPublishSources":["microphone"],
+    pub fn voice(&self, room: &str, id: &str, name: &str, m: &Membership) -> Value {
+        let grant = json!({"roomJoin":true,"room":room,"canPublish":true,"canPublishSources":["microphone"],
             "canSubscribe":true,"canPublishData":false,"canUpdateOwnMetadata":false});
         match self.token(id, name, &m.epoch, grant) {
-            Ok(token) => json!({"type":"voice","channelId":m.room,"token":token}),
+            Ok(token) => json!({"type":"voice","roomId":room,"token":token}),
             Err(_) => json!({"type":"error","message":"语音凭证签发失败"}),
         }
     }
@@ -109,26 +108,15 @@ impl Media {
         Ok(claims)
     }
 
-    async fn remove(&self, cleanup: &Cleanup) -> bool {
-        let (method, args, grants) = match cleanup {
-            Cleanup::Participant(room, id) => (
-                "RemoveParticipant",
-                json!({"room":room,"identity":id}),
-                json!({"roomAdmin":true,"room":room}),
-            ),
-            Cleanup::Room(room) => (
-                "DeleteRoom",
-                json!({"room":room}),
-                json!({"roomCreate":true,"room":room}),
-            ),
-            Cleanup::None => return true,
-        };
+    async fn remove(&self, room: &str, id: &str) -> bool {
+        let args = json!({"room":room,"identity":id});
+        let grants = json!({"roomAdmin":true,"room":room});
         let Ok(token) = self.token("lobby-service", "", "", grants) else {
             return false;
         };
         let Ok(url) = self
             .base
-            .join(&format!("/twirp/livekit.RoomService/{method}"))
+            .join("/twirp/livekit.RoomService/RemoveParticipant")
         else {
             return false;
         };
@@ -155,30 +143,27 @@ impl Media {
     }
 }
 
-pub(super) fn cleanup(state: &Shared, core: &mut Core, job: Cleanup) {
-    let pending = match &job {
-        Cleanup::None => return,
-        Cleanup::Participant(room, id) => {
-            let key = (room.clone(), id.clone());
-            let Entry::Vacant(removal) = core.pending.entry(key.clone()) else {
-                return;
-            };
-            removal.insert(watch::channel(()).0);
-            Some(key)
-        }
-        Cleanup::Room(_) => None,
-    };
-    let media = state.media.clone();
+pub(super) fn cleanup(state: &Shared, core: &mut Core, id: String) {
+    if *state.stop.borrow() || !core.pending.insert(id.clone()) {
+        return;
+    }
+    let room = core.room_id.clone();
     let weak = std::sync::Arc::downgrade(&state.core);
+    let media = state.media.clone();
     let mut stop = state.stop.clone();
     tokio::spawn(async move {
         let mut delay = Duration::from_millis(200);
         while weak.strong_count() > 0 && !*stop.borrow() {
-            if media.remove(&job).await {
-                if let (Some(key), Some(core)) = (pending.as_ref(), weak.upgrade()) {
-                    core.lock().await.pending.remove(key);
+            if media.remove(&room, &id).await {
+                if let Some(core) = weak.upgrade() {
+                    let state = Shared { core, media, stop };
+                    let mut core = state.core.lock().await;
+                    core.pending.remove(&id);
+                    if !*state.stop.borrow() {
+                        state.refresh_voice(&mut core);
+                    }
                 }
-                break;
+                return;
             }
             tokio::select! { _ = sleep(delay) => (), _ = stop.changed() => break }
             delay = (delay * 2).min(Duration::from_secs(5));
@@ -203,7 +188,7 @@ impl Claims {
     fn current<'a>(&self, core: &'a Core) -> Result<&'a super::Member, StatusCode> {
         let m = core.members.get(&self.sub).ok_or(StatusCode::FORBIDDEN)?;
         let grant = m.membership.as_ref().ok_or(StatusCode::FORBIDDEN)?;
-        if grant.room != self.video.room || grant.epoch != self.metadata {
+        if core.room_id != self.video.room || grant.epoch != self.metadata {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(m)
@@ -248,6 +233,9 @@ pub(super) async fn gateway(
     let token = token.ok_or(StatusCode::UNAUTHORIZED)?;
     let claims = state.media.claims(&token)?;
     let core = state.core.lock().await;
+    if *state.stop.borrow() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let member = claims.current(&core)?;
     if validate {
         drop(core);

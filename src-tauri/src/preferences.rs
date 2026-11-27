@@ -7,7 +7,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+const ROOM_HISTORY_LIMIT: usize = 50;
 
 pub fn random_key() -> [u8; 32] {
     let mut key = [0; 32];
@@ -38,6 +41,15 @@ impl Default for Preferences {
             peers: HashMap::new(),
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentRoom {
+    host_id: String,
+    nickname: String,
+    invite: String,
+    last_joined_at: u64,
 }
 
 pub struct Profile {
@@ -79,8 +91,31 @@ impl Profile {
         })
     }
 
-    pub fn channel_database(&self) -> PathBuf {
-        self.directory.join("channels.sqlite3")
+    pub fn room_history(&self) -> Result<Vec<RecentRoom>, String> {
+        match fs::read(self.directory.join("room-history.json")) {
+            Ok(data) => serde_json::from_slice(&data).map_err(file_error),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(file_error(e)),
+        }
+    }
+
+    pub fn remember_room(&self, host_id: &str, nickname: &str, invite: &str) -> Result<(), String> {
+        let mut recent = self.room_history()?;
+        recent.retain(|room| room.host_id != host_id);
+        recent.insert(
+            0,
+            RecentRoom {
+                host_id: host_id.into(),
+                nickname: nickname.into(),
+                invite: invite.into(),
+                last_joined_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            },
+        );
+        recent.truncate(ROOM_HISTORY_LIMIT);
+        write_json(&self.directory.join("room-history.json"), &recent)
     }
 
     pub fn player_credential(&self, host: &str) -> String {
@@ -105,6 +140,28 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_history_replaces_an_old_invitation_and_keeps_the_latest_host_name() {
+        let storage = tempfile::tempdir().unwrap();
+        let profile = Profile::load(storage.path().into()).unwrap();
+        assert!(profile.room_history().unwrap().is_empty());
+        for (host, name, invite) in [
+            ("host-a", "小羽", "first-invite"),
+            ("host-b", "阿岚", "second-invite"),
+            ("host-a", "小羽的新昵称", "new-invite"),
+        ] {
+            profile.remember_room(host, name, invite).unwrap();
+        }
+
+        let reopened = Profile::load(storage.path().into()).unwrap();
+        let history = reopened.room_history().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].host_id, "host-a");
+        assert_eq!(history[0].nickname, "小羽的新昵称");
+        assert_eq!(history[0].invite, "new-invite");
+        assert_eq!(history[1].host_id, "host-b");
+    }
 
     #[test]
     fn first_launch_requires_nickname_and_older_settings_keep_their_name() {

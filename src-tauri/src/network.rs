@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use iroh::{
-    endpoint::{presets, Builder, Connection},
+    endpoint::{presets, Builder, Connection, SendDatagramError},
     Endpoint, EndpointAddr, SecretKey,
 };
 use std::{
@@ -16,8 +16,9 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::{timeout, Instant},
+    time::{timeout, timeout_at, Instant},
 };
 
 const ALPN: &[u8] = b"duipin/1";
@@ -25,6 +26,8 @@ const PREFIX: &str = "duipin://join/";
 const MAX_PACKET: usize = 65509;
 const MAX_FLOWS: usize = 64;
 const FLOW_IDLE: Duration = Duration::from_secs(90);
+const MAX_QUEUED_MEDIA_STREAMS: usize = 8;
+const MEDIA_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -57,7 +60,7 @@ fn endpoint_builder() -> Builder {
 }
 
 // ICE consent keeps an active UDP flow fresh. Remove the least recently active
-// source at capacity so many channel switches never exhaust a guest session.
+// source at capacity so media reconnections never exhaust a guest session.
 struct Flows<T>(HashMap<u16, (Instant, T)>);
 impl<T> Flows<T> {
     fn new() -> Self {
@@ -106,7 +109,7 @@ impl Ticket {
         let web_url;
         let invite = if invite.starts_with("https://") {
             web_url = url::Url::parse(invite).map_err(err)?;
-            web_url.fragment().ok_or("链接缺少大厅邀请")?
+            web_url.fragment().ok_or("链接缺少房间邀请")?
         } else {
             invite
         };
@@ -170,7 +173,7 @@ impl HostEndpoint {
         Self::encode_invite(self.ep.addr(), key)
     }
     // Only sharing an invitation needs internet relay discovery. A host can
-    // enter a local channel as soon as its endpoint and the voice server bind.
+    // accept local players as soon as its endpoint and the voice server bind.
     pub fn share_invite(
         &self,
         key: String,
@@ -224,6 +227,8 @@ impl Drop for HostEndpoint {
 }
 
 async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV4) -> Result<()> {
+    #[cfg(test)]
+    let peer = conn.remote_id();
     timeout(Duration::from_secs(8), async {
         let (mut tx, mut rx) = conn.accept_bi().await.map_err(err)?;
         let mut supplied = [0u8; 64];
@@ -246,6 +251,7 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
             });
         }
     });
+    let outgoing = Arc::new(OutgoingPackets::new(conn));
     let mut flows = Flows::<HostFlow>::new();
     let result = async {
         let mut expire = tokio::time::interval(FLOW_IDLE);
@@ -269,15 +275,17 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
                 );
                 socket.connect(media).await.map_err(err)?;
                 let receiving = socket.clone();
-                let channel = conn.clone();
+                let outgoing = outgoing.clone();
                 let receiver = tokio::spawn(async move {
                     let mut buf = vec![0; MAX_PACKET];
                     loop {
                         tokio::select! {
-                            _=channel.closed()=>break,
+                            _=outgoing.conn.closed()=>break,
                             received=receiving.recv(&mut buf)=>{
                                 let Ok(n)=received else{break};
-                                if send_packet(&channel,id,&buf[..n]).await.is_err(){break}
+                                #[cfg(test)]
+                                crate::scenario_tests::rtp_trace::packet("sfu-out", peer, id, &buf[..n]);
+                                if outgoing.send(id,&buf[..n]).is_err(){break}
                             }
                         }
                     }
@@ -291,6 +299,8 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
                 );
                 socket
             };
+            #[cfg(test)]
+            crate::scenario_tests::rtp_trace::packet("sfu-in", peer, id, &packet[2..]);
             socket.send(&packet[2..]).await.map_err(err)?;
         }
     }
@@ -305,20 +315,85 @@ async fn pipe(tcp: TcpStream, tx: iroh::endpoint::SendStream, rx: iroh::endpoint
     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut duplex).await;
 }
 
-async fn send_packet(conn: &Connection, id: u16, payload: &[u8]) -> Result<()> {
-    let mut frame = Vec::with_capacity(payload.len() + 2);
-    frame.extend_from_slice(&id.to_be_bytes());
-    frame.extend_from_slice(payload);
-    if conn
-        .max_datagram_size()
-        .is_some_and(|size| frame.len() <= size)
-    {
-        conn.send_datagram(Bytes::from(frame)).map_err(err)
-    } else {
-        // DTLS handshakes can exceed the negotiated QUIC datagram MTU.
-        let mut stream = conn.open_uni().await.map_err(err)?;
-        stream.write_all(&frame).await.map_err(err)?;
-        stream.finish().map_err(err)
+struct OutgoingPackets {
+    conn: Connection,
+    large: mpsc::Sender<(Instant, Bytes)>,
+    _stop: oneshot::Sender<()>,
+}
+
+impl OutgoingPackets {
+    fn new(conn: &Connection) -> Self {
+        let (large, queue) = mpsc::channel(MAX_QUEUED_MEDIA_STREAMS);
+        let (stop, stopped) = oneshot::channel();
+        tokio::spawn(Self::send_large(conn.clone(), queue, stopped));
+        Self {
+            conn: conn.clone(),
+            large,
+            _stop: stop,
+        }
+    }
+
+    fn send(&self, id: u16, payload: &[u8]) -> Result<()> {
+        let id = id.to_be_bytes();
+        let frame = || Bytes::from([id.as_slice(), payload].concat());
+        if self
+            .conn
+            .max_datagram_size()
+            .is_some_and(|size| id.len() + payload.len() <= size)
+        {
+            match self.conn.send_datagram(frame()) {
+                Ok(()) => return Ok(()),
+                Err(SendDatagramError::ConnectionLost(error)) => return Err(err(error)),
+                Err(_) => {}
+            }
+        }
+        if let Ok(slot) = self.large.try_reserve() {
+            slot.send((Instant::now() + MEDIA_STREAM_SEND_TIMEOUT, frame()));
+        }
+        Ok(())
+    }
+
+    async fn send_large(
+        conn: Connection,
+        mut queue: mpsc::Receiver<(Instant, Bytes)>,
+        mut stopped: oneshot::Receiver<()>,
+    ) {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = &mut stopped => return,
+                _ = conn.closed() => return,
+                packet = queue.recv() => packet,
+            };
+            let Some((deadline, frame)) = next else {
+                return;
+            };
+            if deadline <= Instant::now() {
+                continue;
+            }
+            let mut stream = tokio::select! {
+                biased;
+                _ = &mut stopped => return,
+                opened = timeout_at(deadline, conn.open_uni()) => match opened {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(_)) => return,
+                    Err(_) => continue,
+                },
+            };
+            let written = tokio::select! {
+                biased;
+                _ = &mut stopped => {
+                    let _ = stream.reset(1u8.into());
+                    return;
+                }
+                written = timeout_at(deadline, stream.write_chunk(frame)) => written,
+            };
+            if matches!(written, Ok(Ok(()))) {
+                let _ = stream.finish();
+            } else {
+                let _ = stream.reset(1u8.into());
+            }
+        }
     }
 }
 
@@ -372,19 +447,19 @@ impl GuestEndpoint {
             ep.connect(ticket.address.clone(), ALPN),
         )
         .await
-        .map_err(|_| "大厅暂时离线，或此网络无法连接中转".to_string())?
-        .map_err(|e| format!("无法建立到大厅的加密连接：{e}"))?;
+        .map_err(|_| "房间暂时离线，或此网络无法连接中转".to_string())?
+        .map_err(|e| format!("无法建立到房间的加密连接：{e}"))?;
         let (mut tx, mut rx) = conn
             .open_bi()
             .await
-            .map_err(|e| format!("无法打开大厅认证通道：{e}"))?;
+            .map_err(|e| format!("无法打开房间认证连接：{e}"))?;
         tx.write_all(ticket.key.as_bytes()).await.map_err(err)?;
         tx.finish().map_err(err)?;
         let mut ack = [0; 2];
         timeout(Duration::from_secs(6), rx.read_exact(&mut ack))
             .await
-            .map_err(|_| "大厅邀请认证响应超时".to_string())?
-            .map_err(|e| format!("大厅未接受邀请：{e}"))?;
+            .map_err(|_| "房间邀请认证响应超时".to_string())?
+            .map_err(|e| format!("房间未接受邀请：{e}"))?;
         if &ack != b"OK" {
             return Err("邀请被拒绝".into());
         }
@@ -408,7 +483,10 @@ impl GuestEndpoint {
             }
         });
         let media_conn = conn.clone();
+        #[cfg(test)]
+        let peer = ep.id();
         let media_task = tokio::spawn(async move {
+            let outgoing = OutgoingPackets::new(&media_conn);
             let mut senders = Flows::new();
             let mut buf = vec![0; MAX_PACKET];
             let mut packets = IncomingPackets::default();
@@ -426,12 +504,16 @@ impl GuestEndpoint {
                         };
                         if !matches!(source,SocketAddr::V4(v) if *v.ip()==ip || v.ip().is_loopback()) {continue}
                         senders.insert(source.port(),source);
-                        if send_packet(&media_conn,source.port(),&buf[..n]).await.is_err(){break}
+                        #[cfg(test)]
+                        crate::scenario_tests::rtp_trace::packet("guest-out", peer, source.port(), &buf[..n]);
+                        if outgoing.send(source.port(),&buf[..n]).is_err(){break}
                     }
                     received=packets.receive(&media_conn)=>{
                         let Ok(frame)=received else{break};
                         if frame.len()<3 {continue}
                         if let Some(addr)=senders.get(u16::from_be_bytes([frame[0],frame[1]])) {
+                            #[cfg(test)]
+                            crate::scenario_tests::rtp_trace::packet("guest-in", peer, addr.port(), &frame[2..]);
                             let _=udp.send_to(&frame[2..],addr).await;
                         }
                     }
@@ -452,6 +534,10 @@ impl GuestEndpoint {
             task.abort()
         }
         self.ep.close().await;
+    }
+
+    pub(crate) fn host_id(&self) -> iroh::EndpointId {
+        self.conn.remote_id()
     }
 
     #[cfg(test)]
@@ -485,18 +571,16 @@ impl Drop for GuestEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::endpoint::QuicTransportConfig;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn live_datagram_overtakes_partial_media_stream() {
-        let local_endpoint = || {
-            Endpoint::builder(presets::N0)
-                .relay_mode(iroh::RelayMode::Disabled)
-                .clear_address_lookup()
-                .alpns(vec![ALPN.to_vec()])
-                .bind()
-        };
-        let host = local_endpoint().await.unwrap();
-        let guest = local_endpoint().await.unwrap();
+    fn local_endpoint() -> Builder {
+        Endpoint::builder(presets::N0)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .clear_address_lookup()
+            .alpns(vec![ALPN.to_vec()])
+    }
+
+    async fn connect_local(host: &Endpoint, guest: &Endpoint) -> (Connection, Connection) {
         let port = host
             .bound_sockets()
             .iter()
@@ -512,7 +596,131 @@ mod tests {
         })
         .await
         .unwrap();
-        let (sender, receiver) = (sender.unwrap(), receiver.unwrap());
+        (sender.unwrap(), receiver.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_datagram_overtakes_media_waiting_for_send_stream_credit() {
+        let host = local_endpoint().bind().await.unwrap();
+        let guest = local_endpoint()
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_uni_streams(0u8.into())
+                    .build(),
+            )
+            .bind()
+            .await
+            .unwrap();
+        let (guest_conn, host_conn) = connect_local(&host, &guest).await;
+        assert!(futures_util::poll!(Box::pin(host_conn.open_uni())).is_pending());
+        let large = vec![7; 16_000];
+        assert!(large.len() > host_conn.max_datagram_size().unwrap());
+
+        let media = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(media_addr) = media.local_addr().unwrap() else {
+            unreachable!();
+        };
+        let key = "a".repeat(64);
+        let host_task =
+            tokio::spawn(async move { run_host(&host_conn, &key, 0, media_addr).await });
+        let (mut auth, mut ack) = guest_conn.open_bi().await.unwrap();
+        auth.write_all(&[b'a'; 64]).await.unwrap();
+        auth.finish().unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), ack.read_to_end(2))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"OK"
+        );
+
+        guest_conn
+            .send_datagram(Bytes::from_static(b"\x12\x34probe"))
+            .unwrap();
+        let mut probe = [0; 16];
+        let (size, bridge_addr) = timeout(Duration::from_secs(5), media.recv_from(&mut probe))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&probe[..size], b"probe");
+        media.send_to(&large, bridge_addr).await.unwrap();
+        media.send_to(b"live audio", bridge_addr).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), guest_conn.read_datagram())
+                .await
+                .expect("live audio stalled waiting for stream credit")
+                .unwrap(),
+            Bytes::from_static(b"\x12\x34live audio")
+        );
+
+        guest_conn.set_max_concurrent_uni_streams(1u8.into());
+        let frame = timeout(Duration::from_secs(2), async {
+            guest_conn
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_to_end(MAX_PACKET + 2)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("large packet was not sent after stream credit became available");
+        assert_eq!(&frame[..2], b"\x12\x34");
+        assert_eq!(&frame[2..], &large);
+        guest_conn.close(0u8.into(), b"done");
+        timeout(Duration::from_secs(2), host_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incomplete_media_stream_is_reset_after_send_timeout() {
+        let host = local_endpoint().bind().await.unwrap();
+        let guest = local_endpoint()
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .stream_receive_window(64u8.into())
+                    .build(),
+            )
+            .bind()
+            .await
+            .unwrap();
+        let (guest_conn, host_conn) = connect_local(&host, &guest).await;
+        let outgoing = OutgoingPackets::new(&host_conn);
+        let payload = vec![7; 16_000];
+        outgoing.send(0x1234, &payload).unwrap();
+
+        let mut stream = timeout(Duration::from_secs(2), guest_conn.accept_uni())
+            .await
+            .expect("oversized media did not start writing")
+            .unwrap();
+        let reset = timeout(Duration::from_secs(5), stream.received_reset())
+            .await
+            .expect("oversized media stream remained open after the send deadline")
+            .unwrap();
+        assert!(
+            reset.is_some(),
+            "partial media was finished without a reset"
+        );
+
+        outgoing.send(0x1234, b"live audio").unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), guest_conn.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\x12\x34live audio")
+        );
+        guest_conn.close(0u8.into(), b"done");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_datagram_overtakes_partial_media_stream() {
+        let host = local_endpoint().bind().await.unwrap();
+        let guest = local_endpoint().bind().await.unwrap();
+        let (sender, receiver) = connect_local(&host, &guest).await;
         let initial_stream_frames = receiver.stats().frame_rx.stream;
         let mut slow = sender.open_uni().await.unwrap();
         let payload = vec![7; 1600];
@@ -555,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn dormant_media_flows_expire_and_new_channels_replace_old_ports() {
+    fn dormant_media_flows_expire_and_new_connections_replace_old_ports() {
         let mut flows = Flows::new();
         for id in 0..MAX_FLOWS as u16 {
             flows.insert(id, id);
