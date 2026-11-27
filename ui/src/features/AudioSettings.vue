@@ -2,11 +2,11 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { Mic, Volume2, AudioWaveform } from 'lucide-vue-next'
-import { modes, type AudioSettings, type Devices } from '../model'
-import type { AudioControls } from './useAudioControls'
+import { modes, type Devices } from '../model'
+import { audioGainLimits, type AudioControls } from './useAudioControls'
 
-const props = defineProps<{ audio: AudioSettings; controls: AudioControls; level: number; speaking: boolean; connected: boolean; visible: boolean }>()
-const draft = computed(() => ({ ...props.audio, ...props.controls.changes }))
+const props = defineProps<{ controls: AudioControls; level: number; speaking: boolean; connected: boolean; visible: boolean }>()
+const draft = computed(() => props.controls.effective)
 const shortcutEdit = ref<string | null>(null)
 const devices = ref<Devices>({ inputs: [], outputs: [] })
 const error = ref('')
@@ -15,11 +15,14 @@ const monitorError = ref('')
 const modeKeys = Object.keys(modes) as (keyof typeof modes)[]
 const meter = computed(() => Math.max(0, Math.min(100, props.level)))
 const meterStatus = computed(() => {
-  if (draft.value.inputDevice !== props.audio.inputDevice || draft.value.inputGain !== props.audio.inputGain ||
-      draft.value.mode !== props.audio.mode || draft.value.threshold !== props.audio.threshold) return '正在应用输入设置'
+  const current = props.controls.current
+  const audio = draft.value
+  if (!current || !audio) return ''
+  if (audio.inputDevice !== current.inputDevice || audio.inputGain !== current.inputGain ||
+      audio.mode !== current.mode || audio.threshold !== current.threshold) return '正在应用输入设置'
   if (monitorError.value) return '麦克风不可用'
   if (!monitoring.value) return '正在打开麦克风'
-  if (draft.value.mode === 'activation') return meter.value >= draft.value.threshold ? '达到阈值' : '低于阈值'
+  if (audio.mode === 'activation') return meter.value >= audio.threshold ? '达到阈值' : '低于阈值'
   if (props.connected && props.speaking) return '正在发言'
   return '试音中'
 })
@@ -34,7 +37,7 @@ async function startMonitor() {
     if (request === monitorRequest) monitoring.value = true
   } catch (reason) { if (request === monitorRequest) monitorError.value = String(reason) }
 }
-watch(() => props.audio.inputDevice, () => {
+watch(() => props.controls.current?.inputDevice, () => {
   if (props.visible && monitorError.value) void startMonitor()
 })
 watch(() => props.visible, (visible, _, onCleanup) => {
@@ -65,19 +68,19 @@ onBeforeUnmount(() => { void flush() })
 </script>
 
 <template>
-    <div>
+    <div v-if="draft">
       <p v-if="controls.error || error" class="form-error" role="alert">{{ controls.error || error }}</p>
       <section class="settings-section">
         <h3><Mic /> 麦克风</h3>
         <label class="field">输入设备
           <select :value="draft.inputDevice" @change="controls.change('inputDevice', ($event.target as HTMLSelectElement).value)">
             <option value="">系统默认设备</option>
-            <option v-if="draft.inputDevice && !devices.inputs.some(d => d.id === draft.inputDevice)" :value="draft.inputDevice">{{ draft.inputDevice }}</option>
+            <option v-if="draft.inputDevice && !devices.inputs.some(d => d.id === draft?.inputDevice)" :value="draft.inputDevice">{{ draft.inputDevice }}</option>
             <option v-for="d in devices.inputs.filter(d => d.id)" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
         </label>
         <label class="range-label" for="audio-input-gain"><span>输入音量</span><output>{{ draft.inputGain }}%</output>
-          <input id="audio-input-gain" :value="draft.inputGain" type="range" min="0" max="200" @input="controls.change('inputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
+          <input id="audio-input-gain" :value="draft.inputGain" type="range" min="0" :max="audioGainLimits.inputGain" @input="controls.change('inputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
         </label>
         <span class="field-name">发言方式</span>
         <div class="segmented" role="group" aria-label="发言方式">
@@ -102,12 +105,12 @@ onBeforeUnmount(() => { void flush() })
         <label class="field">输出设备
           <select :value="draft.outputDevice" @change="controls.change('outputDevice', ($event.target as HTMLSelectElement).value)">
             <option value="">系统默认设备</option>
-            <option v-if="draft.outputDevice && !devices.outputs.some(d => d.id === draft.outputDevice)" :value="draft.outputDevice">{{ draft.outputDevice }}</option>
+            <option v-if="draft.outputDevice && !devices.outputs.some(d => d.id === draft?.outputDevice)" :value="draft.outputDevice">{{ draft.outputDevice }}</option>
             <option v-for="d in devices.outputs.filter(d => d.id)" :key="d.id" :value="d.id">{{ d.name }}</option>
           </select>
         </label>
         <label class="range-label" for="audio-output-gain"><span>播放音量</span><output>{{ draft.outputGain }}%</output>
-          <input id="audio-output-gain" :value="draft.outputGain" type="range" min="0" max="150" @input="controls.change('outputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
+          <input id="audio-output-gain" :value="draft.outputGain" type="range" min="0" :max="audioGainLimits.outputGain" @input="controls.change('outputGain', ($event.target as HTMLInputElement).valueAsNumber, true)" @change="controls.flush()" />
         </label>
         <label class="switch-row">麦克风降噪<input :checked="draft.noiseSuppression" type="checkbox" role="switch" @change="controls.change('noiseSuppression', ($event.target as HTMLInputElement).checked)" /></label>
         <label class="switch-row">回声消除<input :checked="draft.echoCancellation" type="checkbox" role="switch" @change="controls.change('echoCancellation', ($event.target as HTMLInputElement).checked)" /></label>

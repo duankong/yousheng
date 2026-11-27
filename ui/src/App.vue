@@ -11,10 +11,10 @@ import PlayerAvatar from './features/PlayerAvatar.vue'
 import { useLobby } from './features/useLobby'
 import { useAudioControls } from './features/useAudioControls'
 import { useUpdater } from './features/useUpdater'
-import type { Preferences } from './model'
+import type { PeerSettings, ProfileUpdate } from './model'
 
-type Panel = 'join' | 'invite' | 'close' | 'audio' | 'updates' | 'profile' | 'connection' | ''
-const panelTitles: Record<Panel, string> = { join: '加入房间', invite: '邀请好友', close: '关闭房间？', audio: '软件设置', updates: '软件设置', profile: '个人资料', connection: '房间连接详情', '': '' }
+type Panel = 'join' | 'invite' | 'close' | 'audio' | 'updates' | 'diagnostics' | 'profile' | 'connection' | ''
+const panelTitles: Record<Panel, string> = { join: '加入房间', invite: '邀请好友', close: '关闭房间？', audio: '软件设置', updates: '软件设置', diagnostics: '软件设置', profile: '个人资料', connection: '房间连接详情', '': '' }
 const transportLabels = { direct: '直连', relay: '中继', local: '本机房主', unknown: '暂未确定' }
 type ConnectionDetails = { transport: keyof typeof transportLabels; rttMs: number | null }
 const historyDate = new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
@@ -34,12 +34,11 @@ const outbox = ref<ChatAttempt[]>([])
 let nextAttemptId = 0
 let shareRequest = 0
 const lastChatReceipt = ref<{ id: number; elapsedMs?: number; confirmed?: boolean }>()
-const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, retryVoice,
+const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, retryVoice, retryingVoice,
   history, historyLoading, historyError, refreshHistory } = useLobby(link => { pendingInvite.value = link })
 const installBlocked = computed(() => busy.value || active.value)
 const updater = useUpdater(preferences, ready, installBlocked, () => session.value?.id ?? null)
 const audioControls = useAudioControls(preferences)
-const currentAudio = computed(() => preferences.value && { ...preferences.value.audio, ...audioControls.changes })
 watch(() => audioControls.error, (message, previous) => {
   if (message && panel.value !== 'audio') error.value = message
   else if (!message && error.value === previous) error.value = ''
@@ -103,13 +102,19 @@ watch([pendingInvite, ready, busy, editingProfile, () => updater.installing], as
   askJoin(link)
   if (!active.value) await enter()
 })
-function profileSaved(updated: Preferences) {
+function profileSaved(updated: ProfileUpdate) {
+  if (!preferences.value) return
   const onboarding = firstRun.value
-  preferences.value = updated
+  preferences.value.nickname = updated.nickname
+  preferences.value.avatar = updated.avatar
   closePanel()
   if (updated.profileSyncError) error.value = updated.profileSyncError
   else if (onboarding) void connect()
   else inform('个人资料已保存')
+}
+async function savePeer(id: string, settings: PeerSettings) {
+  try { await audioControls.savePeer(id, settings) }
+  catch (reason) { error.value = String(reason) }
 }
 async function enter() {
   const link = invite.value.trim()
@@ -241,13 +246,13 @@ watch(offline, message => {
       </div>
 
       <div v-if="active && snapshot && session" :key="session.id" class="workspace">
-        <Chat v-model="draft" :snapshot="snapshot" :host="session.isHost" :audio="currentAudio" :controls="audioControls"
+        <Chat v-model="draft" :snapshot="snapshot" :host="session.isHost" :controls="audioControls"
           :voice-label="voiceLabel" :voice-message="voice.message" :in-voice="inVoice" :outbox="outbox" :busy="blocked"
-          :can-retry-voice="['device-error', 'error', 'failed', 'disconnected'].includes(voice.state)"
+          :can-retry-voice="['device-error', 'error', 'failed', 'disconnected'].includes(voice.state)" :retrying-voice="retryingVoice"
           @send="sendChat" @restore="restoreAttempt" @dismiss="removeAttempt" @retry="retryVoice"
           @edit-profile="openPanel('profile')" @leave="leaveRoom" @connection="openPanel('connection')" />
-        <Members :snapshot="snapshot" :speakers="speakers" :peers="preferences?.peers ?? {}" :busy="blocked"
-          @invite="openShare" @edit-profile="openPanel('profile')" @saved="(id, settings) => { if (preferences) preferences.peers[id] = settings }" @error="error = $event" />
+        <Members :snapshot="snapshot" :speakers="speakers" :peers="preferences?.peers ?? {}" :controls="audioControls" :busy="blocked"
+          @invite="openShare" @edit-profile="openPanel('profile')" @save="savePeer" />
       </div>
       <div v-else class="home-view">
         <div class="room-actions">
@@ -283,7 +288,7 @@ watch(offline, message => {
     </main>
 
     <ProfileEditor v-if="editingProfile && preferences" :preferences="preferences" :first-run="firstRun" @close="closePanel" @saved="profileSaved" />
-    <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates') && preferences" :tab="panel" :audio="preferences.audio" :level="level"
+    <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates' || panel === 'diagnostics') && preferences" :tab="panel" :level="level"
       :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice" :updater="updater" :controls="audioControls" @tab="panel = $event" @close="closePanel" />
     <Dialog v-else-if="panel" :key="panel" :title="panelTitles[panel]" :dismissible="!busy" @close="closePanel">
       <div v-if="panel === 'connection'">

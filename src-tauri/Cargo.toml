@@ -1,6 +1,6 @@
 [package]
 name = "duipin"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "友声 GroveCall · Windows 游戏组队语音与房间聊天"
 

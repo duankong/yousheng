@@ -2,12 +2,12 @@
 import { computed, ref } from 'vue'
 import { Camera } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
-import type { Preferences } from '../model'
+import type { Preferences, ProfileUpdate } from '../model'
 import Dialog from './Dialog.vue'
 import PlayerAvatar from './PlayerAvatar.vue'
 
 const props = defineProps<{ preferences: Preferences; firstRun?: boolean }>()
-const emit = defineEmits<{ saved: [preferences: Preferences]; close: [] }>()
+const emit = defineEmits<{ saved: [profile: ProfileUpdate]; close: [] }>()
 const nickname = ref(props.preferences.nickname)
 const avatar = ref(props.preferences.avatar ?? '')
 const picker = ref<HTMLInputElement>()
@@ -75,8 +75,8 @@ async function save() {
   saving.value = true
   error.value = ''
   try {
-    const preferences = await invoke<Preferences>('set_profile', { nickname: nickname.value.trim(), avatar: avatar.value })
-    emit('saved', preferences)
+    const profile = await invoke<ProfileUpdate>('set_profile', { nickname: nickname.value.trim(), avatar: avatar.value })
+    emit('saved', profile)
   } catch (reason) { error.value = String(reason) }
   finally { saving.value = false }
 }

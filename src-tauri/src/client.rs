@@ -1,7 +1,17 @@
-use crate::{lobby::ROOM_PROTOCOL, voice::VoiceEngine};
+use crate::{
+    chat::{ChatMessage, HISTORY_LIMIT},
+    lobby::ROOM_PROTOCOL,
+    voice::VoiceEngine,
+};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 use tauri::{AppHandle, Emitter};
 use tokio::{
     net::TcpStream,
@@ -79,6 +89,97 @@ impl ClientCommands {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireSnapshot<'a> {
+    room_id: &'a str,
+    room_name: &'a str,
+    owner_id: &'a str,
+    owner_nickname: &'a str,
+    self_id: &'a str,
+    #[serde(borrow)]
+    members: Vec<WireMember<'a>>,
+}
+
+#[derive(Deserialize)]
+struct WireMember<'a> {
+    id: &'a str,
+    name: &'a str,
+    #[serde(rename = "avatar", default, deserialize_with = "present_avatar")]
+    _avatar: Option<&'a str>,
+}
+
+fn present_avatar<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<&'de str>, D::Error> {
+    <&str>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct WireChat<'a> {
+    #[serde(borrow)]
+    messages: Vec<ChatMessage<&'a str>>,
+}
+
+fn decode_snapshot(
+    event: &mut Value,
+    room: Option<&str>,
+    previous: &mut Vec<Value>,
+) -> Result<(), String> {
+    if event["type"] != "snapshot" {
+        return Err(event["message"].as_str().unwrap_or("加入房间失败").into());
+    }
+    if event["roomProtocol"].as_u64() != Some(ROOM_PROTOCOL) {
+        return Err("房间版本不兼容，请和房主更新到相同版本后再试".into());
+    }
+
+    const MAX_JS_DATE_MS: u64 = 8_640_000_000_000_000;
+    let snapshot = WireSnapshot::deserialize(&*event).map_err(|_| "房间状态无效")?;
+    let room_fields = [
+        snapshot.room_id,
+        snapshot.room_name,
+        snapshot.owner_id,
+        snapshot.owner_nickname,
+        snapshot.self_id,
+    ];
+    let mut member_ids = HashSet::with_capacity(snapshot.members.len());
+    if room_fields.iter().any(|field| field.is_empty())
+        || room.is_some_and(|expected| expected != snapshot.room_id)
+        || snapshot.members.iter().any(|member| {
+            member.id.is_empty() || member.name.is_empty() || !member_ids.insert(member.id)
+        })
+        || !member_ids.contains(snapshot.self_id)
+        || event["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| !member.is_object())
+    {
+        return Err("房间状态无效".into());
+    }
+    let chat = WireChat::deserialize(&*event).map_err(|_| "房间聊天记录同步失败")?;
+    if chat.messages.iter().any(|message| {
+        message.time > MAX_JS_DATE_MS
+            || [
+                message.id,
+                message.author_id,
+                message.author_name,
+                message.text,
+            ]
+            .iter()
+            .any(|field| field.is_empty())
+    }) || event["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| !message.is_object())
+        || !complete_chat(event, previous)
+    {
+        return Err("房间聊天记录同步失败".into());
+    }
+    Ok(())
+}
+
 // The WebSocket orders snapshots. Expand negotiated deltas before a snapshot reaches the UI.
 fn complete_chat(snapshot: &mut Value, previous: &mut Vec<Value>) -> bool {
     let Some(fields) = snapshot.as_object_mut() else {
@@ -93,9 +194,10 @@ fn complete_chat(snapshot: &mut Value, previous: &mut Vec<Value>) -> bool {
             return false;
         }
         previous.append(messages);
-        previous.drain(..previous.len().saturating_sub(crate::chat::HISTORY_LIMIT));
+        previous.drain(..previous.len().saturating_sub(HISTORY_LIMIT));
         messages.clone_from(previous);
     } else {
+        messages.drain(..messages.len().saturating_sub(HISTORY_LIMIT));
         previous.clone_from(messages);
     }
     true
@@ -103,7 +205,8 @@ fn complete_chat(snapshot: &mut Value, previous: &mut Vec<Value>) -> bool {
 
 pub struct Client {
     pub(crate) commands: ClientCommands,
-    tasks: Vec<JoinHandle<()>>,
+    socket: JoinHandle<()>,
+    audio: JoinHandle<()>,
 }
 
 pub(crate) struct AcceptedRoom {
@@ -136,23 +239,8 @@ impl AcceptedRoom {
             .map_err(|e| e.to_string())?;
         let mut initial: Value = serde_json::from_str(first.to_text().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-        if initial["type"] != "snapshot" {
-            return Err(initial["message"].as_str().unwrap_or("加入房间失败").into());
-        }
-        if initial["roomProtocol"].as_u64() != Some(ROOM_PROTOCOL) {
-            return Err("房间版本不兼容，请和房主更新到相同版本后再试".into());
-        }
-        if !["roomId", "roomName", "ownerId", "ownerNickname", "selfId"]
-            .iter()
-            .all(|key| initial[*key].as_str().is_some_and(|s| !s.is_empty()))
-            || !initial["members"].is_array()
-        {
-            return Err("房间状态无效".into());
-        }
         let mut messages = Vec::new();
-        if !complete_chat(&mut initial, &mut messages) {
-            return Err("房间聊天记录同步失败".into());
-        }
+        decode_snapshot(&mut initial, None, &mut messages)?;
         Ok(Self {
             ws,
             base,
@@ -170,6 +258,7 @@ impl AcceptedRoom {
         app: AppHandle,
         voice: Arc<VoiceEngine>,
         session_id: String,
+        diagnostics: crate::diagnostics::Diagnostics,
         disconnected: impl FnOnce(String) + Send + 'static,
     ) -> Client {
         let Self {
@@ -178,7 +267,7 @@ impl AcceptedRoom {
             initial,
             mut messages,
         } = self;
-        let room = initial["roomId"].clone();
+        let room = initial["roomId"].as_str().unwrap().to_owned();
         emit_room(&app, &session_id, initial);
         let (commands, mut outgoing) = mpsc::channel::<Command>(64);
         let (target, mut wanted) = watch::channel::<Option<String>>(None);
@@ -191,7 +280,7 @@ impl AcceptedRoom {
                     tokio::select! {
                         biased;
                         update=wanted.changed()=>{changed=update; continue;},
-                        ()=voice.connect(&base,&token)=>{},
+                          ()=voice.connect(&base,&token,&diagnostics)=>{},
                     }
                 }
                 changed = wanted.changed().await;
@@ -225,7 +314,10 @@ impl AcceptedRoom {
                                     let _=reply.send(result);
                                 },
                                 Some("snapshot")=>{
-                                    if event["roomId"] != room || !complete_chat(&mut event, &mut messages) { break; }
+                                    if let Err(message) = decode_snapshot(&mut event, Some(&room), &mut messages) {
+                                        closure = message;
+                                        break;
+                                    }
                                     emit_room(&app, &session_id, event);
                                 }
                                 Some("voice")=>if event["roomId"] == room {
@@ -251,7 +343,8 @@ impl AcceptedRoom {
         });
         Client {
             commands: ClientCommands(commands),
-            tasks: vec![socket, audio],
+            socket,
+            audio,
         }
     }
 }
@@ -262,10 +355,10 @@ impl Client {
     }
 
     pub async fn close(self) {
-        for task in self.tasks {
-            task.abort();
-            let _ = task.await;
-        }
+        self.socket.abort();
+        let _ = self.socket.await;
+        // Dropping the socket's voice sender lets the audio task finish old-room cleanup.
+        let _ = self.audio.await;
     }
 }
 
@@ -287,10 +380,41 @@ pub(crate) mod tests {
         (
             Client {
                 commands: ClientCommands(commands),
-                tasks: vec![],
+                socket: tokio::spawn(async {}),
+                audio: tokio::spawn(async {}),
             },
             CommandPeer(peer),
         )
+    }
+
+    #[tokio::test]
+    async fn closing_room_waits_for_voice_cleanup_already_in_progress() {
+        let (commands, _peer) = mpsc::channel(1);
+        let (target, mut wanted) = watch::channel(());
+        let (started, cleaning) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        let (done, cleaned) = oneshot::channel();
+        let socket = tokio::spawn(async move { drop(target) });
+        let audio = tokio::spawn(async move {
+            assert!(wanted.changed().await.is_err());
+            started.send(()).unwrap();
+            wait.await.unwrap();
+            done.send(()).unwrap();
+        });
+        let client = Client {
+            commands: ClientCommands(commands),
+            socket,
+            audio,
+        };
+
+        cleaning.await.unwrap();
+        let mut close = Box::pin(client.close());
+        assert!(futures_util::poll!(&mut close).is_pending());
+        let _ = resume.send(());
+        close.await;
+        cleaned
+            .await
+            .expect("voice cleanup must finish before a new room can start");
     }
 
     #[tokio::test]
@@ -328,22 +452,187 @@ pub(crate) mod tests {
     #[test]
     fn chat_deltas_preserve_order_roll_over_and_accept_full_resync() {
         let mut previous = Vec::new();
-        let rows: Vec<_> = (0..100).map(|n| json!({"id":n.to_string()})).collect();
-        let mut full = json!({"messages":rows});
-        assert!(complete_chat(&mut full, &mut previous));
-        let mut delta = json!({"messagesAfter":"99","messages":[{"id":"100"},{"id":"101"}]});
-        assert!(complete_chat(&mut delta, &mut previous));
+        let mut full = wire_snapshot();
+        full["messages"] = Value::Array((0..102).map(|n| wire_message(&n.to_string())).collect());
+        decode_snapshot(&mut full, None, &mut previous).unwrap();
+        assert_eq!(full["messages"].as_array().unwrap().len(), 100);
+        assert_eq!(full["messages"][0]["id"], "2");
+
+        let mut delta = wire_snapshot();
+        delta["messagesAfter"] = json!("101");
+        delta["messages"] = json!([wire_message("102"), wire_message("103")]);
+        decode_snapshot(&mut delta, Some("room"), &mut previous).unwrap();
         let messages = delta["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 100);
-        assert_eq!(messages.first().unwrap()["id"], "2");
-        assert_eq!(messages.last().unwrap()["id"], "101");
-        let mut unchanged = json!({"messagesAfter":"101","messages":[]});
-        assert!(complete_chat(&mut unchanged, &mut previous));
+        assert_eq!(messages.first().unwrap()["id"], "4");
+        assert_eq!(messages.last().unwrap()["id"], "103");
+        assert!(delta.get("messagesAfter").is_none());
+
+        let mut unchanged = wire_snapshot();
+        unchanged["messagesAfter"] = json!("103");
+        unchanged["messages"] = json!([]);
+        decode_snapshot(&mut unchanged, Some("room"), &mut previous).unwrap();
         assert_eq!(unchanged, delta);
-        let mut stale = json!({"messagesAfter":"99","messages":[]});
-        assert!(!complete_chat(&mut stale, &mut previous));
-        let mut resync = json!({"messages":[{"id":"room-b"}]});
-        assert!(complete_chat(&mut resync, &mut previous));
-        assert_eq!(previous, [json!({"id":"room-b"})]);
+
+        let mut stale = wire_snapshot();
+        stale["messagesAfter"] = json!("101");
+        assert!(decode_snapshot(&mut stale, Some("room"), &mut previous).is_err());
+        assert_eq!(previous.last().unwrap()["id"], "103");
+
+        let mut resync = wire_snapshot();
+        decode_snapshot(&mut resync, Some("room"), &mut previous).unwrap();
+        assert_eq!(previous, [wire_message("message")]);
+    }
+
+    fn wire_message(id: &str) -> Value {
+        json!({"id":id,"authorId":"host","authorName":"Host","text":"hello","time":42})
+    }
+
+    fn wire_snapshot() -> Value {
+        json!({
+            "type": "snapshot", "roomProtocol": 2,
+            "roomId": "room", "roomName": "Host's room", "ownerId": "host",
+            "ownerNickname": "Host", "selfId": "guest",
+            "members": [
+                {"id": "host", "name": "Host", "avatar": "picture"},
+                {"id": "guest", "name": "Guest", "avatar": ""},
+            ],
+            "messages": [wire_message("message")],
+        })
+    }
+
+    async fn connect_to_snapshot(event: Value) -> Result<AcceptedRoom, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let host = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        });
+        let result = AcceptedRoom::connect(port, json!({"type":"hello"})).await;
+        host.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_rejects_malformed_members_and_chat() {
+        let mut invalid_member = wire_snapshot();
+        invalid_member["members"][0]["avatar"] = json!(null);
+        let mut invalid_chat = wire_snapshot();
+        invalid_chat["messages"][0]["time"] = json!(8_640_000_000_000_001_u64);
+
+        for event in [invalid_member, invalid_chat] {
+            assert!(
+                connect_to_snapshot(event.clone()).await.is_err(),
+                "accepted malformed initial snapshot: {event}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_preserves_join_and_protocol_errors() {
+        let result = connect_to_snapshot(json!({"type":"error","message":"invite rejected"})).await;
+        assert_eq!(result.err().unwrap(), "invite rejected");
+
+        let mut wrong_protocol = wire_snapshot();
+        wrong_protocol["roomProtocol"] = json!(1);
+        let result = connect_to_snapshot(wrong_protocol).await;
+        assert_eq!(
+            result.err().unwrap(),
+            "房间版本不兼容，请和房主更新到相同版本后再试"
+        );
+    }
+
+    #[test]
+    fn snapshot_updates_reject_invalid_metadata_and_nested_values() {
+        let mut previous = Vec::new();
+        decode_snapshot(&mut wire_snapshot(), None, &mut previous).unwrap();
+        let mut invalid_member = wire_snapshot();
+        invalid_member["members"][0] = json!(["host", "Host", "picture"]);
+        let mut invalid_message = wire_snapshot();
+        invalid_message["messages"][0] = json!(["message", "host", "Host", "hello", 42]);
+        let mut wrong_protocol = wire_snapshot();
+        wrong_protocol["roomProtocol"] = json!(1);
+        let mut wrong_room = wire_snapshot();
+        wrong_room["roomId"] = json!("other");
+        let mut missing_owner = wire_snapshot();
+        missing_owner.as_object_mut().unwrap().remove("ownerId");
+        let mut missing_self = wire_snapshot();
+        missing_self["members"].as_array_mut().unwrap().pop();
+        let mut duplicate_member = wire_snapshot();
+        duplicate_member["members"][0]["id"] = json!("guest");
+        let mut missing_author = wire_snapshot();
+        missing_author["messages"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorId");
+        let mut null_cursor = wire_snapshot();
+        null_cursor["messagesAfter"] = Value::Null;
+        for mut event in [
+            invalid_member,
+            invalid_message,
+            wrong_protocol,
+            wrong_room,
+            missing_owner,
+            missing_self,
+            duplicate_member,
+            missing_author,
+            null_cursor,
+        ] {
+            assert!(
+                decode_snapshot(&mut event, Some("room"), &mut previous).is_err(),
+                "accepted malformed update: {event}"
+            );
+            assert_eq!(previous, [wire_message("message")]);
+        }
+    }
+
+    #[test]
+    fn snapshot_message_time_must_be_a_nonnegative_date_integer() {
+        for (time, accepted) in [
+            (json!(0), true),
+            (json!(8_640_000_000_000_000_u64), true),
+            (json!(8_640_000_000_000_001_u64), false),
+            (json!(-1), false),
+            (json!(0.5), false),
+            (json!("42"), false),
+        ] {
+            let mut event = wire_snapshot();
+            event["messages"][0]["time"] = time.clone();
+            assert_eq!(
+                decode_snapshot(&mut event, Some("room"), &mut Vec::new()).is_ok(),
+                accepted,
+                "unexpected result for {time}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_updates_preserve_avatar_omission_clear_and_member_departure() {
+        let mut previous = Vec::new();
+        let mut initial = wire_snapshot();
+        initial["members"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"leaving","name":"Leaving","avatar":"old picture"}));
+        decode_snapshot(&mut initial, None, &mut previous).unwrap();
+        assert_eq!(initial["members"][0]["avatar"], "picture");
+
+        let mut update = wire_snapshot();
+        update["members"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("avatar");
+        update["messagesAfter"] = json!("message");
+        update["messages"] = json!([]);
+        decode_snapshot(&mut update, Some("room"), &mut previous).unwrap();
+        assert_eq!(
+            update["members"],
+            json!([{"id":"host","name":"Host"},{"id":"guest","name":"Guest","avatar":""}])
+        );
+        assert_eq!(update["messages"], json!([wire_message("message")]));
     }
 }

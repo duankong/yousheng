@@ -1,4 +1,5 @@
 use crate::{
+    diagnostics::Diagnostics,
     lobby, network,
     preferences::{random_key, Profile},
 };
@@ -33,21 +34,12 @@ fn unused_tcp_port() -> Result<u16, String> {
         .map_err(|e| e.to_string())
 }
 
-pub fn local_ip() -> Ipv4Addr {
-    let route = || {
-        let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-        // UDP connect asks Windows for its chosen interface without sending a packet.
-        sock.connect("192.0.2.1:9").ok()?;
-        match sock.local_addr().ok()?.ip() {
-            std::net::IpAddr::V4(ip) => Some(ip),
-            _ => None,
-        }
-    };
-    route().unwrap_or(Ipv4Addr::LOCALHOST)
-}
-
 impl Host {
-    pub async fn start(profile: &Profile, executable: &Path) -> Result<Self, String> {
+    pub async fn start(
+        profile: &Profile,
+        executable: &Path,
+        diagnostics: Diagnostics,
+    ) -> Result<Self, String> {
         if !executable.is_file() {
             return Err("安装包缺少 LiveKit Server，请重新安装或先运行 prepare-livekit.ps1".into());
         }
@@ -56,7 +48,7 @@ impl Host {
             .map_err(|e| e.to_string())?;
         let gateway = listener.local_addr().map_err(|e| e.to_string())?.port();
         let signaling = unused_tcp_port()?;
-        let media_ip = local_ip();
+        let media_ip = network::local_ip();
         let media_port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .and_then(|s| s.local_addr())
             .map_err(|e| e.to_string())?
@@ -112,6 +104,7 @@ impl Host {
             profile.invite_key.clone(),
             gateway,
             SocketAddrV4::new(media_ip, media_port),
+            diagnostics,
         )
         .await?;
         let credential = profile.player_credential(&overlay.id());

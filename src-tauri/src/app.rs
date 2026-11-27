@@ -1,5 +1,6 @@
 use crate::{
     client::{emit_room, AcceptedRoom, Client, ClientCommands},
+    diagnostics::{Diagnostics, Role, RoomDiagnostics, RoomPhase},
     host::Host,
     network::{GuestEndpoint, Ticket},
     player_profile,
@@ -25,46 +26,59 @@ struct Session {
     client: Client,
     host: Option<Host>,
     guest: Option<GuestEndpoint>,
+    diagnostics: RoomDiagnostics,
 }
+
+impl Session {
+    async fn close(self) {
+        self.client.close().await;
+        if let Some(host) = self.host {
+            host.close().await;
+        }
+        if let Some(guest) = self.guest {
+            guest.close().await;
+        }
+        self.diagnostics.mark(RoomPhase::Closed);
+    }
+}
+
 struct Desktop {
     profile: AsyncMutex<Profile>,
     voice: Arc<VoiceEngine>,
+    diagnostics: Diagnostics,
     session: RwLock<Option<Session>>,
     available_update: AsyncMutex<Option<tauri_plugin_updater::Update>>,
     invite: Mutex<Option<String>>,
     closing: AtomicBool,
 }
 impl Desktop {
-    fn activate(&self, app: AppHandle, accepted: AcceptedRoom, session_id: &str) -> Client {
+    fn activate(
+        &self,
+        app: AppHandle,
+        accepted: AcceptedRoom,
+        session_id: &str,
+        diagnostics: &RoomDiagnostics,
+    ) -> Client {
         let notify = app.clone();
         let id = session_id.to_owned();
         accepted.activate(
             app,
             self.voice.clone(),
             session_id.to_owned(),
+            diagnostics.handle(),
             move |message| {
                 // The socket task has to finish before teardown can join it.
                 tokio::spawn(async move {
                     let state = notify.state::<Desktop>();
                     let mut slot = state.session.write().await;
                     if let Some(session) = slot.take_if(|session| session.id == id) {
-                        state.teardown(session).await;
+                        session.diagnostics.mark(RoomPhase::Disconnected);
+                        session.close().await;
                         emit_room(&notify, &id, json!({"type":"offline","message":message}));
                     }
                 });
             },
         )
-    }
-
-    async fn teardown(&self, session: Session) {
-        session.client.close().await;
-        self.voice.disconnect().await;
-        if let Some(host) = session.host {
-            host.close().await;
-        }
-        if let Some(guest) = session.guest {
-            guest.close().await;
-        }
     }
 }
 
@@ -100,6 +114,23 @@ async fn lobby_connection_details(state: State<'_, Desktop>) -> Result<Connectio
     Ok(ConnectionDetails { transport, rtt_ms })
 }
 
+#[tauri::command]
+async fn export_call_diagnostics(
+    app: AppHandle,
+    state: State<'_, Desktop>,
+) -> Result<String, String> {
+    let directory = app
+        .path()
+        .download_dir()
+        .map_err(|_| "无法找到下载文件夹".to_owned())?;
+    let diagnostics = state.diagnostics.clone();
+    let path = tokio::task::spawn_blocking(move || diagnostics.export(&directory))
+        .await
+        .map_err(|_| "导出任务已中断".to_owned())?
+        .map_err(|error| format!("无法保存到下载文件夹（{error}）"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn executable(app: &AppHandle) -> Result<PathBuf, String> {
     let installed = app
         .path()
@@ -119,14 +150,27 @@ async fn host_lobby(
 ) -> Result<ConnectionInfo, String> {
     let mut slot = state.session.write().await;
     if let Some(session) = slot.take() {
-        state.teardown(session).await;
+        session.close().await;
     }
     let profile = state.profile.lock().await;
     let name = player_profile::nickname(&profile.settings.nickname)?;
-    let host = Host::start(&profile, &executable(&app)?).await?;
+    let executable = executable(&app)?;
+    let diagnostics = state.diagnostics.room(Role::Host);
+    let host = diagnostics
+        .measure(
+            RoomPhase::StartHost,
+            Host::start(&profile, &executable, diagnostics.handle()),
+        )
+        .await?;
     let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name,"avatar":profile.settings.avatar});
     drop(profile);
-    let accepted = match AcceptedRoom::connect(host.gateway, hello).await {
+    let accepted = match diagnostics
+        .measure(
+            RoomPhase::AcceptRoom,
+            AcceptedRoom::connect(host.gateway, hello),
+        )
+        .await
+    {
         Ok(accepted) => accepted,
         Err(e) => {
             host.close().await;
@@ -140,11 +184,13 @@ async fn host_lobby(
         snapshot: accepted.snapshot().clone(),
         history_error: None,
     };
+    diagnostics.mark(RoomPhase::Ready);
     *slot = Some(Session {
         id: session_id.clone(),
-        client: state.activate(app, accepted, &session_id),
+        client: state.activate(app, accepted, &session_id, &diagnostics),
         host: Some(host),
         guest: None,
+        diagnostics,
     });
     Ok(info)
 }
@@ -189,9 +235,21 @@ async fn join_lobby(
     let avatar = profile.settings.avatar.clone();
     drop(profile);
 
-    let guest = GuestEndpoint::start(&ticket).await?;
+    let diagnostics = state.diagnostics.room(Role::Guest);
+    let guest = diagnostics
+        .measure(
+            RoomPhase::ConnectTunnel,
+            GuestEndpoint::start(&ticket, diagnostics.handle()),
+        )
+        .await?;
     let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
-    let accepted = match AcceptedRoom::connect(guest.gateway, hello).await {
+    let accepted = match diagnostics
+        .measure(
+            RoomPhase::AcceptRoom,
+            AcceptedRoom::connect(guest.gateway, hello),
+        )
+        .await
+    {
         Ok(accepted) => accepted,
         Err(e) => {
             guest.close().await;
@@ -202,7 +260,7 @@ async fn join_lobby(
     // The target has admitted us. Retire the old socket and microphone before
     // publishing the new room or letting it open a media session.
     if let Some(session) = slot.take() {
-        state.teardown(session).await;
+        session.close().await;
     }
     let snapshot = accepted.snapshot().clone();
     let nickname = snapshot["ownerNickname"]
@@ -214,11 +272,13 @@ async fn join_lobby(
         .await
         .remember_room(&host_id, nickname, &invite)
         .err();
+    diagnostics.mark(RoomPhase::Ready);
     *slot = Some(Session {
         id: session_id.clone(),
-        client: state.activate(app, accepted, &session_id),
+        client: state.activate(app, accepted, &session_id, &diagnostics),
         host: None,
         guest: Some(guest),
+        diagnostics,
     });
     Ok(ConnectionInfo {
         id: session_id,
@@ -236,7 +296,7 @@ async fn leave_lobby(state: State<'_, Desktop>, session_id: String) -> Result<()
         return Err("房间已切换".into());
     }
     if let Some(session) = slot.take() {
-        state.teardown(session).await;
+        session.close().await;
     }
     Ok(())
 }
@@ -286,6 +346,7 @@ mod command_tests {
             client,
             host: None,
             guest: None,
+            diagnostics: Diagnostics::default().room(Role::Host),
         })));
         let send = |id: &'static str, text: &'static str| {
             let slot = slot.clone();
@@ -320,6 +381,7 @@ mod command_tests {
                 client: new_client,
                 host: None,
                 guest: None,
+                diagnostics: Diagnostics::default().room(Role::Guest),
             });
         }
         drop(old_peer);
@@ -359,8 +421,8 @@ async fn list_room_history(state: State<'_, Desktop>) -> Result<Vec<RecentRoom>,
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfileUpdate {
-    #[serde(flatten)]
-    preferences: Preferences,
+    nickname: String,
+    avatar: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_sync_error: Option<String>,
 }
@@ -371,17 +433,17 @@ async fn set_profile(
     nickname: String,
     avatar: String,
 ) -> Result<ProfileUpdate, String> {
-    let name = player_profile::nickname(&nickname)?;
+    let nickname = player_profile::nickname(&nickname)?.to_owned();
     player_profile::validate_avatar(&avatar)?;
     let commands = current_commands(&state.session, None);
     let mut profile = state.profile.lock().await;
     let mut preferences = profile.settings.clone();
-    preferences.nickname = name.into();
-    preferences.avatar = avatar;
-    profile.save(preferences.clone())?;
+    preferences.nickname = nickname.clone();
+    preferences.avatar = avatar.clone();
+    profile.save(preferences)?;
     let pending = commands.map(|available| {
         available.map(|client| {
-            client.send(json!({"type":"profile","nickname":name,"avatar":preferences.avatar}))
+            client.send(json!({"type":"profile","nickname":nickname,"avatar":avatar}))
         })
     });
     drop(profile);
@@ -394,7 +456,8 @@ async fn set_profile(
         format!("个人资料已保存在本机。当前房间同步失败，重新加入后将使用新资料。{error}")
     });
     Ok(ProfileUpdate {
-        preferences,
+        nickname,
+        avatar,
         profile_sync_error,
     })
 }
@@ -542,6 +605,7 @@ pub fn run() {
             app.manage(Desktop {
                 profile: AsyncMutex::new(profile),
                 voice: voice.clone(),
+                diagnostics: Diagnostics::default(),
                 session: RwLock::new(None),
                 available_update: AsyncMutex::new(None),
                 invite: Mutex::new(None),
@@ -583,6 +647,7 @@ pub fn run() {
             lobby_action,
             get_preferences,
             lobby_connection_details,
+            export_call_diagnostics,
             updates::set_auto_update,
             updates::check_update,
             updates::install_update,
@@ -603,7 +668,7 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<Desktop>();
                     if let Some(session) = state.session.write().await.take() {
-                        state.teardown(session).await;
+                        session.close().await;
                     }
                     handle.exit(0);
                 });

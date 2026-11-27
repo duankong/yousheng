@@ -61,17 +61,24 @@ async fn tunnel_exchange() -> Result<(), String> {
         key.clone(),
         tcp.local_addr().map_err(err)?.port(),
         SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp.local_addr().map_err(err)?.port()),
+        crate::diagnostics::Diagnostics::default(),
     )
     .await?;
     let verify = async {
         let invite = host.share_invite(key.clone()).await?;
         let mut bad = Ticket::parse(&invite)?;
         bad.key = "b".repeat(64);
-        if let Ok(unexpected) = GuestEndpoint::start(&bad).await {
+        if let Ok(unexpected) =
+            GuestEndpoint::start(&bad, crate::diagnostics::Diagnostics::default()).await
+        {
             unexpected.close().await;
             return Err("host accepted invalid invite key".to_string());
         }
-        let guest = GuestEndpoint::start(&Ticket::parse(&invite)?).await?;
+        let guest = GuestEndpoint::start(
+            &Ticket::parse(&invite)?,
+            crate::diagnostics::Diagnostics::default(),
+        )
+        .await?;
         let exchanges = async {
             let mut guest_tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, guest.gateway))
                 .await

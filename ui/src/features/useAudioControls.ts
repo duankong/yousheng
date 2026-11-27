@@ -1,12 +1,20 @@
 import { computed, reactive, ref, shallowRef, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import type { AudioSettings, Preferences } from '../model'
+import type { AudioSettings, PeerSettings, Preferences } from '../model'
+
+export const audioGainLimits = { inputGain: 200, outputGain: 150 } as const
+const defaultPeer: PeerSettings = { volume: 100, muted: false }
 
 export function useAudioControls(preferences: Ref<Preferences | undefined>) {
+  const current = computed(() => preferences.value?.audio)
   const pending = shallowRef<Partial<AudioSettings>>({})
   const applying = shallowRef<Partial<AudioSettings>>({})
-  const changes = computed(() => ({ ...applying.value, ...pending.value }))
+  const effective = computed(() => {
+    const audio = current.value
+    if (audio) return { ...audio, ...applying.value, ...pending.value }
+  })
   const error = ref('')
+  const peerChanges = reactive(new Map<string, PeerSettings>())
   let timer: ReturnType<typeof setTimeout> | undefined
   let writing: Promise<boolean> | undefined
 
@@ -45,8 +53,8 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
   }
 
   function change<K extends keyof AudioSettings>(key: K, value: AudioSettings[K], dragging = false) {
-    const current = { ...preferences.value?.audio, ...changes.value }
-    if (current[key] === value) return
+    const audio = effective.value
+    if (!audio || audio[key] === value) return
     pending.value = { ...pending.value, [key]: value }
     error.value = ''
     // A sustained drag previews periodically. Pointer release and navigation flush immediately.
@@ -54,7 +62,24 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
     else if (!timer) timer = setTimeout(flush, 120)
   }
 
-  return reactive({ changes, error, change, flush })
+  function peerSettings(id: string) {
+    return peerChanges.get(id) ?? preferences.value?.peers[id] ?? defaultPeer
+  }
+
+  function peerSaving(id: string) {
+    return peerChanges.has(id)
+  }
+
+  async function savePeer(id: string, settings: PeerSettings) {
+    if (!preferences.value || peerSaving(id)) return
+    peerChanges.set(id, settings)
+    try {
+      await invoke('set_peer', { id, ...settings })
+      if (preferences.value) preferences.value.peers[id] = settings
+    } finally { peerChanges.delete(id) }
+  }
+
+  return reactive({ current, effective, error, change, flush, peerSettings, peerSaving, savePeer })
 }
 
 export type AudioControls = ReturnType<typeof useAudioControls>

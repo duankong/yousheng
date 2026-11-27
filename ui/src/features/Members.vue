@@ -1,33 +1,25 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { AudioLines, SlidersHorizontal, UserRoundPlus, VolumeX, X } from 'lucide-vue-next'
-import { invoke } from '@tauri-apps/api/core'
 import type { Member, PeerSettings, Snapshot } from '../model'
+import type { AudioControls } from './useAudioControls'
 import PlayerAvatar from './PlayerAvatar.vue'
-const props = defineProps<{ snapshot: Snapshot; speakers: string[]; peers: Record<string, PeerSettings>; busy: boolean }>()
-const emit = defineEmits<{ saved: [id: string, settings: PeerSettings]; error: [error: string]; editProfile: []; invite: [] }>()
+const props = defineProps<{ snapshot: Snapshot; speakers: string[]; peers: Record<string, PeerSettings>; controls: AudioControls; busy: boolean }>()
+const emit = defineEmits<{ save: [id: string, settings: PeerSettings]; editProfile: []; invite: [] }>()
 const editId = ref('')
-const edit = ref<PeerSettings>({ volume: 100, muted: false })
-const saving = ref(false)
+const edit = ref({ ...props.controls.peerSettings(editId.value) })
 const visible = computed(() => [...props.snapshot.members].sort((a, b) => Number(b.id === props.snapshot.ownerId) - Number(a.id === props.snapshot.ownerId)))
 watch(visible, list => { if (!list.some(m => m.id === editId.value)) editId.value = '' })
+watch([editId, () => props.controls.peerSettings(editId.value)], ([, settings]) => { edit.value = { ...settings } })
 function role(member: Member) {
   if (member.id === props.snapshot.selfId) return member.id === props.snapshot.ownerId ? '我（房主）' : '我'
   return member.id === props.snapshot.ownerId ? '房主' : '队友'
 }
 function select(member: Member) {
   editId.value = member.id === editId.value ? '' : member.id
-  edit.value = { ...(props.peers[member.id] ?? { volume: 100, muted: false }) }
 }
-async function save() {
-  const id = editId.value
-  const settings = { ...edit.value }
-  saving.value = true
-  try {
-    await invoke('set_peer', { id, ...settings })
-    emit('saved', id, settings)
-  } catch (reason) { emit('error', String(reason)); edit.value = { ...(props.peers[id] ?? { volume: 100, muted: false }) } }
-  finally { saving.value = false }
+function save() {
+  emit('save', editId.value, { ...edit.value })
 }
 </script>
 
@@ -44,12 +36,12 @@ async function save() {
           <small v-else-if="peers[member.id]?.muted" class="peer-muted"><VolumeX /> 本地已静音</small>
           <small v-else>{{ role(member) }}</small>
         </div>
-        <button v-if="member.id !== snapshot.selfId" :disabled="busy || saving" class="peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal aria-hidden="true" /><span>音量</span></button>
+        <button v-if="member.id !== snapshot.selfId" :disabled="busy" class="peer-button" :title="'调节' + member.name + '的音量'" :aria-label="'调节' + member.name + '的音量'" :aria-expanded="editId === member.id" @click="select(member)"><SlidersHorizontal aria-hidden="true" /><span>音量</span></button>
       </div>
       <div v-if="editId === member.id" class="peer-panel">
         <div class="peer-head"><b>个人收听</b><button class="icon-button" aria-label="收起音量设置" @click="editId = ''"><X /></button></div>
-        <label class="range-label"><span>音量</span><output>{{ edit.volume }}%</output><input v-model.number="edit.volume" type="range" min="0" max="200" :disabled="busy || saving" @change="save" /></label>
-        <label class="switch-row">我不听此人<input v-model="edit.muted" type="checkbox" role="switch" :disabled="busy || saving" @change="save" /></label>
+        <label class="range-label"><span>音量</span><output>{{ edit.volume }}%</output><input v-model.number="edit.volume" type="range" min="0" max="200" :disabled="busy || controls.peerSaving(member.id)" @change="save" /></label>
+        <label class="switch-row">我不听此人<input v-model="edit.muted" type="checkbox" role="switch" :disabled="busy || controls.peerSaving(member.id)" @change="save" /></label>
       </div>
     </li></ul>
   </aside>

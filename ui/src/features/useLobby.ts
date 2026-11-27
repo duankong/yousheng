@@ -32,6 +32,8 @@ export function useLobby(openInvite: (link: string) => void) {
   const speakers = ref<string[]>([])
   const level = ref(0)
   const voice = ref<VoiceStatus>({ state: 'disconnected' })
+  const voiceRetry = shallowRef<{ sessionId: string }>()
+  const retryingVoice = computed(() => !!voiceRetry.value && voiceRetry.value.sessionId === session.value?.id)
   const inVoice = computed(() => ['connected', 'online', 'ready'].includes(voice.value.state))
   const voiceLabel = computed(() => {
     if (inVoice.value) return '语音已连接'
@@ -63,6 +65,7 @@ export function useLobby(openInvite: (link: string) => void) {
   }
 
   function clearSession() {
+    voiceRetry.value = undefined
     current.value = undefined
     speakers.value = []
     level.value = 0
@@ -145,6 +148,7 @@ export function useLobby(openInvite: (link: string) => void) {
         throw new Error(attempt.offline)
       }
       const { id, isHost, invite: acceptedInvite } = result
+      voiceRetry.value = undefined
       current.value = { session: { id, isHost, invite: acceptedInvite }, snapshot: attempt.snapshot ?? result.snapshot }
       if (!keepNotice) offline.value = ''
       if (attempt.error) error.value = attempt.error
@@ -188,13 +192,22 @@ export function useLobby(openInvite: (link: string) => void) {
     })
   }
 
-  function retryVoice() {
-    return run(async () => {
-      const room = session.value
-      if (room && active.value) await invoke('lobby_action', { sessionId: room.id, action: { type: 'retryVoice' } })
-    })
+  async function retryVoice() {
+    const room = session.value
+    if (!room || !active.value || busy.value || retryingVoice.value) return
+    const request = { sessionId: room.id }
+    voiceRetry.value = request
+    const currentRequest = () => !disposed && voiceRetry.value === request && session.value?.id === request.sessionId
+    error.value = ''
+    try {
+      await invoke('lobby_action', { sessionId: room.id, action: { type: 'retryVoice' } })
+    } catch (reason) {
+      if (currentRequest() && !busy.value) error.value = reason instanceof Error ? reason.message : String(reason)
+    } finally {
+      if (currentRequest()) voiceRetry.value = undefined
+    }
   }
 
   return { preferences, session, snapshot, ready, busy, offline, error, speakers, level, voice,
-    active, inVoice, voiceLabel, connect, leave, retryVoice, history, historyLoading, historyError, refreshHistory }
+    active, inVoice, voiceLabel, connect, leave, retryVoice, retryingVoice, history, historyLoading, historyError, refreshHistory }
 }

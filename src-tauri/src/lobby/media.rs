@@ -27,6 +27,9 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+// Allow the bundled SFU's three admission attempts, then release a stalled connection.
+pub(super) const SFU_ADMISSION_LIMIT: Duration = Duration::from_secs(40);
+
 #[derive(Clone)]
 pub(super) struct Media {
     key: String,
@@ -143,15 +146,22 @@ impl Media {
     }
 }
 
-pub(super) fn cleanup(state: &Shared, core: &mut Core, id: String) {
+pub(super) fn cleanup(state: &Shared, core: &mut Core, id: String, membership: Membership) {
+    drop(membership.revoked);
     if *state.stop.borrow() || !core.pending.insert(id.clone()) {
         return;
     }
+    let admission = membership.admission;
     let room = core.room_id.clone();
     let weak = std::sync::Arc::downgrade(&state.core);
     let media = state.media.clone();
     let mut stop = state.stop.clone();
     tokio::spawn(async move {
+        let _admission = tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => return,
+            admission = admission.lock() => admission,
+        };
         let mut delay = Duration::from_millis(200);
         while weak.strong_count() > 0 && !*stop.borrow() {
             if media.remove(&room, &id).await {
@@ -185,13 +195,16 @@ struct Grant {
 }
 
 impl Claims {
-    fn current<'a>(&self, core: &'a Core) -> Result<&'a super::Member, StatusCode> {
+    fn current<'a>(
+        &self,
+        core: &'a Core,
+    ) -> Result<(&'a super::Member, &'a Membership), StatusCode> {
         let m = core.members.get(&self.sub).ok_or(StatusCode::FORBIDDEN)?;
         let grant = m.membership.as_ref().ok_or(StatusCode::FORBIDDEN)?;
         if core.room_id != self.video.room || grant.epoch != self.metadata {
             return Err(StatusCode::FORBIDDEN);
         }
-        Ok(m)
+        Ok((m, grant))
     }
 }
 
@@ -236,7 +249,7 @@ pub(super) async fn gateway(
     if *state.stop.borrow() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let member = claims.current(&core)?;
+    let (_, membership) = claims.current(&core)?;
     if validate {
         drop(core);
         let response = state
@@ -257,8 +270,8 @@ pub(super) async fn gateway(
             .into_response());
     }
     let ws = ws.map_err(|_| StatusCode::BAD_REQUEST)?;
-    let revoked = member.membership.as_ref().unwrap().revoked.subscribe();
-    let playback = member.playback;
+    let admission = membership.admission.clone();
+    drop(core);
     url.set_scheme("ws").map_err(|_| StatusCode::BAD_GATEWAY)?;
     let mut request = url
         .as_str()
@@ -270,12 +283,41 @@ pub(super) async fn gateway(
             .parse()
             .map_err(|_| StatusCode::BAD_REQUEST)?,
     );
-    // Serialize private admission with membership changes so a kick cannot overtake an in-flight join.
-    let (upstream, _) = timeout(Duration::from_secs(3), connect_async(request))
+    let upstream = timeout(Duration::from_secs(3), async {
+        let admission = admission.lock_owned().await;
+        let mut stop = state.stop.clone();
+        {
+            let core = state.core.lock().await;
+            if *stop.borrow() {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            claims.current(&core)?;
+        }
+        // Keep the member's gate through LiveKit's retries even if the caller timed out.
+        tokio::spawn(async move {
+            let _admission = admission;
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => Err(StatusCode::SERVICE_UNAVAILABLE),
+                result = timeout(SFU_ADMISSION_LIMIT, connect_async(request)) => result
+                    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+                    .map(|(upstream, _)| upstream)
+                    .map_err(|_| StatusCode::BAD_GATEWAY),
+            }
+        })
         .await
-        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    drop(core);
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+    })
+    .await
+    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)??;
+    let (revoked, playback) = {
+        let core = state.core.lock().await;
+        if *state.stop.borrow() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let (member, membership) = claims.current(&core)?;
+        (membership.revoked.subscribe(), member.playback)
+    };
     Ok(ws
         .max_message_size(2 * 1024 * 1024)
         .on_upgrade(move |down| bridge(down, upstream, revoked, state.stop, playback)))

@@ -731,7 +731,12 @@ async fn two_clients() -> Result<()> {
     let host_profile = Profile::load(storage.path().join("host"))?;
     let guest_profile = Profile::load(storage.path().join("guest"))?;
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
-    let host = Host::start(&host_profile, &binary).await?;
+    let host = Host::start(
+        &host_profile,
+        &binary,
+        crate::diagnostics::Diagnostics::default(),
+    )
+    .await?;
     let scenario = async {
         let invite = Ticket::parse(
             &host
@@ -739,7 +744,8 @@ async fn two_clients() -> Result<()> {
                 .share_invite(host_profile.invite_key.clone())
                 .await?,
         )?;
-        let guest = GuestEndpoint::start(&invite).await?;
+        let guest =
+            GuestEndpoint::start(&invite, crate::diagnostics::Diagnostics::default()).await?;
         let result = exercise(&host, &guest, &guest_profile, &invite.key).await.and_then(|()| {
             let route = guest.selected_transport().ok_or("iroh has no selected path")?;
             if tunnel::expect_relay() && route != "relay" {
@@ -769,12 +775,19 @@ async fn four_players() -> Result<()> {
     let storage = tempfile::tempdir().map_err(err)?;
     let host_profile = Profile::load(storage.path().join("host"))?;
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
-    let host = Host::start(&host_profile, &binary).await?;
+    let host = Host::start(
+        &host_profile,
+        &binary,
+        crate::diagnostics::Diagnostics::default(),
+    )
+    .await?;
     let mut guests = Vec::new();
     let scenario = async {
         let invite = Ticket::parse(&host.overlay.share_invite(host_profile.invite_key).await?)?;
         for _ in 0..3 {
-            guests.push(GuestEndpoint::start(&invite).await?);
+            guests.push(
+                GuestEndpoint::start(&invite, crate::diagnostics::Diagnostics::default()).await?,
+            );
         }
         exercise_four_players(&host, &guests, &invite.key, storage.path()).await
     };

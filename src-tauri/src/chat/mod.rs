@@ -1,18 +1,18 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChatMessage {
-    pub(crate) id: String,
-    author_id: String,
-    author_name: String,
-    text: String,
-    time: u64,
+pub(crate) struct ChatMessage<Text = String> {
+    pub(crate) id: Text,
+    pub(crate) author_id: Text,
+    pub(crate) author_name: Text,
+    pub(crate) text: Text,
+    pub(crate) time: u64,
 }
 
 #[derive(Default)]

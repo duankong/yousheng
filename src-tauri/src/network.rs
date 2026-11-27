@@ -1,16 +1,20 @@
 //! The same authenticated peer connection carries lobby/signaling streams and
 //! encrypted WebRTC UDP packets, whether iroh chooses a direct path or relay.
+use crate::diagnostics::{Diagnostics, Event, Role};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use iroh::{
-    endpoint::{presets, Builder, Connection, SendDatagramError},
-    Endpoint, EndpointAddr, SecretKey,
+    endpoint::{presets, Builder, Connection, PathEvent, SendDatagramError},
+    Endpoint, EndpointAddr, SecretKey, TransportAddr,
 };
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -28,9 +32,132 @@ const MAX_FLOWS: usize = 64;
 const FLOW_IDLE: Duration = Duration::from_secs(90);
 const MAX_QUEUED_MEDIA_STREAMS: usize = 8;
 const MEDIA_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+const TRANSPORT_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "transport_event", rename_all = "snake_case")]
+pub(crate) enum TransportEvent {
+    Sample {
+        link_id: u64,
+        role: Role,
+        phase: TransportSamplePhase,
+        path: &'static str,
+        rtt_ms: Option<f64>,
+        quic_packets_sent: u64,
+        quic_packets_lost: u64,
+        media_stream_fallbacks: u64,
+        media_stream_queue_drops: u64,
+    },
+    SelectedPathChanged {
+        link_id: u64,
+        role: Role,
+        path: &'static str,
+        rtt_ms: Option<f64>,
+    },
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransportSamplePhase {
+    Initial,
+    Periodic,
+    Final,
+}
+
+#[derive(Default)]
+struct MediaStreamCounters {
+    fallbacks: AtomicU64,
+    queue_drops: AtomicU64,
+}
+
+fn transport_label(address: &TransportAddr) -> &'static str {
+    if address.is_relay() {
+        "relay"
+    } else if address.is_ip() {
+        "direct"
+    } else {
+        "unknown"
+    }
+}
+
+fn selected_path(conn: &Connection) -> Option<(&'static str, Duration)> {
+    conn.paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| (transport_label(path.remote_addr()), path.rtt()))
+}
+
+fn observe_transport(
+    conn: &Connection,
+    role: Role,
+    diagnostics: Diagnostics,
+    media: Arc<MediaStreamCounters>,
+) {
+    let link_id = diagnostics.next_id();
+    let mut paths = conn.path_events();
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let sample = |phase| {
+            let (path, rtt_ms) = selected_path(&conn)
+                .map(|(path, rtt)| (path, Some(rtt.as_secs_f64() * 1000.0)))
+                .unwrap_or(("unknown", None));
+            let quic = conn.stats();
+            diagnostics.record(Event::Transport(TransportEvent::Sample {
+                link_id,
+                role,
+                phase,
+                path,
+                rtt_ms,
+                quic_packets_sent: quic.sent_packets,
+                quic_packets_lost: quic.lost_packets,
+                media_stream_fallbacks: media.fallbacks.load(Ordering::Relaxed),
+                media_stream_queue_drops: media.queue_drops.load(Ordering::Relaxed),
+            }));
+        };
+        sample(TransportSamplePhase::Initial);
+        let mut interval = tokio::time::interval_at(
+            Instant::now() + TRANSPORT_SAMPLE_INTERVAL,
+            TRANSPORT_SAMPLE_INTERVAL,
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let closed = conn.closed();
+        tokio::pin!(closed);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut closed => break,
+                _ = interval.tick() => sample(TransportSamplePhase::Periodic),
+                Some(event) = paths.next() => {
+                    if let PathEvent::Selected { id, remote_addr, .. } = event {
+                        diagnostics.record(Event::Transport(TransportEvent::SelectedPathChanged {
+                            link_id,
+                            role,
+                            path: transport_label(&remote_addr),
+                            rtt_ms: conn.rtt(id).map(|rtt| rtt.as_secs_f64() * 1000.0),
+                        }));
+                    }
+                }
+            }
+        }
+        sample(TransportSamplePhase::Final);
+    });
+}
+
+pub(crate) fn local_ip() -> Ipv4Addr {
+    let route = || {
+        let sock = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        // UDP connect asks Windows for its chosen interface without sending a packet.
+        sock.connect("192.0.2.1:9").ok()?;
+        match sock.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            _ => None,
+        }
+    };
+    route().unwrap_or(Ipv4Addr::LOCALHOST)
 }
 
 fn force_relay() -> bool {
@@ -143,6 +270,7 @@ impl HostEndpoint {
         key: String,
         gateway: u16,
         media: SocketAddrV4,
+        diagnostics: Diagnostics,
     ) -> Result<Self> {
         let ep = endpoint_builder()
             .secret_key(SecretKey::from_bytes(&seed))
@@ -154,11 +282,15 @@ impl HostEndpoint {
         let accept = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let key = key.clone();
+                let diagnostics = diagnostics.clone();
                 tokio::spawn(async move {
                     let Ok(Ok(conn)) = timeout(Duration::from_secs(12), incoming).await else {
                         return;
                     };
-                    if run_host(&conn, &key, gateway, media).await.is_err() {
+                    if run_host(&conn, &key, gateway, media, diagnostics)
+                        .await
+                        .is_err()
+                    {
                         conn.close(1u8.into(), b"end")
                     }
                 });
@@ -226,7 +358,13 @@ impl Drop for HostEndpoint {
     }
 }
 
-async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV4) -> Result<()> {
+async fn run_host(
+    conn: &Connection,
+    key: &str,
+    gateway: u16,
+    media: SocketAddrV4,
+    diagnostics: Diagnostics,
+) -> Result<()> {
     #[cfg(test)]
     let peer = conn.remote_id();
     timeout(Duration::from_secs(8), async {
@@ -241,6 +379,8 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
     })
     .await
     .map_err(err)??;
+    let media_counters = Arc::new(MediaStreamCounters::default());
+    observe_transport(conn, Role::Host, diagnostics, media_counters.clone());
     let bridge = conn.clone();
     let streams = tokio::spawn(async move {
         while let Ok((tx, rx)) = bridge.accept_bi().await {
@@ -251,7 +391,7 @@ async fn run_host(conn: &Connection, key: &str, gateway: u16, media: SocketAddrV
             });
         }
     });
-    let outgoing = Arc::new(OutgoingPackets::new(conn));
+    let outgoing = Arc::new(OutgoingPackets::new(conn, media_counters));
     let mut flows = Flows::<HostFlow>::new();
     let result = async {
         let mut expire = tokio::time::interval(FLOW_IDLE);
@@ -319,10 +459,11 @@ struct OutgoingPackets {
     conn: Connection,
     large: mpsc::Sender<(Instant, Bytes)>,
     _stop: oneshot::Sender<()>,
+    counters: Arc<MediaStreamCounters>,
 }
 
 impl OutgoingPackets {
-    fn new(conn: &Connection) -> Self {
+    fn new(conn: &Connection, counters: Arc<MediaStreamCounters>) -> Self {
         let (large, queue) = mpsc::channel(MAX_QUEUED_MEDIA_STREAMS);
         let (stop, stopped) = oneshot::channel();
         tokio::spawn(Self::send_large(conn.clone(), queue, stopped));
@@ -330,6 +471,7 @@ impl OutgoingPackets {
             conn: conn.clone(),
             large,
             _stop: stop,
+            counters,
         }
     }
 
@@ -348,7 +490,10 @@ impl OutgoingPackets {
             }
         }
         if let Ok(slot) = self.large.try_reserve() {
+            self.counters.fallbacks.fetch_add(1, Ordering::Relaxed);
             slot.send((Instant::now() + MEDIA_STREAM_SEND_TIMEOUT, frame()));
+        } else {
+            self.counters.queue_drops.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -435,7 +580,7 @@ pub struct GuestEndpoint {
     pub media: SocketAddrV4,
 }
 impl GuestEndpoint {
-    pub async fn start(ticket: &Ticket) -> Result<Self> {
+    pub async fn start(ticket: &Ticket, diagnostics: Diagnostics) -> Result<Self> {
         let ep = endpoint_builder().bind().await.map_err(err)?;
         if force_relay() {
             timeout(Duration::from_secs(12), ep.online())
@@ -467,9 +612,11 @@ impl GuestEndpoint {
             .await
             .map_err(err)?;
         let gateway = listener.local_addr().map_err(err)?.port();
-        let ip = crate::host::local_ip();
+        let ip = local_ip();
         let udp = UdpSocket::bind((ip, 0)).await.map_err(err)?;
         let media = SocketAddrV4::new(ip, udp.local_addr().map_err(err)?.port());
+        let media_counters = Arc::new(MediaStreamCounters::default());
+        observe_transport(&conn, Role::Guest, diagnostics, media_counters.clone());
         let stream_conn = conn.clone();
         let streams = tokio::spawn(async move {
             loop {
@@ -486,7 +633,7 @@ impl GuestEndpoint {
         #[cfg(test)]
         let peer = ep.id();
         let media_task = tokio::spawn(async move {
-            let outgoing = OutgoingPackets::new(&media_conn);
+            let outgoing = OutgoingPackets::new(&media_conn, media_counters);
             let mut senders = Flows::new();
             let mut buf = vec![0; MAX_PACKET];
             let mut packets = IncomingPackets::default();
@@ -546,16 +693,7 @@ impl GuestEndpoint {
     }
 
     pub(crate) fn selected_path(&self) -> Option<(&'static str, Duration)> {
-        self.conn.paths().iter().find(|p| p.is_selected()).map(|p| {
-            let transport = if p.is_relay() {
-                "relay"
-            } else if p.is_ip() {
-                "direct"
-            } else {
-                "unknown"
-            };
-            (transport, p.rtt())
-        })
+        selected_path(&self.conn)
     }
 }
 
@@ -599,6 +737,34 @@ mod tests {
         (sender.unwrap(), receiver.unwrap())
     }
 
+    #[tokio::test]
+    async fn media_stream_counters_distinguish_fallbacks_and_full_queue_drops() {
+        let host = local_endpoint().bind().await.unwrap();
+        let guest = local_endpoint().bind().await.unwrap();
+        let (guest_conn, host_conn) = connect_local(&host, &guest).await;
+        let counters = Arc::new(MediaStreamCounters::default());
+        let outgoing = OutgoingPackets::new(&host_conn, counters.clone());
+        let payload = vec![7; 16_000];
+
+        outgoing.send(0x1234, b"live audio").unwrap();
+        for _ in 0..=MAX_QUEUED_MEDIA_STREAMS {
+            outgoing.send(0x1234, &payload).unwrap();
+        }
+
+        assert_eq!(
+            counters.fallbacks.load(Ordering::Relaxed),
+            MAX_QUEUED_MEDIA_STREAMS as u64
+        );
+        assert_eq!(counters.queue_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            timeout(Duration::from_secs(2), guest_conn.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"\x12\x34live audio")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_datagram_overtakes_media_waiting_for_send_stream_credit() {
         let host = local_endpoint().bind().await.unwrap();
@@ -621,8 +787,9 @@ mod tests {
             unreachable!();
         };
         let key = "a".repeat(64);
-        let host_task =
-            tokio::spawn(async move { run_host(&host_conn, &key, 0, media_addr).await });
+        let host_task = tokio::spawn(async move {
+            run_host(&host_conn, &key, 0, media_addr, Diagnostics::default()).await
+        });
         let (mut auth, mut ack) = guest_conn.open_bi().await.unwrap();
         auth.write_all(&[b'a'; 64]).await.unwrap();
         auth.finish().unwrap();
@@ -688,7 +855,7 @@ mod tests {
             .await
             .unwrap();
         let (guest_conn, host_conn) = connect_local(&host, &guest).await;
-        let outgoing = OutgoingPackets::new(&host_conn);
+        let outgoing = OutgoingPackets::new(&host_conn, Arc::default());
         let payload = vec![7; 16_000];
         outgoing.send(0x1234, &payload).unwrap();
 

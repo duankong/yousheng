@@ -1,8 +1,10 @@
 mod audio;
 mod devices;
+mod diagnostics;
 #[cfg(test)]
 mod scenario_playback;
 
+pub(crate) use diagnostics::VoiceEvent;
 #[cfg(test)]
 pub(crate) use scenario_playback::ScenarioPlayback;
 
@@ -26,8 +28,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::diagnostics::Diagnostics;
 use audio::{AudioIo, CaptureControl, PreparedAudioIo, BLOCK, RATE};
 pub use devices::AudioDevices;
+use diagnostics::{CallDiagnostics, ConnectingCall, PcmStats, VoiceState};
 
 // Decoded WebRTC sink frames are typically 10 ms each.
 const SDK_PCM_QUEUE_FRAMES: usize = 3;
@@ -113,6 +117,7 @@ struct Mixer {
     tracks: HashMap<TrackSid, VoiceTrack>,
     peers: HashMap<String, PeerGain>,
     callback_samples: usize,
+    pcm_stats: PcmStats,
 }
 
 impl Mixer {
@@ -155,7 +160,9 @@ impl Mixer {
             let stale = track.samples.len().saturating_sub(limit);
             let count = (track.samples.len() - stale).min(output.len());
             let queued = track.samples.drain(..stale + count);
+            self.pcm_stats.trimmed_samples_total += stale as u64;
             if !muted && track.gain != 0.0 {
+                self.pcm_stats.unfilled_track_samples_total += (output.len() - count) as u64;
                 for (mixed, sample) in output.iter_mut().zip(queued.skip(stale)) {
                     *mixed += f32::from(sample) * track.gain;
                 }
@@ -168,11 +175,30 @@ impl Mixer {
         let Some(track) = self.tracks.get_mut(sid) else {
             return false;
         };
-        let samples = &samples[samples.len().saturating_sub(limit)..];
+        let skipped_input = samples.len().saturating_sub(limit);
+        let samples = &samples[skipped_input..];
         let stale = track.samples.len().saturating_sub(limit - samples.len());
         track.samples.drain(..stale);
         track.samples.extend(samples.iter().copied());
+        self.pcm_stats.trimmed_samples_total += (skipped_input + stale) as u64;
+        self.pcm_stats.peak_track_queue_samples = self
+            .pcm_stats
+            .peak_track_queue_samples
+            .max(track.samples.len());
         true
+    }
+
+    fn sample_pcm(&mut self) -> PcmStats {
+        let depth = self
+            .tracks
+            .values()
+            .map(|track| track.samples.len())
+            .max()
+            .unwrap_or(0);
+        let mut sample = self.pcm_stats;
+        sample.peak_track_queue_samples = sample.peak_track_queue_samples.max(depth);
+        self.pcm_stats.peak_track_queue_samples = depth;
+        sample
     }
 }
 
@@ -193,6 +219,7 @@ struct Session {
     source: NativeAudioSource,
     io: Arc<AsyncMutex<Option<AudioIo>>>,
     events: Task,
+    diagnostics: CallDiagnostics,
 }
 
 fn call_is_active(state: ConnectionState) -> bool {
@@ -334,21 +361,26 @@ impl VoiceEngine {
         }
     }
 
-    pub async fn connect(&self, url: &str, token: &str) {
+    pub(crate) async fn connect(&self, url: &str, token: &str, diagnostics: &Diagnostics) {
         let mut slot = self.session.lock().await;
         if let Some(old) = slot.take() {
             self.stop(old).await;
         }
         self.set_ptt(false);
+        let connecting = ConnectingCall::begin(diagnostics);
         status(&self.audio.app, "connecting", None);
-        let (room, events, source) = match join_microphone(url, token).await {
+        let joined = join_microphone(url, token).await;
+        let diagnostics = connecting.finish();
+        let (room, events, source) = match joined {
             Ok(joined) => joined,
             Err(error) => {
+                diagnostics.status(VoiceState::ConnectFailed);
                 silence(&self.audio.app);
                 status(&self.audio.app, "error", Some(&error));
                 return;
             }
         };
+        self.audio.mix.lock().unwrap().pcm_stats = PcmStats::default();
         let settings = self.audio.settings.borrow().clone();
         let audio = self
             .audio
@@ -360,6 +392,7 @@ impl VoiceEngine {
         let audio = match audio {
             Ok(audio) => audio,
             Err(e) => {
+                diagnostics.status(VoiceState::DeviceError);
                 tokio::spawn(async move {
                     let _ = room.close().await;
                 });
@@ -371,6 +404,7 @@ impl VoiceEngine {
         };
         let io = Arc::new(AsyncMutex::new(Some(audio)));
         let room = Arc::new(room);
+        diagnostics.status(VoiceState::Connected);
         status(&self.audio.app, "connected", None);
         let events = Task(tokio::spawn(room_events(
             self.audio.clone(),
@@ -378,17 +412,19 @@ impl VoiceEngine {
             io.clone(),
             room.clone(),
             source.clone(),
+            diagnostics.clone(),
         )));
         *slot = Some(Session {
             room,
             source,
             io,
             events,
+            diagnostics,
         });
     }
 
     async fn stop(&self, session: Session) {
-        // Closing continues if a newer invitation cancels this command.
+        // Close signaling in parallel with local audio cleanup.
         let close = tokio::spawn(async move {
             let _ = session.room.close().await;
         });
@@ -401,6 +437,7 @@ impl VoiceEngine {
             audio.stop().await;
         }
         self.audio.mix.lock().unwrap().tracks.clear();
+        session.diagnostics.status(VoiceState::Disconnected);
         silence(&self.audio.app);
         let _ = tokio::time::timeout(Duration::from_secs(4), close).await;
     }
@@ -467,7 +504,11 @@ impl VoiceEngine {
             {
                 self.audio
                     .replace_call_io(io, &settings, &session.room, &session.source)
-                    .await?;
+                    .await
+                    .inspect_err(|_| session.diagnostics.status(VoiceState::DeviceError))?;
+                if io.as_ref().is_some_and(|current| !current.failed()) {
+                    session.diagnostics.status(VoiceState::DeviceConfigured);
+                }
                 if session.room.connection_state() == ConnectionState::Connected {
                     status(&self.audio.app, "connected", None);
                 }
@@ -562,7 +603,14 @@ mod tests {
         let sid = add_track(&mut mix, "one", VecDeque::new());
         mix.push_remote_pcm(&sid, &[2048; 2880]);
         mix.push_remote_pcm(&sid, &[4096; 1920]);
-        assert_eq!(played_sample(&Mutex::new(mix), 1.0), 0.125);
+        let mix = Mutex::new(mix);
+        assert_eq!(played_sample(&mix, 1.0), 0.125);
+        let mut mix = mix.lock().unwrap();
+        let pcm = mix.sample_pcm();
+        assert_eq!(pcm.peak_track_queue_samples, 2880);
+        assert_eq!(pcm.trimmed_samples_total, 2880);
+        assert_eq!(pcm.unfilled_track_samples_total, 0);
+        assert!(mix.sample_pcm().peak_track_queue_samples < pcm.peak_track_queue_samples);
     }
 
     #[tokio::test]
@@ -719,11 +767,16 @@ async fn room_events(
     io: Arc<AsyncMutex<Option<AudioIo>>>,
     room: Arc<Room>,
     source: NativeAudioSource,
+    diagnostics: CallDiagnostics,
 ) {
     let mut reason = None;
     let app = &audio.app;
     let mix = &audio.mix;
+    let sampler = Task(tokio::spawn(
+        diagnostics.clone().sample(room.clone(), mix.clone()),
+    ));
     let mut network_ready = true;
+    let mut device_failed = false;
     let mut retry = tokio::time::interval(Duration::from_secs(2));
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -732,10 +785,18 @@ async fn room_events(
             _ = retry.tick() => {
                 let mut current = io.lock().await;
                 if call_is_active(room.connection_state()) && current.as_ref().is_none_or(AudioIo::failed) {
+                    if !device_failed {
+                        diagnostics.status(VoiceState::DeviceError);
+                    }
+                    device_failed = true;
                     let settings = audio.settings.borrow().clone();
                     if audio.replace_call_io(&mut current, &settings, &room, &source).await.is_ok() {
                         if network_ready && current.is_some() { status(app, "connected", None); }
                     }
+                }
+                if device_failed && current.as_ref().is_some_and(|audio| !audio.failed()) {
+                    diagnostics.status(VoiceState::DeviceRecovered);
+                    device_failed = false;
                 }
                 continue;
             }
@@ -763,11 +824,13 @@ async fn room_events(
             }
             RoomEvent::Reconnecting => {
                 network_ready = false;
+                diagnostics.status(VoiceState::Reconnecting);
                 silence(app);
                 status(app, "reconnecting", None);
             }
             RoomEvent::Reconnected => {
                 network_ready = true;
+                diagnostics.status(VoiceState::Reconnected);
                 if io
                     .lock()
                     .await
@@ -776,6 +839,10 @@ async fn room_events(
                 {
                     status(app, "connected", None);
                 } else {
+                    if !device_failed {
+                        diagnostics.status(VoiceState::DeviceError);
+                    }
+                    device_failed = true;
                     status(
                         app,
                         "device-error",
@@ -790,11 +857,13 @@ async fn room_events(
             _ => (),
         }
     }
+    drop(sampler);
     let mut current = io.lock().await;
     if let Some(current) = current.take() {
         current.stop().await;
     }
     mix.lock().unwrap().tracks.clear();
+    diagnostics.status(VoiceState::Disconnected);
     silence(app);
     status(app, "disconnected", reason.as_deref());
     audio.resume_preview();

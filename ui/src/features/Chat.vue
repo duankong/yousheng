@@ -11,12 +11,12 @@ export function chatSendHint(attempts: ChatAttempt[], text: string): string {
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { Activity, RotateCw } from 'lucide-vue-next'
-import type { AudioSettings, Snapshot } from '../model'
+import type { Snapshot } from '../model'
 import RoomAudioControls from './RoomAudioControls.vue'
 import type { AudioControls } from './useAudioControls'
 import PlayerAvatar from './PlayerAvatar.vue'
 
-const props = defineProps<{ snapshot: Snapshot; host: boolean; outbox: ChatAttempt[]; audio?: AudioSettings; controls: AudioControls; voiceLabel: string; voiceMessage?: string; inVoice: boolean; canRetryVoice: boolean; busy: boolean }>()
+const props = defineProps<{ snapshot: Snapshot; host: boolean; outbox: ChatAttempt[]; controls: AudioControls; voiceLabel: string; voiceMessage?: string; inVoice: boolean; canRetryVoice: boolean; retryingVoice: boolean; busy: boolean }>()
 const draft = defineModel<string>({ required: true })
 const emit = defineEmits<{ leave: []; retry: []; send: []; restore: [id: number]; dismiss: [id: number]; editProfile: []; connection: [] }>()
 const sendHint = computed(() => chatSendHint(props.outbox, draft.value))
@@ -88,9 +88,9 @@ function keydown(event: KeyboardEvent) {
         <button type="button" class="connection" :class="{ online: inVoice }" title="查看房间连接详情" aria-haspopup="dialog" @click="emit('connection')">
           <span role="status">{{ voiceLabel }}</span><Activity aria-hidden="true" />
         </button>
-        <button v-if="canRetryVoice" :disabled="busy" class="text-button retry-voice" @click="emit('retry')"><RotateCw aria-hidden="true" />重试语音</button>
+        <button v-if="canRetryVoice" :disabled="busy || retryingVoice" class="text-button retry-voice" @click="emit('retry')"><RotateCw aria-hidden="true" />重试语音</button>
       </div>
-      <RoomAudioControls :audio="audio" :controls="controls" />
+      <RoomAudioControls :controls="controls" />
     </footer>
     <p v-if="voiceMessage" class="voice-detail" role="status">{{ voiceMessage }}</p>
   </section>

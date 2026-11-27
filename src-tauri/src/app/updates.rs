@@ -119,7 +119,7 @@ pub(super) async fn install_update(
         host.stop_if_empty().await?;
     }
     if let Some(current) = session.take() {
-        state.teardown(current).await;
+        current.close().await;
     }
     if let Err(error) = update.install(bytes) {
         if let Some(id) = session_id {

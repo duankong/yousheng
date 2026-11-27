@@ -384,6 +384,185 @@ async fn websocket_rejoin_keeps_chat_live_while_stale_voice_cleanup_finishes() {
     sf.abort();
 }
 
+async fn rejoin_during_voice_admission(wait_for_timeout: bool) {
+    use axum::{http::StatusCode, routing::post, Json};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_tungstenite::tungstenite::Error;
+
+    let sf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config();
+    cfg.livekit_http_url = format!("http://{}", sf_listener.local_addr().unwrap());
+    let (admission_tx, mut admissions) = mpsc::channel(1);
+    let (kick_tx, mut kicks) = mpsc::channel(1);
+    let sf = Router::new()
+        .route(
+            "/rtc/v1",
+            get(move |ws: WebSocketUpgrade| {
+                let tx = admission_tx.clone();
+                async move {
+                    let (release, wait) = oneshot::channel();
+                    tx.send(release).await.unwrap();
+                    wait.await.unwrap();
+                    ws.on_upgrade(|mut ws| async move { while ws.recv().await.is_some() {} })
+                }
+            }),
+        )
+        .route(
+            "/twirp/livekit.RoomService/RemoveParticipant",
+            post(move |Json(body): Json<Value>| {
+                let tx = kick_tx.clone();
+                async move {
+                    let (ack, wait) = oneshot::channel();
+                    tx.send((body, ack)).await.unwrap();
+                    wait.await.unwrap();
+                    Json(json!({}))
+                }
+            }),
+        );
+    let sf = tokio::spawn(async move { axum::serve(sf_listener, sf).await.unwrap() });
+    let room = TestRoom::start(cfg).await;
+    let (mut host, initial) = room.login('a', "主机").await;
+    let (mut guest, guest_snapshot) = room.login('b', "好友").await;
+    token(&mut host).await;
+    let old = token(&mut guest).await;
+    let route = format!(
+        "{}/rtc/v1?access_token={old}",
+        room.http.replacen("http", "ws", 1)
+    );
+    let mut signal = tokio::spawn(connect_async(route.clone()));
+    let release = timeout(Duration::from_secs(2), admissions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    if wait_for_timeout {
+        assert!(matches!(
+            timeout(Duration::from_secs(4), &mut signal).await.unwrap().unwrap(),
+            Err(Error::Http(response)) if response.status() == StatusCode::GATEWAY_TIMEOUT
+        ));
+    }
+    send_op(
+        &mut host,
+        json!({"type":"chat","roomId":initial["roomId"],"text":"仍可发言","requestId":31}),
+    )
+    .await;
+    let ack = timeout(
+        Duration::from_secs(1),
+        event(&mut host, |v| v["type"] == "result"),
+    )
+    .await
+    .expect("the host's chat ACK waited for another member's SFU handshake");
+    assert_eq!(ack, json!({"type":"result","requestId":31,"error":null}));
+    let (_other, other) = room.login('c', "第三位好友").await;
+    assert_eq!(other["messages"][0]["text"], "仍可发言");
+
+    let (mut rejoined, snapshot) = room.login('b', "重新加入").await;
+    assert_eq!(snapshot["selfId"], guest_snapshot["selfId"]);
+    assert_eq!(snapshot["members"].as_array().unwrap().len(), 3);
+    assert!(matches!(
+        connect_async(route).await,
+        Err(Error::Http(response)) if response.status() == StatusCode::FORBIDDEN
+    ));
+
+    assert!(
+        timeout(Duration::from_millis(100), kicks.recv())
+            .await
+            .is_err(),
+        "participant removal overtook the delayed SFU handshake"
+    );
+    release.send(()).unwrap();
+    if !wait_for_timeout {
+        assert!(matches!(
+            signal.await.unwrap(),
+            Err(Error::Http(response)) if response.status() == StatusCode::FORBIDDEN
+        ));
+    }
+
+    let (removed, ack) = timeout(Duration::from_secs(2), kicks.recv())
+        .await
+        .expect("the SFU did not receive the removal after the handshake")
+        .unwrap();
+    assert_eq!(
+        removed,
+        json!({"room":initial["roomId"],"identity":snapshot["selfId"]})
+    );
+    send_op(&mut rejoined, json!({"type":"retryVoice","requestId":32})).await;
+    let pending = event(&mut rejoined, |v| v["type"] == "result").await;
+    assert_eq!(pending["requestId"], 32);
+    assert!(pending["error"].is_string());
+    ack.send(()).unwrap();
+    assert_ne!(token(&mut rejoined).await, old);
+    sf.abort();
+}
+
+#[tokio::test]
+async fn in_flight_voice_admission_does_not_block_the_room_or_outlive_revocation() {
+    rejoin_during_voice_admission(false).await;
+}
+
+#[tokio::test]
+async fn timed_out_voice_admission_cannot_overtake_participant_removal() {
+    rejoin_during_voice_admission(true).await;
+}
+
+#[tokio::test]
+async fn a_stalled_voice_admission_releases_the_member_for_rejoin() {
+    use axum::routing::post;
+    use tokio::sync::mpsc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config();
+    cfg.livekit_http_url = format!("http://{}", listener.local_addr().unwrap());
+    let (started, mut in_flight) = mpsc::channel(1);
+    let (removed, mut removal) = mpsc::channel(1);
+    let sf = Router::new()
+        .route(
+            "/rtc/v1",
+            get(move || {
+                let started = started.clone();
+                async move {
+                    started.send(()).await.unwrap();
+                    std::future::pending::<axum::http::StatusCode>().await
+                }
+            }),
+        )
+        .route(
+            "/twirp/livekit.RoomService/RemoveParticipant",
+            post(move || {
+                let removed = removed.clone();
+                async move {
+                    let _ = removed.try_send(());
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+    let sf = tokio::spawn(async move { axum::serve(listener, sf).await.unwrap() });
+    let room = TestRoom::start(cfg).await;
+    let (mut host, _) = room.login('a', "主机").await;
+    let (mut guest, _) = room.login('b', "好友").await;
+    token(&mut host).await;
+    let old = token(&mut guest).await;
+    let route = format!(
+        "{}/rtc/v1?access_token={old}",
+        room.http.replacen("http", "ws", 1)
+    );
+    let signal = tokio::spawn(connect_async(route));
+    in_flight.recv().await.unwrap();
+    let (mut rejoined, _) = room.login('b', "重新加入").await;
+
+    tokio::time::pause();
+    tokio::time::advance(super::media::SFU_ADMISSION_LIMIT + Duration::from_millis(10)).await;
+    tokio::time::resume();
+
+    timeout(Duration::from_secs(1), removal.recv())
+        .await
+        .expect("a stalled handshake must release the member's admission lock")
+        .unwrap();
+    assert_ne!(token(&mut rejoined).await, old);
+    let _ = signal.await;
+    sf.abort();
+}
+
 #[tokio::test]
 async fn two_sockets_observe_profile_changes_without_interrupting_voice_or_chat() {
     let room = TestRoom::start(config()).await;

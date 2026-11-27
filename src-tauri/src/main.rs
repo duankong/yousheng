@@ -3,6 +3,7 @@
 mod app;
 mod chat;
 mod client;
+mod diagnostics;
 mod host;
 mod ice;
 mod lobby;

@@ -48,6 +48,7 @@ struct Shared {
 struct Membership {
     epoch: String,
     revoked: watch::Sender<()>,
+    admission: Arc<Mutex<()>>,
 }
 
 struct Member {
@@ -168,7 +169,10 @@ impl Core {
         }
     }
 
-    fn login(&mut self, op: Op) -> Result<(String, Uuid, watch::Receiver<()>, bool), &'static str> {
+    fn login(
+        &mut self,
+        op: Op,
+    ) -> Result<(String, Uuid, watch::Receiver<()>, Option<Membership>), &'static str> {
         let Op::Hello {
             invite_key,
             nickname,
@@ -220,8 +224,7 @@ impl Core {
                 dirty: tx,
             },
         );
-        let had_voice = old.is_some_and(|m| m.membership.is_some());
-        Ok((id, session, rx, had_voice))
+        Ok((id, session, rx, old.and_then(|m| m.membership)))
     }
 
     fn snapshot(
@@ -314,15 +317,16 @@ impl Shared {
                     member.membership = Some(Membership {
                         epoch: Uuid::new_v4().to_string(),
                         revoked: watch::channel(()).0,
+                        admission: Arc::new(Mutex::new(())),
                     });
                     member.dirty.send_replace(());
                 }
-            } else if member.membership.take().is_some() {
-                revoked.push(id.clone());
+            } else if let Some(membership) = member.membership.take() {
+                revoked.push((id.clone(), membership));
             }
         }
-        for id in revoked {
-            media::cleanup(self, core, id);
+        for (id, membership) in revoked {
+            media::cleanup(self, core, id, membership);
         }
     }
 }
@@ -359,7 +363,7 @@ async fn socket(mut ws: WebSocket, state: Shared) {
     let login = serde_json::from_str(&text)
         .map_err(|_| "邀请请求格式无效")
         .and_then(|op| core.login(op));
-    let (id, session, mut dirty, had_voice) = match login {
+    let (id, session, mut dirty, membership) = match login {
         Ok(result) => result,
         Err(e) => {
             drop(core);
@@ -367,8 +371,8 @@ async fn socket(mut ws: WebSocket, state: Shared) {
             return;
         }
     };
-    if had_voice {
-        media::cleanup(&state, &mut core, id.clone());
+    if let Some(membership) = membership {
+        media::cleanup(&state, &mut core, id.clone(), membership);
     }
     state.refresh_voice(&mut core);
     core.notify();
@@ -451,9 +455,8 @@ async fn socket(mut ws: WebSocket, state: Shared) {
         if !member.avatar.is_empty() {
             core.avatar_revision += 1;
         }
-        if member.membership.is_some() {
-            drop(member);
-            media::cleanup(&state, &mut core, id);
+        if let Some(membership) = member.membership {
+            media::cleanup(&state, &mut core, id, membership);
         }
         state.refresh_voice(&mut core);
         core.notify();

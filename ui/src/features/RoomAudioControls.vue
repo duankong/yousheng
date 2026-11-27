@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { Mic, MicOff, Volume2, VolumeX } from 'lucide-vue-next'
-import type { AudioSettings } from '../model'
-import type { AudioControls } from './useAudioControls'
+import { audioGainLimits, type AudioControls } from './useAudioControls'
 
-defineProps<{ audio?: AudioSettings; controls: AudioControls }>()
+const props = defineProps<{ controls: AudioControls }>()
+const audio = computed(() => props.controls.effective)
 const items = [
-  { gain: 'inputGain', mute: 'muted', name: '麦克风音量', muteLabel: '麦克风静音', off: '关闭麦克风', on: '取消麦克风静音', icon: Mic, mutedIcon: MicOff, max: 200 },
-  { gain: 'outputGain', mute: 'outputMuted', name: '扬声器音量', muteLabel: '扬声器静音', off: '关闭扬声器', on: '恢复扬声器声音', icon: Volume2, mutedIcon: VolumeX, max: 150 },
+  { gain: 'inputGain', mute: 'muted', name: '麦克风音量', muteLabel: '麦克风静音', off: '关闭麦克风', on: '取消麦克风静音', icon: Mic, mutedIcon: MicOff },
+  { gain: 'outputGain', mute: 'outputMuted', name: '扬声器音量', muteLabel: '扬声器静音', off: '关闭扬声器', on: '恢复扬声器声音', icon: Volume2, mutedIcon: VolumeX },
 ] as const
 type Gain = (typeof items)[number]['gain']
 const open = ref<Gain>()
@@ -67,8 +67,8 @@ onBeforeUnmount(() => clearTimeout(hoverTimer))
         <component :is="audio?.[item.mute] ? item.mutedIcon : item.icon" aria-hidden="true" />
       </button>
       <div v-if="audio && open === item.gain" class="volume-popover">
-        <div class="volume-card" :style="{ '--volume-level': audio[item.gain] / item.max }">
-          <input :id="'call-' + item.gain" type="range" min="0" :max="item.max" :value="audio[item.gain]"
+        <div class="volume-card" :style="{ '--volume-level': audio[item.gain] / audioGainLimits[item.gain] }">
+          <input :id="'call-' + item.gain" type="range" min="0" :max="audioGainLimits[item.gain]" :value="audio[item.gain]"
             :aria-label="item.name" aria-orientation="vertical" :aria-valuetext="audio[item.gain] + '%'"
             @pointerdown="startDrag"
             @pointerup="endDrag(item.gain, $event)" @pointercancel="endDrag(item.gain, $event)"
