@@ -41,10 +41,19 @@ try {
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         if ($Integration) {
             $env:DUIPIN_TEST_SFU = (Resolve-Path 'src-tauri/resources/livekit-server.exe').Path
-            cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml -- --ignored --test-threads=1
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            $env:DUIPIN_TEST_LOCAL_RELAY = '1'
-            cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml scenario_tests -- --ignored --test-threads=1
+            $previousRelayLimit = $env:DUIPIN_TEST_RELAY_LIMIT_128KB
+            try {
+                $env:DUIPIN_TEST_RELAY_LIMIT_128KB = $null
+                cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml -- --ignored --test-threads=1
+                if ($LASTEXITCODE) { exit $LASTEXITCODE }
+                $env:DUIPIN_TEST_LOCAL_RELAY = '1'
+                cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml scenario_tests -- --ignored --test-threads=1
+                if ($LASTEXITCODE) { exit $LASTEXITCODE }
+                $env:DUIPIN_TEST_RELAY_LIMIT_128KB = '1'
+                cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml scenario_tests::four_players_exchange_pcm_and_chat_through_iroh -- --exact --ignored --nocapture --test-threads=1
+            } finally {
+                $env:DUIPIN_TEST_RELAY_LIMIT_128KB = $previousRelayLimit
+            }
         }
     } else {
         $options = @('--target', 'x86_64-pc-windows-msvc')

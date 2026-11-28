@@ -254,7 +254,8 @@ const MARKER_COUNT: usize = 10;
 const MARKER_SLOT_MS: u64 = 160;
 const MARKER_LENGTH_MS: u64 = 80;
 const PLAYERS: usize = 4;
-const OBSERVATION_MS: u64 = MARKER_SLOT_MS * (PLAYERS * MARKER_COUNT) as u64 + 400;
+const MARKER_WINDOW_MS: u64 = MARKER_SLOT_MS * (PLAYERS * MARKER_COUNT) as u64;
+const OBSERVATION_MS: u64 = MARKER_WINDOW_MS + 400;
 type MarkerTimes = [OnceLock<Instant>; MARKER_COUNT];
 
 #[derive(Default)]
@@ -773,7 +774,7 @@ async fn four_players_exchange_pcm_and_chat_through_iroh() -> Result<()> {
 }
 
 async fn four_players() -> Result<()> {
-    let trace = rtp_trace::TraceFile::start()?;
+    let trace = rtp_trace::TraceFile::start(tunnel::limited_relay_requested())?;
     let storage = tempfile::tempdir().map_err(err)?;
     let host_profile = Profile::load(storage.path().join("host"))?;
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
@@ -915,7 +916,14 @@ async fn exercise_four_players(
             let decoded = report_probe("decoded", &decoded, minimum_delivered);
             println!("mixed callback low-level runs describe the entire receiver mix");
             let rendered = report_probe("mixed callback", &rendered, minimum_delivered);
-            decoded.and(rendered)
+            let uplink = if tunnel::limited_relay_requested() {
+                let start = probe.schedule().into_std();
+                let end = start + Duration::from_millis(MARKER_WINDOW_MS);
+                rtp_trace::verify_sfu_uplink(start, end)
+            } else {
+                Ok(())
+            };
+            uplink.and(decoded).and(rendered)
         };
         tokio::select! {
             result = feeds.join_next() => {

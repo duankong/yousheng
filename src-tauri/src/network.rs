@@ -49,6 +49,17 @@ pub(crate) enum TransportEvent {
         rtt_ms: Option<f64>,
         quic_packets_sent: u64,
         quic_packets_lost: u64,
+        quic_udp_payload_bytes_sent: u64,
+        quic_udp_payload_bytes_received: u64,
+        quic_datagram_frames_sent: u64,
+        quic_datagram_frames_received: u64,
+        quic_datagram_send_buffer_free_bytes: usize,
+        forwarded_udp_quic_datagram_admitted_packets: u64,
+        forwarded_udp_quic_datagram_admitted_bytes: u64,
+        forwarded_udp_stream_queue_admitted_packets: u64,
+        forwarded_udp_stream_queue_admitted_bytes: u64,
+        forwarded_udp_receive_admitted_packets: u64,
+        forwarded_udp_receive_admitted_bytes: u64,
         media_stream_fallbacks: u64,
         media_stream_queue_drops: u64,
         media_stream_queue_expirations: u64,
@@ -74,8 +85,31 @@ pub(crate) enum TransportSamplePhase {
 }
 
 #[derive(Default)]
-struct MediaStreamCounters {
-    fallbacks: AtomicU64,
+struct UdpPayloadCounters {
+    packets: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl UdpPayloadCounters {
+    fn record(&self, payload_bytes: usize) {
+        self.bytes
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.packets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn sample(&self) -> (u64, u64) {
+        (
+            self.packets.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Default)]
+struct MediaCounters {
+    udp_datagram: UdpPayloadCounters,
+    udp_stream_queue: UdpPayloadCounters,
+    udp_receive: UdpPayloadCounters,
     queue_drops: AtomicU64,
     queue_expirations: AtomicU64,
     open_timeouts: AtomicU64,
@@ -105,7 +139,7 @@ fn observe_transport(
     conn: &Connection,
     role: Role,
     diagnostics: Diagnostics,
-    media: Arc<MediaStreamCounters>,
+    media: Arc<MediaCounters>,
 ) {
     let link_id = diagnostics.next_id();
     let mut paths = conn.path_events();
@@ -116,6 +150,9 @@ fn observe_transport(
                 .map(|(path, rtt)| (path, Some(rtt.as_secs_f64() * 1000.0)))
                 .unwrap_or(("unknown", None));
             let quic = conn.stats();
+            let (datagram_packets, datagram_bytes) = media.udp_datagram.sample();
+            let (stream_queue_packets, stream_queue_bytes) = media.udp_stream_queue.sample();
+            let (receive_packets, receive_bytes) = media.udp_receive.sample();
             diagnostics.record(Event::Transport(TransportEvent::Sample {
                 link_id,
                 role,
@@ -124,7 +161,18 @@ fn observe_transport(
                 rtt_ms,
                 quic_packets_sent: quic.sent_packets,
                 quic_packets_lost: quic.lost_packets,
-                media_stream_fallbacks: media.fallbacks.load(Ordering::Relaxed),
+                quic_udp_payload_bytes_sent: quic.udp_tx.bytes,
+                quic_udp_payload_bytes_received: quic.udp_rx.bytes,
+                quic_datagram_frames_sent: quic.frame_tx.datagram,
+                quic_datagram_frames_received: quic.frame_rx.datagram,
+                quic_datagram_send_buffer_free_bytes: conn.datagram_send_buffer_space(),
+                forwarded_udp_quic_datagram_admitted_packets: datagram_packets,
+                forwarded_udp_quic_datagram_admitted_bytes: datagram_bytes,
+                forwarded_udp_stream_queue_admitted_packets: stream_queue_packets,
+                forwarded_udp_stream_queue_admitted_bytes: stream_queue_bytes,
+                forwarded_udp_receive_admitted_packets: receive_packets,
+                forwarded_udp_receive_admitted_bytes: receive_bytes,
+                media_stream_fallbacks: stream_queue_packets,
                 media_stream_queue_drops: media.queue_drops.load(Ordering::Relaxed),
                 media_stream_queue_expirations: media.queue_expirations.load(Ordering::Relaxed),
                 media_stream_open_timeouts: media.open_timeouts.load(Ordering::Relaxed),
@@ -395,7 +443,7 @@ async fn run_host(
     })
     .await
     .map_err(err)??;
-    let media_counters = Arc::new(MediaStreamCounters::default());
+    let media_counters = Arc::new(MediaCounters::default());
     observe_transport(conn, Role::Host, diagnostics, media_counters.clone());
     let bridge = conn.clone();
     let streams = tokio::spawn(async move {
@@ -407,7 +455,7 @@ async fn run_host(
             });
         }
     });
-    let outgoing = Arc::new(OutgoingPackets::new(conn, media_counters));
+    let outgoing = Arc::new(OutgoingPackets::new(conn, media_counters.clone()));
     let mut flows = Flows::<HostFlow>::new();
     let result = async {
         let mut expire = tokio::time::interval(FLOW_IDLE);
@@ -457,6 +505,7 @@ async fn run_host(
             };
             #[cfg(test)]
             crate::scenario_tests::rtp_trace::packet("sfu-in", peer, id, &packet[2..]);
+            media_counters.udp_receive.record(packet.len() - 2);
             socket.send(&packet[2..]).await.map_err(err)?;
         }
     }
@@ -475,11 +524,11 @@ struct OutgoingPackets {
     conn: Connection,
     large: mpsc::Sender<(Instant, Bytes)>,
     _stop: oneshot::Sender<()>,
-    counters: Arc<MediaStreamCounters>,
+    counters: Arc<MediaCounters>,
 }
 
 impl OutgoingPackets {
-    fn new(conn: &Connection, counters: Arc<MediaStreamCounters>) -> Self {
+    fn new(conn: &Connection, counters: Arc<MediaCounters>) -> Self {
         let (large, queue) = mpsc::channel(MAX_QUEUED_MEDIA_STREAMS);
         let (stop, stopped) = oneshot::channel();
         tokio::spawn(Self::send_large(
@@ -505,13 +554,16 @@ impl OutgoingPackets {
             .is_some_and(|size| id.len() + payload.len() <= size)
         {
             match self.conn.send_datagram(frame()) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.counters.udp_datagram.record(payload.len());
+                    return Ok(());
+                }
                 Err(SendDatagramError::ConnectionLost(error)) => return Err(err(error)),
                 Err(_) => {}
             }
         }
         if let Ok(slot) = self.large.try_reserve() {
-            self.counters.fallbacks.fetch_add(1, Ordering::Relaxed);
+            self.counters.udp_stream_queue.record(payload.len());
             slot.send((Instant::now() + MEDIA_STREAM_SEND_TIMEOUT, frame()));
         } else {
             self.counters.queue_drops.fetch_add(1, Ordering::Relaxed);
@@ -523,7 +575,7 @@ impl OutgoingPackets {
         conn: Connection,
         mut queue: mpsc::Receiver<(Instant, Bytes)>,
         mut stopped: oneshot::Receiver<()>,
-        counters: Arc<MediaStreamCounters>,
+        counters: Arc<MediaCounters>,
     ) {
         loop {
             let next = tokio::select! {
@@ -663,7 +715,7 @@ impl GuestEndpoint {
         let ip = local_ip();
         let udp = UdpSocket::bind((ip, 0)).await.map_err(err)?;
         let media = SocketAddrV4::new(ip, udp.local_addr().map_err(err)?.port());
-        let media_counters = Arc::new(MediaStreamCounters::default());
+        let media_counters = Arc::new(MediaCounters::default());
         observe_transport(
             &conn,
             Role::Guest,
@@ -686,7 +738,7 @@ impl GuestEndpoint {
         #[cfg(test)]
         let peer = ep.id();
         let media_task = tokio::spawn(async move {
-            let outgoing = OutgoingPackets::new(&media_conn, media_counters);
+            let outgoing = OutgoingPackets::new(&media_conn, media_counters.clone());
             let mut senders = Flows::new();
             let mut buf = vec![0; MAX_PACKET];
             let mut packets = IncomingPackets::default();
@@ -714,6 +766,7 @@ impl GuestEndpoint {
                         if let Some(addr)=senders.get(u16::from_be_bytes([frame[0],frame[1]])) {
                             #[cfg(test)]
                             crate::scenario_tests::rtp_trace::packet("guest-in", peer, addr.port(), &frame[2..]);
+                            media_counters.udp_receive.record(frame.len() - 2);
                             let _=udp.send_to(&frame[2..],addr).await;
                         }
                     }
@@ -795,7 +848,7 @@ mod tests {
         let host = local_endpoint().bind().await.unwrap();
         let guest = local_endpoint().bind().await.unwrap();
         let (guest_conn, host_conn) = connect_local(&host, &guest).await;
-        let counters = Arc::new(MediaStreamCounters::default());
+        let counters = Arc::new(MediaCounters::default());
         let outgoing = OutgoingPackets::new(&host_conn, counters.clone());
         let payload = vec![7; 16_000];
 
@@ -805,8 +858,11 @@ mod tests {
         }
 
         assert_eq!(
-            counters.fallbacks.load(Ordering::Relaxed),
-            MAX_QUEUED_MEDIA_STREAMS as u64
+            counters.udp_stream_queue.sample(),
+            (
+                MAX_QUEUED_MEDIA_STREAMS as u64,
+                (MAX_QUEUED_MEDIA_STREAMS * payload.len()) as u64
+            ),
         );
         assert_eq!(counters.queue_drops.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -844,7 +900,7 @@ mod tests {
             .await
             .unwrap();
         let (_guest_conn, host_conn) = connect_local(&host, &guest).await;
-        let counters = Arc::new(MediaStreamCounters::default());
+        let counters = Arc::new(MediaCounters::default());
         let (outbound, queue) = mpsc::channel(2);
         let (_stop, stopped) = oneshot::channel();
         outbound.try_send((Instant::now(), Bytes::new())).unwrap();
@@ -883,8 +939,10 @@ mod tests {
             unreachable!();
         };
         let key = "a".repeat(64);
+        let diagnostics = Diagnostics::default();
+        let host_diagnostics = diagnostics.clone();
         let host_task = tokio::spawn(async move {
-            run_host(&host_conn, &key, 0, media_addr, Diagnostics::default()).await
+            run_host(&host_conn, &key, 0, media_addr, host_diagnostics).await
         });
         let (mut auth, mut ack) = guest_conn.open_bi().await.unwrap();
         auth.write_all(&[b'a'; 64]).await.unwrap();
@@ -936,6 +994,54 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap_err();
+
+        let directory = tempfile::tempdir().unwrap();
+        let sample = timeout(Duration::from_secs(2), async {
+            loop {
+                let report: serde_json::Value = tokio::task::block_in_place(|| {
+                    let path = diagnostics.export(directory.path()).unwrap();
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+                });
+                let sample = report["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|event| {
+                        let data = &event["data"];
+                        (data["transport_event"] == "sample" && data["phase"] == "final")
+                            .then_some(data)
+                    });
+                if let Some(sample) = sample {
+                    break sample.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport observer did not record a final sample");
+        assert_eq!(sample["forwarded_udp_quic_datagram_admitted_packets"], 1);
+        assert_eq!(
+            sample["forwarded_udp_quic_datagram_admitted_bytes"],
+            b"live audio".len()
+        );
+        assert_eq!(sample["forwarded_udp_stream_queue_admitted_packets"], 1);
+        assert_eq!(
+            sample["forwarded_udp_stream_queue_admitted_bytes"],
+            large.len()
+        );
+        assert_eq!(sample["media_stream_fallbacks"], 1);
+        assert_eq!(sample["forwarded_udp_receive_admitted_packets"], 1);
+        assert_eq!(
+            sample["forwarded_udp_receive_admitted_bytes"],
+            b"probe".len()
+        );
+        assert!(sample["quic_udp_payload_bytes_sent"].as_u64().unwrap() > large.len() as u64);
+        assert!(
+            sample["quic_udp_payload_bytes_received"].as_u64().unwrap() > b"probe".len() as u64
+        );
+        assert!(sample["quic_datagram_frames_sent"].as_u64().unwrap() >= 1);
+        assert!(sample["quic_datagram_frames_received"].as_u64().unwrap() >= 1);
+        assert!(sample["quic_datagram_send_buffer_free_bytes"].is_u64());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -951,7 +1057,7 @@ mod tests {
             .await
             .unwrap();
         let (guest_conn, host_conn) = connect_local(&host, &guest).await;
-        let counters = Arc::new(MediaStreamCounters::default());
+        let counters = Arc::new(MediaCounters::default());
         let outgoing = OutgoingPackets::new(&host_conn, counters.clone());
         let payload = vec![7; 16_000];
         outgoing.send(0x1234, &payload).unwrap();

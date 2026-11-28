@@ -476,9 +476,9 @@ impl Playback {
                     let waited = {
                         let started = Instant::now();
                         let mut mix = mix.lock().unwrap();
-                        let waited = started.elapsed();
-                        mix.mix_block(&mut self.mixed[..end], muted, new_callback.take());
-                        waited
+                        let locked = Instant::now();
+                        mix.mix_block(&mut self.mixed[..end], muted, new_callback.take(), locked);
+                        locked - started
                     };
                     timing.record(waited);
                     remaining -= end;

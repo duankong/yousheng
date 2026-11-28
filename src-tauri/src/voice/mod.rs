@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
 use tokio::{
@@ -32,7 +32,9 @@ use tokio::{
 use crate::diagnostics::Diagnostics;
 use audio::{AudioIo, CallAudio, CaptureControl, PreparedAudioIo, BLOCK, RATE};
 pub use devices::AudioDevices;
-use diagnostics::{CallDiagnostics, ConnectingCall, PcmStats, PlaybackTiming, VoiceState};
+use diagnostics::{
+    CallDiagnostics, ConnectingCall, PcmResidenceWindow, PcmStats, PlaybackTiming, VoiceState,
+};
 
 // Decoded WebRTC sink frames are typically 10 ms each.
 const SDK_PCM_QUEUE_FRAMES: usize = 3;
@@ -120,7 +122,28 @@ struct VoiceTrack {
     player: String,
     gain: f32,
     samples: VecDeque<i16>,
+    batches: VecDeque<PcmBatch>,
     _pump: Task,
+}
+
+struct PcmBatch {
+    enqueued_at: Instant,
+    samples: usize,
+}
+
+impl VoiceTrack {
+    fn advance_pcm_batches(&mut self, mut samples: usize, mut consume: impl FnMut(usize, Instant)) {
+        while samples != 0 {
+            let batch = self.batches.front_mut().unwrap();
+            let count = samples.min(batch.samples);
+            consume(count, batch.enqueued_at);
+            samples -= count;
+            batch.samples -= count;
+            if batch.samples == 0 {
+                self.batches.pop_front();
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -129,6 +152,7 @@ struct Mixer {
     peers: HashMap<String, PeerGain>,
     callback_samples: usize,
     pcm_stats: PcmStats,
+    pcm_residence: PcmResidenceWindow,
 }
 
 impl Mixer {
@@ -159,7 +183,13 @@ impl Mixer {
         MIN_PCM_QUEUE_SAMPLES.max(self.playout_limit())
     }
 
-    fn mix_block(&mut self, output: &mut [f32], muted: bool, callback_samples: Option<usize>) {
+    fn mix_block(
+        &mut self,
+        output: &mut [f32],
+        muted: bool,
+        callback_samples: Option<usize>,
+        mixed_at: Instant,
+    ) {
         let limit = if let Some(callback_samples) = callback_samples {
             self.callback_samples = callback_samples;
             self.playout_limit()
@@ -170,9 +200,16 @@ impl Mixer {
         for track in self.tracks.values_mut() {
             let stale = track.samples.len().saturating_sub(limit);
             let count = (track.samples.len() - stale).min(output.len());
+            let audible = !muted && track.gain != 0.0;
+            track.advance_pcm_batches(stale, |_, _| {});
+            track.advance_pcm_batches(count, |samples, enqueued_at| {
+                if audible {
+                    self.pcm_residence.record(mixed_at - enqueued_at, samples);
+                }
+            });
             let queued = track.samples.drain(..stale + count);
             self.pcm_stats.trimmed_samples_total += stale as u64;
-            if !muted && track.gain != 0.0 {
+            if audible {
                 self.pcm_stats.unfilled_track_samples_total += (output.len() - count) as u64;
                 for (mixed, sample) in output.iter_mut().zip(queued.skip(stale)) {
                     *mixed += f32::from(sample) * track.gain;
@@ -181,7 +218,7 @@ impl Mixer {
         }
     }
 
-    fn push_remote_pcm(&mut self, sid: &TrackSid, samples: &[i16]) -> bool {
+    fn push_remote_pcm(&mut self, sid: &TrackSid, samples: &[i16], enqueued_at: Instant) -> bool {
         let limit = self.pcm_queue_capacity();
         let Some(track) = self.tracks.get_mut(sid) else {
             return false;
@@ -190,7 +227,14 @@ impl Mixer {
         let samples = &samples[skipped_input..];
         let stale = track.samples.len().saturating_sub(limit - samples.len());
         track.samples.drain(..stale);
+        track.advance_pcm_batches(stale, |_, _| {});
         track.samples.extend(samples.iter().copied());
+        if !samples.is_empty() {
+            track.batches.push_back(PcmBatch {
+                enqueued_at,
+                samples: samples.len(),
+            });
+        }
         self.pcm_stats.trimmed_samples_total += (skipped_input + stale) as u64;
         self.pcm_stats.peak_track_queue_samples = self
             .pcm_stats
@@ -208,8 +252,14 @@ impl Mixer {
             .unwrap_or(0);
         let mut sample = self.pcm_stats;
         sample.peak_track_queue_samples = sample.peak_track_queue_samples.max(depth);
+        sample.enqueue_to_mix = self.pcm_residence.sample();
         self.pcm_stats.peak_track_queue_samples = depth;
         sample
+    }
+
+    fn reset_pcm_diagnostics(&mut self) {
+        self.pcm_stats = PcmStats::default();
+        self.pcm_residence = PcmResidenceWindow::default();
     }
 }
 
@@ -703,6 +753,7 @@ pub(crate) async fn join_microphone(
         LocalAudioTrack::create_audio_track("microphone", RtcAudioSource::Native(source.clone()));
     let publish = TrackPublishOptions {
         source: TrackSource::Microphone,
+        audio_encoding: Some(livekit::options::audio::SPEECH.encoding),
         dtx: true,
         ..Default::default()
     };
@@ -776,7 +827,7 @@ impl VoiceEngine {
             *closing = Some(ClosingRoom::new(room));
             return;
         }
-        self.audio.mix.lock().unwrap().pcm_stats = PcmStats::default();
+        self.audio.mix.lock().unwrap().reset_pcm_diagnostics();
         let call = CallAudio {
             source,
             playback_timing: Arc::new(PlaybackTiming::default()),
@@ -1084,17 +1135,19 @@ mod tests {
         assert_eq!(response.await.unwrap(), Ok(()));
     }
 
-    fn add_track(mix: &mut Mixer, id: &str, samples: VecDeque<i16>) -> TrackSid {
+    fn add_track(mix: &mut Mixer, id: &str, mut samples: VecDeque<i16>) -> TrackSid {
         let sid: TrackSid = format!("TR_{id}").try_into().unwrap();
         mix.tracks.insert(
             sid.clone(),
             VoiceTrack {
                 player: id.into(),
                 gain: 1.0,
-                samples,
+                samples: VecDeque::new(),
+                batches: VecDeque::new(),
                 _pump: Task(tokio::spawn(std::future::pending())),
             },
         );
+        mix.push_remote_pcm(&sid, samples.make_contiguous(), Instant::now());
         sid
     }
 
@@ -1118,8 +1171,8 @@ mod tests {
     async fn playout_discards_stale_pcm_before_reaching_the_speaker() {
         let mut mix = Mixer::default();
         let sid = add_track(&mut mix, "one", VecDeque::new());
-        mix.push_remote_pcm(&sid, &[2048; 2880]);
-        mix.push_remote_pcm(&sid, &[4096; 1920]);
+        mix.push_remote_pcm(&sid, &[2048; 2880], Instant::now());
+        mix.push_remote_pcm(&sid, &[4096; 1920], Instant::now());
         let mix = Mutex::new(mix);
         assert_eq!(played_sample(&mix, 1.0), 0.125);
         let mut mix = mix.lock().unwrap();
@@ -1131,18 +1184,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pcm_residence_counts_only_source_samples_mixed_in_the_window() {
+        let mut mixer = Mixer::default();
+        let sid = add_track(&mut mixer, "one", VecDeque::new());
+        mixer.push_remote_pcm(&sid, &[2048; 2000], Instant::now());
+        mixer.push_remote_pcm(&sid, &[4096; 1000], Instant::now());
+        let mix = Mutex::new(mixer);
+        let mut playback = audio::Playback::new(48_000);
+        let mut output = [0.0; 1000];
+        playback.render(0..output.len(), 1.0, &mix, |frame, sample| {
+            output[frame] = sample;
+        });
+        assert_eq!(output[1], 0.0625);
+        assert_eq!(output[920], 0.0625);
+        assert_eq!(output[921], 0.125);
+
+        let sample = serde_json::to_value(mix.lock().unwrap().sample_pcm()).unwrap();
+        assert_eq!(sample["trimmed_samples_total"], 1080);
+        assert_eq!(sample["enqueue_to_mix"]["mixed_source_samples"], 1000);
+        let next = serde_json::to_value(mix.lock().unwrap().sample_pcm()).unwrap();
+        assert!(next["enqueue_to_mix"].is_null());
+
+        playback.render(0..700, 0.0, &mix, |_, sample| assert_eq!(sample, 0.0));
+        playback.render(0..300, 1.0, &mix, |_, _| {});
+        let next = serde_json::to_value(mix.lock().unwrap().sample_pcm()).unwrap();
+        assert_eq!(next["unfilled_track_samples_total"], 80);
+        assert_eq!(next["enqueue_to_mix"]["mixed_source_samples"], 220);
+
+        let mut mixer = mix.lock().unwrap();
+        mixer.push_remote_pcm(&sid, &[8192; 480], Instant::now());
+        mixer.tracks.remove(&sid);
+        drop(mixer);
+        playback.render(0..480, 1.0, &mix, |_, _| {});
+        let empty = serde_json::to_value(mix.lock().unwrap().sample_pcm()).unwrap();
+        assert!(empty["enqueue_to_mix"].is_null());
+    }
+
+    #[tokio::test]
+    async fn pcm_residence_weights_each_track_sample_at_its_mix_time() {
+        let mut mix = Mixer::default();
+        let first = add_track(&mut mix, "first", VecDeque::new());
+        let second = add_track(&mut mix, "second", VecDeque::new());
+        let start = Instant::now();
+        mix.push_remote_pcm(&first, &[2048; 3], start);
+        mix.push_remote_pcm(&first, &[], start);
+        mix.push_remote_pcm(&second, &[4096; 150], start + Duration::from_millis(8));
+
+        mix.mix_block(
+            &mut [0.0; 100],
+            false,
+            None,
+            start + Duration::from_millis(10),
+        );
+        let first = serde_json::to_value(mix.sample_pcm()).unwrap();
+        assert_eq!(
+            first["enqueue_to_mix"],
+            serde_json::json!({
+                "mixed_source_samples": 103,
+                "p95_us": 2047,
+                "p99_us": 10_000,
+                "max_us": 10_000
+            })
+        );
+
+        mix.mix_block(
+            &mut [0.0; 50],
+            false,
+            None,
+            start + Duration::from_millis(14),
+        );
+        let second = serde_json::to_value(mix.sample_pcm()).unwrap();
+        assert_eq!(
+            second["enqueue_to_mix"],
+            serde_json::json!({
+                "mixed_source_samples": 50,
+                "p95_us": 6000,
+                "p99_us": 6000,
+                "max_us": 6000
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn playout_queue_adapts_to_the_device_callback_length() {
         let mix = Mutex::new(Mixer::default());
         let sid = add_track(&mut mix.lock().unwrap(), "one", VecDeque::new());
         let mut playback = audio::Playback::new(44_100);
         playback.render(0..2205, 1.0, &mix, |_, _| {});
-        mix.lock().unwrap().push_remote_pcm(&sid, &[4096; 2400]);
+        mix.lock()
+            .unwrap()
+            .push_remote_pcm(&sid, &[4096; 2400], Instant::now());
         let mut played = 0.0;
         playback.render(0..2205, 1.0, &mix, |_, sample| played = sample);
         assert_eq!(played, 0.125);
 
-        mix.lock().unwrap().push_remote_pcm(&sid, &[4096; 480]);
-        mix.lock().unwrap().push_remote_pcm(&sid, &[8192; 1920]);
+        let mut mixer = mix.lock().unwrap();
+        mixer.push_remote_pcm(&sid, &[4096; 480], Instant::now());
+        mixer.push_remote_pcm(&sid, &[8192; 1920], Instant::now());
+        drop(mixer);
         assert_eq!(played_sample(&mix, 1.0), 0.25);
     }
 
@@ -1155,7 +1294,9 @@ mod tests {
 
         let levels = [2048, 4096, 6144, 8192, 10240];
         for level in levels {
-            mix.lock().unwrap().push_remote_pcm(&sid, &[level; BLOCK]);
+            mix.lock()
+                .unwrap()
+                .push_remote_pcm(&sid, &[level; BLOCK], Instant::now());
         }
 
         let mut played = [0.0; 2205];
@@ -1171,6 +1312,8 @@ mod tests {
                 block[440]
             );
         }
+        let pcm = serde_json::to_value(mix.lock().unwrap().sample_pcm()).unwrap();
+        assert_eq!(pcm["enqueue_to_mix"]["mixed_source_samples"], 2400);
     }
 
     #[tokio::test]
@@ -1257,12 +1400,14 @@ fn attach_remote_track(mix: &Arc<Mutex<Mixer>>, track: RemoteAudioTrack, player:
     let key = sid.clone();
     let capacity = mix.lock().unwrap().pcm_queue_capacity();
     let samples = VecDeque::with_capacity(capacity);
+    let batches = VecDeque::with_capacity(capacity.div_ceil(BLOCK) + 1);
     let mut mix = mix.lock().unwrap();
     let gain = mix.gain(&player);
     let pump = Task(tokio::spawn(async move {
         while let Some(frame) = stream.next().await {
             let Some(mix) = weak.upgrade() else { break };
-            if !mix.lock().unwrap().push_remote_pcm(&key, &frame.data) {
+            let mut mixer = mix.lock().unwrap();
+            if !mixer.push_remote_pcm(&key, &frame.data, Instant::now()) {
                 break;
             }
         }
@@ -1273,6 +1418,7 @@ fn attach_remote_track(mix: &Arc<Mutex<Mixer>>, track: RemoteAudioTrack, player:
             player,
             gain,
             samples,
+            batches,
             _pump: pump,
         },
     );

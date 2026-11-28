@@ -17,6 +17,7 @@ enum Event {
         sequence: u16,
         timestamp: u32,
         ssrc: u32,
+        bytes: usize,
     },
     Marker {
         sender: usize,
@@ -33,9 +34,9 @@ struct Trace {
 pub(super) struct TraceFile(Option<PathBuf>);
 
 impl TraceFile {
-    pub(super) fn start() -> Result<Self, String> {
+    pub(super) fn start(measure_uplink: bool) -> Result<Self, String> {
         let path = std::env::var_os("DUIPIN_TEST_RTP_TRACE").map(PathBuf::from);
-        if path.is_some() {
+        if measure_uplink || path.is_some() {
             TRACE
                 .set(Mutex::new(Trace {
                     start: Instant::now(),
@@ -62,6 +63,7 @@ impl TraceFile {
                     sequence,
                     timestamp,
                     ssrc,
+                    ..
                 } => {
                     writeln!(
                         file,
@@ -86,6 +88,39 @@ impl TraceFile {
         }
         file.flush().map_err(super::err)
     }
+}
+
+pub(super) fn verify_sfu_uplink(start: Instant, end: Instant) -> Result<(), String> {
+    const MAX_SRTP_KBPS: f64 = 800.;
+    let trace = TRACE.get().ok_or("SFU uplink capture was not started")?;
+    let trace = trace.lock().unwrap();
+    if trace.events.len() == CAPACITY {
+        return Err("RTP trace reached its capture limit".into());
+    }
+    let mut packets = 0;
+    let mut bytes = 0;
+    for (at, stage, event) in &trace.events {
+        if *stage == "sfu-out" && (start..end).contains(at) {
+            if let Event::Packet { bytes: size, .. } = event {
+                packets += 1;
+                bytes += size;
+            }
+        }
+    }
+    if packets == 0 {
+        return Err("no outbound SFU SRTP packets captured during the PCM probe".into());
+    }
+    let seconds = (end - start).as_secs_f64();
+    let kbps = 8. * bytes as f64 / (seconds * 1000.);
+    println!(
+        "host relay uplink at the SFU proxy: {kbps:.1} kb/s SRTP, {packets} packets, {bytes} bytes over {seconds:.1} s (budget {MAX_SRTP_KBPS:.0} kb/s)"
+    );
+    if kbps > MAX_SRTP_KBPS {
+        return Err(format!(
+            "host relay SRTP uplink exceeded budget ({kbps:.1} > {MAX_SRTP_KBPS:.0} kb/s)"
+        ));
+    }
+    Ok(())
 }
 
 fn record(at: Instant, stage: &'static str, event: Event) {
@@ -115,6 +150,7 @@ pub(crate) fn packet(stage: &'static str, peer: EndpointId, flow: u16, data: &[u
             sequence: u16::from_be_bytes(data[2..4].try_into().unwrap()),
             timestamp: u32::from_be_bytes(data[4..8].try_into().unwrap()),
             ssrc: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            bytes: data.len(),
         },
     );
 }

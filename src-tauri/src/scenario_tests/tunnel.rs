@@ -21,12 +21,19 @@ async fn authenticated_tunnel_carries_tcp_and_both_udp_sizes() -> Result<(), Str
 pub(super) async fn with_requested_relay<F: Future<Output = Result<(), String>>>(
     test: F,
 ) -> Result<(), String> {
-    if std::env::var("DUIPIN_TEST_LOCAL_RELAY").as_deref() != Ok("1") {
+    if !local_relay_requested() {
         return test.await;
     }
-    use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+    use iroh_relay::server::{ClientRateLimit, RelayConfig, Server, ServerConfig};
     let mut config = ServerConfig::default();
-    config.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0)));
+    let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+    if limited_relay_requested() {
+        relay.limits.client_rx = Some(ClientRateLimit::new(
+            std::num::NonZeroU32::new(128_000).unwrap(),
+        ));
+        println!("relay incoming limit: 128000 bytes/s per endpoint");
+    }
+    config.relay = Some(relay);
     let server = Server::spawn(config).await.map_err(|e| e.to_string())?;
     let addr = server.http_addr().ok_or("test relay failed to bind")?;
     let url: iroh::RelayUrl = format!("http://{addr}")
@@ -43,8 +50,15 @@ pub(super) async fn with_requested_relay<F: Future<Output = Result<(), String>>>
 }
 
 pub(super) fn expect_relay() -> bool {
-    std::env::var("DUIPIN_FORCE_RELAY").as_deref() == Ok("1")
-        || std::env::var("DUIPIN_TEST_LOCAL_RELAY").as_deref() == Ok("1")
+    std::env::var("DUIPIN_FORCE_RELAY").as_deref() == Ok("1") || local_relay_requested()
+}
+
+fn local_relay_requested() -> bool {
+    std::env::var("DUIPIN_TEST_LOCAL_RELAY").as_deref() == Ok("1")
+}
+
+pub(super) fn limited_relay_requested() -> bool {
+    local_relay_requested() && std::env::var("DUIPIN_TEST_RELAY_LIMIT_128KB").as_deref() == Ok("1")
 }
 
 async fn tunnel_exchange() -> Result<(), String> {

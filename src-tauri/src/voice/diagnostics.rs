@@ -72,6 +72,45 @@ pub(crate) struct PcmStats {
     pub(super) peak_track_queue_samples: usize,
     pub(super) trimmed_samples_total: u64,
     pub(super) unfilled_track_samples_total: u64,
+    pub(super) enqueue_to_mix: Option<PcmResidenceStats>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct PcmResidenceStats {
+    mixed_source_samples: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+#[derive(Default)]
+pub(super) struct PcmResidenceWindow {
+    mixed_source_samples: u64,
+    max_us: u64,
+    durations: TimingHistogram,
+}
+
+impl PcmResidenceWindow {
+    pub(super) fn record(&mut self, duration: Duration, samples: usize) {
+        let micros = duration.as_micros() as u64;
+        self.mixed_source_samples += samples as u64;
+        self.max_us = self.max_us.max(micros);
+        self.durations.record_weighted(micros, samples as u64);
+    }
+
+    pub(super) fn sample(&mut self) -> Option<PcmResidenceStats> {
+        let Self {
+            mixed_source_samples,
+            max_us,
+            durations,
+        } = std::mem::take(self);
+        Some(PcmResidenceStats {
+            mixed_source_samples,
+            p95_us: durations.percentile(mixed_source_samples, 95, max_us)?,
+            p99_us: durations.percentile(mixed_source_samples, 99, max_us)?,
+            max_us,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -118,9 +157,13 @@ struct TimingHistogram([u64; 20]);
 
 impl TimingHistogram {
     fn record(&mut self, micros: u64) {
+        self.record_weighted(micros, 1);
+    }
+
+    fn record_weighted(&mut self, micros: u64, count: u64) {
         let bucket = (u64::BITS - micros.leading_zeros()) as usize;
         let last = self.0.len() - 1;
-        self.0[bucket.min(last)] += 1;
+        self.0[bucket.min(last)] += count;
     }
 
     fn percentile(&self, count: u64, percentile: u64, max: u64) -> Option<u64> {
