@@ -1,5 +1,6 @@
 use crate::{
     chat::{ChatMessage, HISTORY_LIMIT},
+    diagnostics::{RoomDiagnostics, RoomPhase},
     lobby::ROOM_PROTOCOL,
     voice::VoiceEngine,
 };
@@ -242,25 +243,38 @@ pub(crate) fn emit_room(app: &AppHandle, session_id: &str, mut event: Value) {
 }
 
 impl AcceptedRoom {
-    pub(crate) async fn connect(port: u16, mut hello: Value) -> Result<Self, String> {
+    pub(crate) async fn connect(
+        port: u16,
+        mut hello: Value,
+        diagnostics: &RoomDiagnostics,
+    ) -> Result<Self, String> {
         let base = format!("ws://127.0.0.1:{port}");
-        let (mut ws, _) = timeout(Duration::from_secs(10), connect_async(format!("{base}/ws")))
-            .await
-            .map_err(|_| "房间连接超时".to_owned())?
-            .map_err(|e| format!("无法连接房间：{e}"))?;
+        let (mut ws, _) = diagnostics
+            .measure(RoomPhase::OpenRoomSocket, async {
+                timeout(Duration::from_secs(10), connect_async(format!("{base}/ws")))
+                    .await
+                    .map_err(|_| "房间连接超时".to_owned())?
+                    .map_err(|e| format!("无法连接房间：{e}"))
+            })
+            .await?;
         hello["roomProtocol"] = ROOM_PROTOCOL.into();
-        ws.send(Message::Text(hello.to_string().into()))
-            .await
-            .map_err(|e| e.to_string())?;
-        let first = timeout(Duration::from_secs(10), ws.next())
-            .await
-            .map_err(|_| "房间没有回应".to_owned())?
-            .ok_or("房间已关闭")?
-            .map_err(|e| e.to_string())?;
-        let mut initial: Value = serde_json::from_str(first.to_text().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
         let mut chat_cursor = ChatCursor::default();
-        decode_snapshot(&mut initial, None, &mut chat_cursor)?;
+        let initial = diagnostics
+            .measure(RoomPhase::FirstRoomSnapshot, async {
+                ws.send(Message::Text(hello.to_string().into()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let first = timeout(Duration::from_secs(10), ws.next())
+                    .await
+                    .map_err(|_| "房间没有回应".to_owned())?
+                    .ok_or("房间已关闭")?
+                    .map_err(|e| e.to_string())?;
+                let mut initial = serde_json::from_str(first.to_text().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                decode_snapshot(&mut initial, None, &mut chat_cursor)?;
+                Ok::<_, String>(initial)
+            })
+            .await?;
         Ok(Self {
             ws,
             base,
@@ -547,7 +561,9 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         });
-        let result = AcceptedRoom::connect(port, json!({"type":"hello"})).await;
+        let diagnostics =
+            crate::diagnostics::Diagnostics::default().room(crate::diagnostics::Role::Guest);
+        let result = AcceptedRoom::connect(port, json!({"type":"hello"}), &diagnostics).await;
         host.await.unwrap();
         result
     }

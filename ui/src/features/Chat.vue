@@ -1,17 +1,8 @@
-<script lang="ts">
-export interface ChatAttempt { id: number; original: string; error: string }
-export function chatSendHint(attempts: ChatAttempt[], text: string): string {
-  const duplicate = attempts.find(item => item.original.trim() === text.trim())
-  if (duplicate) return duplicate.error ? '相同内容尚未确认，请先核对记录' : '相同内容正在等待房主确认'
-  if (attempts.filter(item => !item.error).length >= 8) return '已有 8 条消息等待确认，稍后可继续发送'
-  return ''
-}
-</script>
-
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type { Snapshot } from '../model'
 import PlayerAvatar from './PlayerAvatar.vue'
+import { chatSendHint, type ChatAttempt } from './useChat'
 
 const props = defineProps<{ snapshot: Snapshot; host: boolean; outbox: ChatAttempt[]; busy: boolean }>()
 const draft = defineModel<string>({ required: true })

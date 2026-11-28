@@ -8,6 +8,14 @@ interface RoomSession {
   snapshot: Snapshot
 }
 
+interface RoomOpening {
+  id: string
+  snapshot?: Snapshot
+  offline?: string
+  error?: string
+  cancellation?: Promise<boolean>
+}
+
 function applySnapshot(update: SnapshotUpdate, previous?: Snapshot): Snapshot | undefined {
   const { messagesAfter, retainedMessageCount, ...snapshot } = update
   let messages = snapshot.messages
@@ -24,7 +32,7 @@ function applySnapshot(update: SnapshotUpdate, previous?: Snapshot): Snapshot | 
   return { ...snapshot, members, messages }
 }
 
-export function useLobby(openInvite: (link: string) => void) {
+export function useLobby(openInvite: (link: string) => void, preserveChat?: (room: Snapshot) => void) {
   const preferences = ref<Preferences>()
   const current = shallowRef<RoomSession>()
   const session = computed(() => current.value?.session)
@@ -40,6 +48,8 @@ export function useLobby(openInvite: (link: string) => void) {
   const speakers = ref<string[]>([])
   const level = ref(0)
   const voice = ref<VoiceStatus>({ state: 'disconnected' })
+  const previewError = ref('')
+  const joinStatus = ref<'waiting' | 'cancelling' | 'finishing'>()
   const voiceRetry = shallowRef<{ sessionId: string }>()
   const retryingVoice = computed(() => !!voiceRetry.value && voiceRetry.value.sessionId === session.value?.id)
   const inVoice = computed(() => ['connected', 'online', 'ready'].includes(voice.value.state))
@@ -56,7 +66,9 @@ export function useLobby(openInvite: (link: string) => void) {
   let historyVersion = 0
   let manuallyClosed = false
   let restoreWhenIdle = false
-  let pending: { id: string; snapshot?: Snapshot; offline?: string; error?: string } | undefined
+  let pending: RoomOpening | undefined
+  let joining: Promise<boolean> | undefined
+  let leaving: string | undefined
 
   async function refreshHistory() {
     const version = ++historyVersion
@@ -107,8 +119,10 @@ export function useLobby(openInvite: (link: string) => void) {
     if (event.type === 'snapshot') {
       const next = applySnapshot(event, room.snapshot)
       if (next) current.value = { session: room.session, snapshot: next }
-    } else if (event.type === 'offline') disconnected(event.message, room.session.isHost)
-    else error.value = event.message
+    } else if (event.type === 'offline') {
+      if (leaving !== room.session.id) preserveChat?.(room.snapshot)
+      disconnected(event.message, room.session.isHost)
+    } else error.value = event.message
   }
 
   async function subscribe<T>(name: string, handle: (payload: T) => void) {
@@ -130,6 +144,7 @@ export function useLobby(openInvite: (link: string) => void) {
             level.value = 0
           }
         }),
+        subscribe<string>('voice-preview-error', message => { previewError.value = message }),
         subscribe<{ level: number }>('voice-level', e => { level.value = e.level }),
         subscribe<string[]>('speakers', ids => { speakers.value = ids }),
         subscribe<string>('invite-open', link => { if (ready.value) openInvite(link); else pendingInvite = link }),
@@ -147,12 +162,15 @@ export function useLobby(openInvite: (link: string) => void) {
 
   async function openSession(invite?: string, keepNotice = false) {
     if (!preferences.value?.nickname.trim()) throw new Error('请先设置昵称')
-    const attempt = { id: crypto.randomUUID() } as NonNullable<typeof pending>
+    const attempt: RoomOpening = { id: crypto.randomUUID() }
     pending = attempt
+    if (invite) joinStatus.value = 'waiting'
     try {
-      const result = invite
-        ? await invoke<Session & { snapshot: Snapshot; historyError?: string }>('join_lobby', { sessionId: attempt.id, invite })
-        : await invoke<Session & { snapshot: Snapshot }>('host_lobby', { sessionId: attempt.id })
+      const args = { sessionId: attempt.id }
+      const result = await invoke<Session & { snapshot: Snapshot; historyError?: string }>(
+        invite ? 'join_lobby' : 'host_lobby', invite ? { ...args, invite } : args,
+      )
+      if (attempt.cancellation && await attempt.cancellation) return false
       if (attempt.offline) {
         disconnected(attempt.offline, result.isHost)
         throw new Error(attempt.offline)
@@ -164,18 +182,24 @@ export function useLobby(openInvite: (link: string) => void) {
       if (attempt.error) error.value = attempt.error
       if (!isHost) {
         void refreshHistory()
-        if ('historyError' in result && typeof result.historyError === 'string') error.value = result.historyError
+        if (result.historyError) error.value = result.historyError
       }
-    } finally { pending = undefined }
+      return true
+    } catch (reason) {
+      if (attempt.cancellation && await attempt.cancellation) return false
+      throw reason
+    } finally {
+      pending = undefined
+      joinStatus.value = undefined
+    }
   }
 
-  async function run(operation: () => Promise<void>) {
+  async function run(operation: () => Promise<boolean | void>) {
     if (busy.value) return false
     busy.value = true
     error.value = ''
     try {
-      await operation()
-      return true
+      return (await operation()) !== false
     } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason); return false }
     finally {
       busy.value = false
@@ -184,21 +208,59 @@ export function useLobby(openInvite: (link: string) => void) {
   }
 
   function connect(invite?: string) {
-    return run(async () => {
-      if (!invite) manuallyClosed = false
-      await openSession(invite)
+    if (busy.value) return Promise.resolve(false)
+    if (!invite) return run(() => {
+      manuallyClosed = false
+      return openSession()
     })
+    const task = run(() => openSession(invite))
+    joining = task
+    void task.then(() => { if (joining === task) joining = undefined })
+    return task
   }
 
-  function leave() {
+  function requestJoinCancellation() {
+    const attempt = pending
+    if (!attempt || !joinStatus.value) return Promise.resolve(false)
+    if (attempt.cancellation) return attempt.cancellation
+    joinStatus.value = 'cancelling'
+    attempt.cancellation = invoke<boolean>('cancel_join', { sessionId: attempt.id }).then(cancelled => {
+      if (!cancelled) joinStatus.value = 'finishing'
+      return cancelled
+    }, reason => {
+      attempt.cancellation = undefined
+      joinStatus.value = 'waiting'
+      error.value = String(reason)
+      return false
+    })
+    return attempt.cancellation
+  }
+
+  async function cancelJoin() {
+    const task = joining
+    const cancelled = await requestJoinCancellation()
+    if (cancelled) await task
+    return cancelled
+  }
+
+  async function leave() {
     const room = session.value
-    if (!room) return Promise.resolve(false)
+    if (!room) return false
+    if (joining) {
+      const task = joining
+      await requestJoinCancellation()
+      await task
+      if (session.value?.id !== room.id) return false
+    }
     return run(async () => {
-      await invoke('leave_lobby', { sessionId: room.id })
-      clearSession()
-      offline.value = ''
-      if (room.isHost) manuallyClosed = true
-      else restoreWhenIdle = true
+      leaving = room.id
+      try {
+        await invoke('leave_lobby', { sessionId: room.id })
+        clearSession()
+        offline.value = ''
+        if (room.isHost) manuallyClosed = true
+        else restoreWhenIdle = true
+      } finally { leaving = undefined }
     })
   }
 
@@ -218,6 +280,6 @@ export function useLobby(openInvite: (link: string) => void) {
     }
   }
 
-  return { preferences, session, snapshot, ready, busy, offline, error, speakers, level, voice,
-    active, inVoice, voiceLabel, connect, leave, retryVoice, retryingVoice, history, historyLoading, historyError, refreshHistory }
+  return { preferences, session, snapshot, ready, busy, offline, error, speakers, level, voice, previewError,
+    active, inVoice, voiceLabel, connect, joinStatus, cancelJoin, leave, retryVoice, retryingVoice, history, historyLoading, historyError, refreshHistory }
 }

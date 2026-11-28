@@ -2,7 +2,7 @@ pub(crate) mod rtp_trace;
 mod tunnel;
 
 use crate::{
-    host::Host,
+    host::{Host, HostIdentity},
     lobby::ROOM_PROTOCOL,
     network::{GuestEndpoint, Ticket},
     preferences::Profile,
@@ -732,8 +732,9 @@ async fn two_clients() -> Result<()> {
     let guest_profile = Profile::load(storage.path().join("guest"))?;
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
     let host = Host::start(
-        &host_profile,
+        &HostIdentity::from(&host_profile),
         &binary,
+        host_profile.settings.nickname.clone(),
         crate::diagnostics::Diagnostics::default(),
     )
     .await?;
@@ -744,8 +745,9 @@ async fn two_clients() -> Result<()> {
                 .share_invite(host_profile.invite_key.clone())
                 .await?,
         )?;
-        let guest =
-            GuestEndpoint::start(&invite, crate::diagnostics::Diagnostics::default()).await?;
+        let diagnostics =
+            crate::diagnostics::Diagnostics::default().room(crate::diagnostics::Role::Guest);
+        let guest = GuestEndpoint::start(&invite, &diagnostics).await?;
         let result = exercise(&host, &guest, &guest_profile, &invite.key).await.and_then(|()| {
             let route = guest.selected_transport().ok_or("iroh has no selected path")?;
             if tunnel::expect_relay() && route != "relay" {
@@ -776,8 +778,9 @@ async fn four_players() -> Result<()> {
     let host_profile = Profile::load(storage.path().join("host"))?;
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/livekit-server.exe");
     let host = Host::start(
-        &host_profile,
+        &HostIdentity::from(&host_profile),
         &binary,
+        host_profile.settings.nickname.clone(),
         crate::diagnostics::Diagnostics::default(),
     )
     .await?;
@@ -785,9 +788,9 @@ async fn four_players() -> Result<()> {
     let scenario = async {
         let invite = Ticket::parse(&host.overlay.share_invite(host_profile.invite_key).await?)?;
         for _ in 0..3 {
-            guests.push(
-                GuestEndpoint::start(&invite, crate::diagnostics::Diagnostics::default()).await?,
-            );
+            let diagnostics =
+                crate::diagnostics::Diagnostics::default().room(crate::diagnostics::Role::Guest);
+            guests.push(GuestEndpoint::start(&invite, &diagnostics).await?);
         }
         exercise_four_players(&host, &guests, &invite.key, storage.path()).await
     };

@@ -16,6 +16,23 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub(crate) struct HostIdentity {
+    key: [u8; 32],
+    pub(crate) invite_key: String,
+    credential: String,
+}
+
+impl From<&Profile> for HostIdentity {
+    fn from(profile: &Profile) -> Self {
+        let owner = iroh::SecretKey::from_bytes(&profile.host_key).public();
+        Self {
+            key: profile.host_key,
+            invite_key: profile.invite_key.clone(),
+            credential: profile.player_credential(&owner.to_string()),
+        }
+    }
+}
+
 pub struct Host {
     media: Child,
     room: lobby::RoomControl,
@@ -35,9 +52,10 @@ fn unused_tcp_port() -> Result<u16, String> {
 }
 
 impl Host {
-    pub async fn start(
-        profile: &Profile,
+    pub(crate) async fn start(
+        identity: &HostIdentity,
         executable: &Path,
+        owner_nickname: String,
         diagnostics: Diagnostics,
     ) -> Result<Self, String> {
         if !executable.is_file() {
@@ -99,21 +117,22 @@ impl Host {
         .await
         .map_err(|_| "等待语音服务启动超时".to_string())?;
         ready?;
-        let overlay = network::HostEndpoint::start(
-            profile.host_key,
-            profile.invite_key.clone(),
+        // Keep iroh's bind future off the optimized Windows IPC stack.
+        let overlay = Box::pin(network::HostEndpoint::start(
+            identity.key,
+            identity.invite_key.clone(),
             gateway,
             SocketAddrV4::new(media_ip, media_port),
             diagnostics,
-        )
+        ))
         .await?;
-        let credential = profile.player_credential(&overlay.id());
+        let invite = overlay.invite(&identity.invite_key)?;
         let (stop, mut stopping) = watch::channel(false);
         let (router, room) = lobby::router_with_shutdown(
             lobby::Config {
-                owner_identity: credential.clone(),
-                owner_nickname: profile.settings.nickname.clone(),
-                invite_key: profile.invite_key.clone(),
+                owner_identity: identity.credential.clone(),
+                owner_nickname,
+                invite_key: identity.invite_key.clone(),
                 livekit_key: api_key,
                 livekit_secret: api_secret,
                 livekit_http_url: format!("http://127.0.0.1:{signaling}"),
@@ -127,7 +146,6 @@ impl Host {
                 })
                 .await;
         });
-        let invite = overlay.invite(&profile.invite_key)?;
         Ok(Self {
             media,
             room,
@@ -136,7 +154,7 @@ impl Host {
             overlay,
             gateway,
             invite,
-            credential,
+            credential: identity.credential.clone(),
         })
     }
 

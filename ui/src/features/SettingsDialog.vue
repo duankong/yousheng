@@ -15,7 +15,7 @@ const tabs = [
   { id: 'diagnostics', label: '通话诊断', icon: Activity },
 ] as const
 type Tab = typeof tabs[number]['id']
-const props = defineProps<{ tab: Tab; controls: AudioControls; level: number; speaking: boolean; connected: boolean; updater: Updater }>()
+const props = defineProps<{ tab: Tab; controls: AudioControls; level: number; speaking: boolean; connected: boolean; previewError: string; updater: Updater }>()
 const emit = defineEmits<{ close: []; tab: [tab: Tab] }>()
 const audioForm = ref<InstanceType<typeof AudioSettingsView>>()
 const content = ref<HTMLElement>()
@@ -69,7 +69,8 @@ async function exportDiagnostics() {
         </button>
       </div>
       <div id="settings-content" ref="content" class="settings-content" role="region" :aria-labelledby="`settings-${tab}`" tabindex="0">
-        <AudioSettingsView ref="audioForm" v-show="tab === 'audio'" :inert="leaving" :visible="tab === 'audio'" :controls="controls" :level="level" :speaking="speaking" :connected="connected" />
+        <AudioSettingsView ref="audioForm" v-show="tab === 'audio'" :inert="leaving" :visible="tab === 'audio'" :controls="controls"
+          :level="level" :speaking="speaking" :connected="connected" :preview-error="previewError" />
         <section v-if="tab === 'updates'" class="settings-section update-settings">
           <p class="section-description">友声 GroveCall · 当前版本 {{ version }}</p>
           <label class="switch-row">启动时自动检查更新<input type="checkbox" role="switch" :checked="updater.enabled" :disabled="locked" @change="toggleUpdates" /></label>

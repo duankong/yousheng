@@ -25,7 +25,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use tokio::{
-    sync::{mpsc, watch, Mutex as AsyncMutex},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify},
     task::JoinHandle,
 };
 
@@ -39,7 +39,7 @@ const SDK_PCM_QUEUE_FRAMES: usize = 3;
 const NORMAL_PLAYOUT_SAMPLES: usize = 4 * BLOCK;
 const MIN_PCM_QUEUE_SAMPLES: usize = 6 * BLOCK;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AudioSettings {
     pub mode: String,
@@ -74,6 +74,10 @@ impl Default for AudioSettings {
 }
 
 impl AudioSettings {
+    fn same_devices(&self, other: &Self) -> bool {
+        self.input_device == other.input_device && self.output_device == other.output_device
+    }
+
     fn playback_gain(&self) -> f32 {
         if self.output_muted {
             0.0
@@ -216,6 +220,10 @@ fn status(app: &AppHandle, state: &str, message: Option<&str>) {
     );
 }
 
+fn preview_status(app: &AppHandle, error: &str) {
+    let _ = app.emit("voice-preview-error", error);
+}
+
 fn silence(app: &AppHandle) {
     let _ = app.emit("speakers", Vec::<String>::new());
     let _ = app.emit("voice-level", serde_json::json!({"level":0}));
@@ -223,10 +231,119 @@ fn silence(app: &AppHandle) {
 
 struct Session {
     room: Arc<Room>,
-    call: CallAudio,
-    io: Arc<AsyncMutex<Option<AudioIo>>>,
+    devices: Arc<CallDevices>,
+    configure: mpsc::Sender<ConfigureDevices>,
+    stop_devices: watch::Sender<Option<StopDevices>>,
+    recovery: JoinHandle<()>,
     events: Task,
     diagnostics: CallDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+enum StopDevices {
+    Stop,
+    ResumePreview,
+}
+
+struct ConfigureDevices {
+    revision: u64,
+    previous: AudioSettings,
+    requested: AudioSettings,
+    complete: oneshot::Sender<Result<(), String>>,
+}
+
+type ConfigureResult = oneshot::Receiver<Result<(), String>>;
+
+#[derive(Default)]
+struct CallDevices {
+    current: Mutex<CurrentDevices>,
+    changed: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct CurrentDevices {
+    io: Option<AudioIo>,
+    error: Option<String>,
+    stopping: bool,
+    pending: Option<u64>,
+}
+
+impl CurrentDevices {
+    fn owns_input(&self) -> bool {
+        self.io.is_some() || self.stopping
+    }
+
+    fn is_requested(&self, revision: Option<u64>) -> bool {
+        self.pending == revision
+    }
+
+    fn take_io(&mut self) -> Option<AudioIo> {
+        let old = self.io.take();
+        self.stopping = old.is_some();
+        old
+    }
+
+    fn queue_switch(
+        &mut self,
+        configure: &mpsc::Sender<ConfigureDevices>,
+        previous: AudioSettings,
+        requested: AudioSettings,
+    ) -> Result<ConfigureResult, String> {
+        let (complete, response) = oneshot::channel();
+        let revision = self.pending.unwrap_or(0).wrapping_add(1);
+        configure
+            .try_send(ConfigureDevices {
+                revision,
+                previous,
+                requested,
+                complete,
+            })
+            .map_err(|_| "声音设备正在切换，请稍后重试".to_owned())?;
+        self.pending = Some(revision);
+        Ok(response)
+    }
+}
+
+#[derive(PartialEq)]
+enum DeviceReadiness {
+    Starting,
+    Ready,
+    Failed(String),
+}
+
+impl CallDevices {
+    fn readiness(&self) -> DeviceReadiness {
+        let current = self.current.lock().unwrap();
+        if let Some(error) = current.io.as_ref().and_then(AudioIo::failure) {
+            DeviceReadiness::Failed(error)
+        } else if current.io.as_ref().is_some_and(AudioIo::active) {
+            DeviceReadiness::Ready
+        } else if let Some(error) = &current.error {
+            DeviceReadiness::Failed(error.clone())
+        } else {
+            DeviceReadiness::Starting
+        }
+    }
+
+    fn stop(&self, stopped: &watch::Sender<Option<StopDevices>>, end: StopDevices) {
+        let current = self.current.lock().unwrap();
+        stopped.send_if_modified(|stop| {
+            if stop.is_none()
+                || matches!(
+                    (*stop, end),
+                    (Some(StopDevices::ResumePreview), StopDevices::Stop)
+                )
+            {
+                *stop = Some(end);
+                true
+            } else {
+                false
+            }
+        });
+        if let Some(io) = current.io.as_ref() {
+            io.deactivate();
+        }
+    }
 }
 
 fn call_is_active(state: ConnectionState) -> bool {
@@ -260,32 +377,51 @@ impl Drop for SpeakerPreviewGuard<'_> {
 }
 
 fn stop_speaker_preview(stream: &Mutex<Option<cpal::Stream>>) {
-    let mut stream = stream.lock().unwrap();
-    drop(stream.take());
+    let stopped = stream.lock().unwrap().take();
+    drop(stopped);
 }
 
 struct UninstalledRoom<'a> {
     room: Option<Arc<Room>>,
-    closing: &'a mut Option<JoinHandle<()>>,
+    closing: &'a mut Option<ClosingRoom>,
 }
 
 impl Drop for UninstalledRoom<'_> {
     fn drop(&mut self) {
         if let Some(room) = self.room.take() {
-            *self.closing = Some(close_room(room));
+            *self.closing = Some(ClosingRoom::new(room));
         }
     }
 }
 
-fn close_room(room: Arc<Room>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let _ = room.close().await;
-    })
+struct ClosingRoom {
+    audio: Option<JoinHandle<()>>,
+    signaling: JoinHandle<()>,
 }
 
-async fn wait_for_room_close(closing: &mut Option<JoinHandle<()>>) {
-    if let Some(close) = closing.as_mut() {
-        let _ = tokio::time::timeout(Duration::from_secs(4), close).await;
+impl ClosingRoom {
+    fn new(room: Arc<Room>) -> Self {
+        Self {
+            audio: None,
+            signaling: tokio::spawn(async move {
+                let _ = room.close().await;
+            }),
+        }
+    }
+}
+
+async fn wait_for_audio_close(closing: &mut Option<ClosingRoom>) {
+    if let Some(closing) = closing.as_mut() {
+        if let Some(audio) = closing.audio.as_mut() {
+            let _ = audio.await;
+            closing.audio.take();
+        }
+    }
+}
+
+async fn wait_for_room_close(closing: &mut Option<ClosingRoom>) {
+    if let Some(room) = closing.as_mut() {
+        let _ = tokio::time::timeout(Duration::from_secs(4), &mut room.signaling).await;
         closing.take();
     }
 }
@@ -305,6 +441,7 @@ impl AudioControls {
         &self,
         settings: &AudioSettings,
         call: Option<&CallAudio>,
+        call_changed: Option<Arc<Notify>>,
     ) -> Result<PreparedAudioIo, String> {
         PreparedAudioIo::open(
             &self.app,
@@ -313,37 +450,16 @@ impl AudioControls {
             self.capture_control.clone(),
             self.mix.clone(),
             call.cloned(),
+            call_changed,
         )
     }
 
-    async fn replace_call_io(
-        &self,
-        current: &mut Option<AudioIo>,
-        settings: &AudioSettings,
-        room: &Room,
-        call: &CallAudio,
-    ) -> Result<(), String> {
-        // Keep a working device if the replacement format or endpoint fails to open.
-        let replacement = self.prepare_io(settings, Some(call))?;
-        if let Some(old) = current.take() {
-            old.stop().await;
-        }
-        if let Some(preview_input) = self.take_preview_for_call() {
-            preview_input.stop().await;
-        }
-        if !call_is_active(room.connection_state()) {
-            return Ok(());
-        }
-        match replacement.start() {
-            Ok(started) => {
-                *current = Some(started);
-                Ok(())
-            }
-            Err(error) => {
-                status(&self.app, "device-error", Some(&error));
-                Err(error)
-            }
-        }
+    fn apply_settings(&self, previous: &AudioSettings, settings: AudioSettings) {
+        self.capture_control.configure(
+            &settings,
+            previous.mode != settings.mode || previous.shortcut != settings.shortcut,
+        );
+        self.settings.send_replace(settings);
     }
 
     fn take_preview_for_call(&self) -> Option<AudioIo> {
@@ -355,13 +471,219 @@ impl AudioControls {
         let mut preview = self.preview.lock().unwrap();
         if preview.requested && preview.input.is_none() {
             let prefs = self.settings.borrow().clone();
-            match self
-                .prepare_io(&prefs, None)
-                .and_then(PreparedAudioIo::start)
-            {
-                Ok(input) => preview.input = Some(input),
-                Err(e) => status(&self.app, "device-error", Some(&e)),
+            match self.prepare_preview(&prefs) {
+                Ok(input) => self.install_preview(&mut preview, input),
+                Err(e) => preview_status(&self.app, &e),
             }
+        }
+    }
+
+    fn prepare_preview(&self, prefs: &AudioSettings) -> Result<PreparedAudioIo, String> {
+        let input = self.prepare_io(prefs, None, None)?;
+        input.start()?;
+        Ok(input)
+    }
+
+    fn install_preview(&self, preview: &mut Preview, input: PreparedAudioIo) {
+        drop(preview.input.take());
+        preview_status(&self.app, "");
+        preview.input = Some(input.activate_preview());
+    }
+}
+
+struct DeviceRecovery {
+    audio: AudioControls,
+    devices: Arc<CallDevices>,
+    room: Arc<Room>,
+    call: CallAudio,
+    diagnostics: CallDiagnostics,
+}
+
+impl DeviceRecovery {
+    async fn run(
+        self,
+        mut requests: mpsc::Receiver<ConfigureDevices>,
+        mut stopped: watch::Receiver<Option<StopDevices>>,
+    ) {
+        let mut retry = tokio::time::interval(Duration::from_secs(2));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while stopped.borrow().is_none() {
+            let request = tokio::select! {
+                biased;
+                _ = stopped.changed() => break,
+                request = requests.recv() => match request {
+                    Some(request) => Some(request),
+                    None => break,
+                },
+                _ = retry.tick() => None,
+            };
+            if request.is_none() && self.devices.readiness() == DeviceReadiness::Ready {
+                continue;
+            }
+            let result = self.replace(request.as_ref(), &mut stopped).await;
+            match (&result, &request) {
+                (Ok(true), request) => {
+                    preview_status(&self.audio.app, "");
+                    if request.is_some() {
+                        self.diagnostics.status(VoiceState::DeviceConfigured);
+                    }
+                }
+                (Err(error), _) => {
+                    let mut current = self.devices.current.lock().unwrap();
+                    if current.io.as_ref().is_none_or(AudioIo::failed) {
+                        current.error = Some(error.clone());
+                    }
+                }
+                _ => {}
+            }
+            if let Some(request) = request {
+                let mut current = self.devices.current.lock().unwrap();
+                if current.is_requested(Some(request.revision)) {
+                    current.pending = None;
+                }
+                let _ = request.complete.send(result.and_then(|installed| {
+                    installed
+                        .then_some(())
+                        .ok_or_else(|| "声音设置变更已取消，请重试".to_owned())
+                }));
+            }
+            self.devices.changed.notify_one();
+        }
+        let old = self.devices.current.lock().unwrap().take_io();
+        self.stop_current(old).await;
+        let resume_preview = matches!(*stopped.borrow(), Some(StopDevices::ResumePreview));
+        if resume_preview {
+            let _ = tokio::task::spawn_blocking(move || self.audio.resume_preview()).await;
+        }
+    }
+
+    fn is_current(
+        &self,
+        request: Option<&ConfigureDevices>,
+        opened_for: &AudioSettings,
+        stopped: &watch::Receiver<Option<StopDevices>>,
+        current: &CurrentDevices,
+    ) -> bool {
+        let settings = self.audio.settings.borrow();
+        stopped.borrow().is_none()
+            && call_is_active(self.room.connection_state())
+            && current.is_requested(request.map(|request| request.revision))
+            && request.map_or_else(
+                || settings.same_devices(opened_for),
+                |request| !request.complete.is_closed() && *settings == request.previous,
+            )
+    }
+
+    fn can_replace(
+        &self,
+        request: Option<&ConfigureDevices>,
+        settings: &AudioSettings,
+        stopped: &watch::Receiver<Option<StopDevices>>,
+    ) -> bool {
+        self.is_current(
+            request,
+            settings,
+            stopped,
+            &self.devices.current.lock().unwrap(),
+        )
+    }
+
+    async fn replace(
+        &self,
+        request: Option<&ConfigureDevices>,
+        stopped: &mut watch::Receiver<Option<StopDevices>>,
+    ) -> Result<bool, String> {
+        let settings = request.map_or_else(
+            || self.audio.settings.borrow().clone(),
+            |request| request.requested.clone(),
+        );
+        if !self.can_replace(request, &settings, stopped) {
+            return Ok(false);
+        }
+        let audio = self.audio.clone();
+        let prefs = settings.clone();
+        let call = self.call.clone();
+        let changed = self.devices.changed.clone();
+        let replacement = tokio::task::spawn_blocking(move || {
+            audio.prepare_io(&prefs, Some(&call), Some(changed))
+        })
+        .await
+        .map_err(|error| format!("声音设备准备失败：{error}"))?;
+        let replacement = match replacement {
+            Ok(replacement) => replacement,
+            Err(error) if self.can_replace(request, &settings, stopped) => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        self.activate_if_current(request, &settings, stopped, replacement)
+            .await
+    }
+
+    async fn activate_if_current(
+        &self,
+        request: Option<&ConfigureDevices>,
+        settings: &AudioSettings,
+        stopped: &mut watch::Receiver<Option<StopDevices>>,
+        replacement: PreparedAudioIo,
+    ) -> Result<bool, String> {
+        let mut replacement = Some(replacement);
+        let result = async {
+            let opened = replacement.as_ref().unwrap();
+            {
+                let current = self.devices.current.lock().unwrap();
+                if !self.is_current(request, settings, stopped, &current) {
+                    return Ok(false);
+                }
+                opened.start()?;
+            }
+            tokio::select! {
+                biased;
+                _ = stopped.changed() => return Ok(false),
+                ready = opened.ready() => ready?,
+            }
+            let old = {
+                let mut current = self.devices.current.lock().unwrap();
+                if !self.is_current(request, settings, stopped, &current) {
+                    return Ok(false);
+                }
+                if let Some(error) = opened.failure() {
+                    return Err(error);
+                }
+                current.take_io()
+            };
+            self.stop_current(old).await;
+            if !self.can_replace(request, settings, stopped) {
+                return Ok(false);
+            }
+            let audio = self.audio.clone();
+            let preview = tokio::task::spawn_blocking(move || audio.take_preview_for_call()).await;
+            if let Ok(Some(preview)) = preview {
+                preview.stop().await;
+            }
+            let mut current = self.devices.current.lock().unwrap();
+            if !self.is_current(request, settings, stopped, &current) {
+                return Ok(false);
+            }
+            opened.activate_call(|| {
+                if let Some(request) = request {
+                    self.audio
+                        .apply_settings(&request.previous, request.requested.clone());
+                }
+            })?;
+            current.error = None;
+            current.io = Some(replacement.take().unwrap().into_io());
+            Ok(true)
+        }
+        .await;
+        if let Some(replacement) = replacement {
+            let _ = tokio::task::spawn_blocking(move || drop(replacement)).await;
+        }
+        result
+    }
+
+    async fn stop_current(&self, old: Option<AudioIo>) {
+        if let Some(old) = old {
+            old.stop().await;
+            self.devices.current.lock().unwrap().stopping = false;
         }
     }
 }
@@ -395,7 +717,7 @@ pub(crate) async fn join_microphone(
 
 pub struct VoiceEngine {
     session: AsyncMutex<Option<Session>>,
-    transition: AsyncMutex<Option<JoinHandle<()>>>,
+    transition: AsyncMutex<Option<ClosingRoom>>,
     audio: AudioControls,
     speaker_preview: AsyncMutex<()>,
 }
@@ -422,8 +744,9 @@ impl VoiceEngine {
         {
             let mut slot = self.session.lock().await;
             if let Some(old) = slot.take() {
-                *closing = Some(self.stop(old).await);
+                *closing = Some(self.stop(old));
             }
+            wait_for_audio_close(&mut closing).await;
         }
         wait_for_room_close(&mut closing).await;
         self.set_ptt(false);
@@ -450,68 +773,63 @@ impl VoiceEngine {
             diagnostics.status(VoiceState::Disconnected);
             silence(&self.audio.app);
             status(&self.audio.app, "disconnected", None);
-            *closing = Some(close_room(room));
+            *closing = Some(ClosingRoom::new(room));
             return;
         }
         self.audio.mix.lock().unwrap().pcm_stats = PcmStats::default();
-        let settings = self.audio.settings.borrow().clone();
         let call = CallAudio {
             source,
             playback_timing: Arc::new(PlaybackTiming::default()),
         };
-        let audio = self
-            .audio
-            .prepare_io(&settings, Some(&call))
-            .and_then(|io| {
-                drop(self.audio.take_preview_for_call());
-                io.start()
-            });
-        let audio = match audio {
-            Ok(audio) => audio,
-            Err(e) => {
-                diagnostics.status(VoiceState::DeviceError);
-                *closing = Some(close_room(room));
-                silence(&self.audio.app);
-                status(&self.audio.app, "device-error", Some(&e));
-                self.audio.resume_preview();
-                return;
-            }
-        };
-        let io = Arc::new(AsyncMutex::new(Some(audio)));
-        diagnostics.status(VoiceState::Connected);
-        status(&self.audio.app, "connected", None);
+        let devices = Arc::new(CallDevices::default());
+        let (configure, requests) = mpsc::channel(1);
+        let (stop_devices, stopped) = watch::channel(None);
         let events = Task(tokio::spawn(room_events(
             self.audio.clone(),
             events,
-            io.clone(),
+            devices.clone(),
+            stop_devices.clone(),
             room.clone(),
             call.clone(),
             diagnostics.clone(),
         )));
+        let recovery = tokio::spawn(
+            DeviceRecovery {
+                audio: self.audio.clone(),
+                devices: devices.clone(),
+                room: room.clone(),
+                call,
+                diagnostics: diagnostics.clone(),
+            }
+            .run(requests, stopped),
+        );
         *slot = Some(Session {
             room,
-            call,
-            io,
+            devices,
+            configure,
+            stop_devices,
+            recovery,
             events,
             diagnostics,
         });
     }
 
-    async fn stop(&self, session: Session) -> JoinHandle<()> {
-        // Close signaling in parallel with local audio cleanup.
-        let close = close_room(session.room);
+    fn stop(&self, session: Session) -> ClosingRoom {
+        session
+            .devices
+            .stop(&session.stop_devices, StopDevices::Stop);
+        let mut closing = ClosingRoom::new(session.room);
         session.events.0.abort();
-        // Join before clearing the shared mixer so a stale subscription cannot reinsert a track.
-        let mut events = session.events;
-        let _ = (&mut events.0).await;
-        let audio = session.io.lock().await.take();
-        if let Some(audio) = audio {
-            audio.stop().await;
-        }
-        self.audio.mix.lock().unwrap().tracks.clear();
-        session.diagnostics.status(VoiceState::Disconnected);
-        silence(&self.audio.app);
-        close
+        let audio = self.audio.clone();
+        closing.audio = Some(tokio::spawn(async move {
+            let mut events = session.events;
+            let _ = (&mut events.0).await;
+            audio.mix.lock().unwrap().tracks.clear();
+            let _ = session.recovery.await;
+            session.diagnostics.status(VoiceState::Disconnected);
+            silence(&audio.app);
+        }));
+        closing
     }
 
     pub async fn disconnect(&self) {
@@ -520,8 +838,9 @@ impl VoiceEngine {
         {
             let mut slot = self.session.lock().await;
             if let Some(session) = slot.take() {
-                *closing = Some(self.stop(session).await);
+                *closing = Some(self.stop(session));
             }
+            wait_for_audio_close(&mut closing).await;
             status(&self.audio.app, "disconnected", None);
             self.audio.resume_preview();
         }
@@ -530,12 +849,9 @@ impl VoiceEngine {
 
     pub async fn monitor(&self, active: bool) -> Result<(), String> {
         let slot = self.session.lock().await;
-        let call = match slot.as_ref() {
-            Some(session) => Some((session, session.io.lock().await)),
-            None => None,
-        };
-        let in_call = call.as_ref().is_some_and(|(session, io)| {
-            call_owns_input(session.room.connection_state(), io.is_some())
+        let in_call = slot.as_ref().is_some_and(|session| {
+            let current = session.devices.current.lock().unwrap();
+            call_owns_input(session.room.connection_state(), current.owns_input())
         });
         let mut preview = self.audio.preview.lock().unwrap();
         preview.requested = active;
@@ -547,11 +863,11 @@ impl VoiceEngine {
                     .app
                     .emit("voice-level", serde_json::json!({"level":0}));
             }
+            preview_status(&self.audio.app, "");
         } else if preview.input.as_ref().is_none_or(AudioIo::failed) {
             let prefs = self.audio.settings.borrow().clone();
-            let input = self.audio.prepare_io(&prefs, None)?;
-            preview.input.take();
-            preview.input = Some(input.start()?);
+            let input = self.audio.prepare_preview(&prefs)?;
+            self.audio.install_preview(&mut preview, input);
         }
         Ok(())
     }
@@ -565,49 +881,42 @@ impl VoiceEngine {
             return Err("声音设置超出范围".into());
         }
         let slot = self.session.lock().await;
-        let old = self.audio.settings.borrow().clone();
-        let mut call = match slot.as_ref() {
-            Some(session) => Some((session, session.io.lock().await)),
-            None => None,
-        };
-        let in_call = if let Some((session, io)) = &mut call {
-            if call_is_active(session.room.connection_state())
-                && io.as_ref().is_none_or(|current| {
-                    current.failed()
-                        || old.input_device != settings.input_device
-                        || old.output_device != settings.output_device
-                })
-            {
-                self.audio
-                    .replace_call_io(io, &settings, &session.room, &session.call)
-                    .await
-                    .inspect_err(|_| session.diagnostics.status(VoiceState::DeviceError))?;
-                if io.as_ref().is_some_and(|current| !current.failed()) {
-                    session.diagnostics.status(VoiceState::DeviceConfigured);
-                }
-                if session.room.connection_state() == ConnectionState::Connected {
-                    status(&self.audio.app, "connected", None);
-                }
+        let response = if let Some(session) = slot.as_ref() {
+            let mut current = session.devices.current.lock().unwrap();
+            let old = self.audio.settings.borrow().clone();
+            let network = session.room.connection_state();
+            if call_is_active(network) && !old.same_devices(&settings) {
+                Some(current.queue_switch(&session.configure, old, settings.clone())?)
+            } else if call_owns_input(network, current.owns_input()) {
+                self.audio.apply_settings(&old, settings);
+                return Ok(());
+            } else {
+                None
             }
-            call_owns_input(session.room.connection_state(), io.is_some())
         } else {
-            false
+            None
         };
-        let mut preview = self.audio.preview.lock().unwrap();
-        if preview.needs_input_change(in_call, old.input_device != settings.input_device) {
-            let input = self.audio.prepare_io(&settings, None)?;
-            preview.input.take();
-            preview.input = Some(input.start()?);
+        if let Some(response) = response {
+            drop(slot);
+            return response
+                .await
+                .map_err(|_| "语音已断开，请重试声音设置".to_owned())?;
         }
-        drop(preview);
+        let old = self.audio.settings.borrow().clone();
+        let mut preview = self.audio.preview.lock().unwrap();
+        let input = if preview.needs_input_change(false, old.input_device != settings.input_device)
+        {
+            Some(self.audio.prepare_preview(&settings)?)
+        } else {
+            None
+        };
         if old.output_device != settings.output_device {
             stop_speaker_preview(&self.audio.speaker_stream);
         }
-        self.audio.capture_control.configure(
-            &settings,
-            old.mode != settings.mode || old.shortcut != settings.shortcut,
-        );
-        self.audio.settings.send_replace(settings);
+        self.audio.apply_settings(&old, settings);
+        if let Some(input) = input {
+            self.audio.install_preview(&mut preview, input);
+        }
         Ok(())
     }
 
@@ -624,38 +933,39 @@ impl VoiceEngine {
         let _preview = self.speaker_preview.lock().await;
         let mut prepared = None;
         let finished = loop {
-            let slot = self.session.lock().await;
-            if self
-                .audio
-                .settings
-                .borrow()
-                .speaker_preview_target(expected_gain)
-                != Some((device.as_str(), gain))
             {
-                return Ok(());
-            }
-            let io = match slot.as_ref() {
-                Some(session) => Some(session.io.lock().await),
-                None => None,
-            };
-            if io
-                .as_ref()
-                .is_some_and(|io| io.as_ref().is_some_and(|io| io.preview_speaker(gain)))
-            {
-                return Ok(());
-            }
-            if let Some(opened) = prepared.take() {
-                let (speaker, finished): (cpal::Stream, _) = opened?;
-                if let Err(error) = speaker.play() {
-                    drop(io);
-                    drop(slot);
-                    return Err(format!("无法启动播放设备：{error}"));
+                let slot = self.session.lock().await;
+                if self
+                    .audio
+                    .settings
+                    .borrow()
+                    .speaker_preview_target(expected_gain)
+                    != Some((device.as_str(), gain))
+                {
+                    return Ok(());
                 }
-                *self.audio.speaker_stream.lock().unwrap() = Some(speaker);
-                break finished;
+                let io = slot
+                    .as_ref()
+                    .map(|session| session.devices.current.lock().unwrap());
+                if io.as_ref().is_some_and(|current| {
+                    current
+                        .io
+                        .as_ref()
+                        .is_some_and(|io| io.preview_speaker(gain))
+                }) {
+                    return Ok(());
+                }
+                if let Some(opened) = prepared.take() {
+                    let (speaker, finished): (cpal::Stream, _) = opened?;
+                    if let Err(error) = speaker.play() {
+                        drop(io);
+                        drop(slot);
+                        return Err(format!("无法启动播放设备：{error}"));
+                    }
+                    *self.audio.speaker_stream.lock().unwrap() = Some(speaker);
+                    break finished;
+                }
             }
-            drop(io);
-            drop(slot);
             let output_device = device.clone();
             let control = self.audio.capture_control.clone();
             prepared = Some(
@@ -733,6 +1043,45 @@ mod tests {
         assert!(call_owns_input(ConnectionState::Reconnecting, false));
         assert!(call_owns_input(ConnectionState::Disconnected, true));
         assert!(!call_owns_input(ConnectionState::Disconnected, false));
+    }
+
+    #[tokio::test]
+    async fn queued_device_switch_supersedes_a_delayed_retry() {
+        let devices = Arc::new(CallDevices::default());
+        let opening = devices.clone();
+        let (started, wait_started) = oneshot::channel();
+        let (opened, wait_opened) = oneshot::channel();
+        let retry = tokio::spawn(async move {
+            assert!(opening.current.lock().unwrap().is_requested(None));
+            started.send(()).unwrap();
+            wait_opened.await.unwrap();
+            opening.current.lock().unwrap().is_requested(None)
+        });
+        wait_started.await.unwrap();
+
+        let (configure, mut requests) = mpsc::channel(1);
+        let requested = AudioSettings {
+            input_device: "headset".into(),
+            ..AudioSettings::default()
+        };
+        let response = devices
+            .current
+            .lock()
+            .unwrap()
+            .queue_switch(&configure, AudioSettings::default(), requested)
+            .unwrap();
+        opened.send(()).unwrap();
+        assert!(!retry.await.unwrap());
+
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.requested.input_device, "headset");
+        assert!(devices
+            .current
+            .lock()
+            .unwrap()
+            .is_requested(Some(request.revision)));
+        request.complete.send(Ok(())).unwrap();
+        assert_eq!(response.await.unwrap(), Ok(()));
     }
 
     fn add_track(mix: &mut Mixer, id: &str, samples: VecDeque<i16>) -> TrackSid {
@@ -932,7 +1281,8 @@ fn attach_remote_track(mix: &Arc<Mutex<Mixer>>, track: RemoteAudioTrack, player:
 async fn room_events(
     audio: AudioControls,
     mut events: mpsc::UnboundedReceiver<RoomEvent>,
-    io: Arc<AsyncMutex<Option<AudioIo>>>,
+    devices: Arc<CallDevices>,
+    stop_devices: watch::Sender<Option<StopDevices>>,
     room: Arc<Room>,
     call: CallAudio,
     diagnostics: CallDiagnostics,
@@ -946,95 +1296,95 @@ async fn room_events(
         call.playback_timing.clone(),
     )));
     let mut network_ready = true;
+    let mut connected_once = false;
     let mut device_failed = false;
-    let mut retry = tokio::time::interval(Duration::from_secs(2));
-    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shown = Some(DeviceReadiness::Starting);
     loop {
         let event = tokio::select! {
-            event = events.recv() => match event { Some(event) => event, None => break },
-            _ = retry.tick() => {
-                let mut current = io.lock().await;
-                if call_is_active(room.connection_state()) && current.as_ref().is_none_or(AudioIo::failed) {
-                    if !device_failed {
-                        diagnostics.status(VoiceState::DeviceError);
-                    }
-                    device_failed = true;
-                    let settings = audio.settings.borrow().clone();
-                    if audio.replace_call_io(&mut current, &settings, &room, &call).await.is_ok() {
-                        if network_ready && current.is_some() { status(app, "connected", None); }
-                    }
-                }
-                if device_failed && current.as_ref().is_some_and(|audio| !audio.failed()) {
-                    diagnostics.status(VoiceState::DeviceRecovered);
-                    device_failed = false;
-                }
-                continue;
-            }
+            biased;
+            event = events.recv() => match event { Some(event) => Some(event), None => break },
+            _ = devices.changed.notified() => None,
         };
         match event {
-            RoomEvent::TrackSubscribed {
+            Some(RoomEvent::TrackSubscribed {
                 track: RemoteTrack::Audio(track),
                 participant,
                 ..
-            } => {
+            }) => {
                 attach_remote_track(mix, track, participant.identity().to_string());
+                continue;
             }
-            RoomEvent::TrackUnsubscribed {
+            Some(RoomEvent::TrackUnsubscribed {
                 track: RemoteTrack::Audio(track),
                 ..
-            } => {
+            }) => {
                 mix.lock().unwrap().tracks.remove(&track.sid());
+                continue;
             }
-            RoomEvent::ActiveSpeakersChanged { speakers } => {
+            Some(RoomEvent::ActiveSpeakersChanged { speakers }) => {
                 let ids: Vec<_> = speakers
                     .iter()
                     .map(|speaker| speaker.identity().to_string())
                     .collect();
                 let _ = app.emit("speakers", ids);
+                continue;
             }
-            RoomEvent::Reconnecting => {
+            Some(RoomEvent::Reconnecting) => {
                 network_ready = false;
                 diagnostics.status(VoiceState::Reconnecting);
                 silence(app);
                 status(app, "reconnecting", None);
+                continue;
             }
-            RoomEvent::Reconnected => {
+            Some(RoomEvent::Reconnected) => {
                 network_ready = true;
                 diagnostics.status(VoiceState::Reconnected);
-                if io
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(|audio| !audio.failed())
-                {
-                    status(app, "connected", None);
-                } else {
-                    if !device_failed {
-                        diagnostics.status(VoiceState::DeviceError);
-                    }
-                    device_failed = true;
-                    status(
-                        app,
-                        "device-error",
-                        Some("请检查声音设置中的麦克风和播放设备"),
-                    );
-                }
+                shown = None;
             }
-            RoomEvent::Disconnected { reason: why } => {
+            Some(RoomEvent::Disconnected { reason: why }) => {
                 reason = Some(format!("{why:?}"));
                 break;
             }
-            _ => (),
+            None => (),
+            Some(_) => continue,
         }
+        if !network_ready
+            || stop_devices.borrow().is_some()
+            || room.connection_state() != ConnectionState::Connected
+        {
+            continue;
+        }
+        let readiness = devices.readiness();
+        if shown.as_ref() == Some(&readiness) {
+            continue;
+        }
+        match &readiness {
+            DeviceReadiness::Starting => {}
+            DeviceReadiness::Ready => {
+                if device_failed {
+                    diagnostics.status(VoiceState::DeviceRecovered);
+                }
+                if !connected_once {
+                    diagnostics.status(VoiceState::Connected);
+                }
+                connected_once = true;
+                device_failed = false;
+                status(app, "connected", None);
+            }
+            DeviceReadiness::Failed(error) => {
+                if !device_failed {
+                    diagnostics.status(VoiceState::DeviceError);
+                }
+                device_failed = true;
+                status(app, "device-error", Some(error));
+            }
+        }
+        shown = Some(readiness);
     }
     drop(sampler);
-    let mut current = io.lock().await;
-    if let Some(current) = current.take() {
-        current.stop().await;
-    }
+    devices.stop(&stop_devices, StopDevices::ResumePreview);
     mix.lock().unwrap().tracks.clear();
     diagnostics.status(VoiceState::Disconnected);
     silence(app);
     status(app, "disconnected", reason.as_deref());
-    audio.resume_preview();
 }

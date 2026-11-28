@@ -5,13 +5,14 @@ import { Mic, Volume2, AudioWaveform } from 'lucide-vue-next'
 import { modes, type Devices } from '../model'
 import { audioGainLimits, type AudioControls } from './useAudioControls'
 
-const props = defineProps<{ controls: AudioControls; level: number; speaking: boolean; connected: boolean; visible: boolean }>()
+const props = defineProps<{ controls: AudioControls; level: number; speaking: boolean; connected: boolean; visible: boolean; previewError: string }>()
 const draft = computed(() => props.controls.effective)
 const shortcutEdit = ref<string | null>(null)
 const devices = ref<Devices>({ inputs: [], outputs: [] })
 const error = ref('')
 const monitoring = ref(false)
 const monitorError = ref('')
+const monitorProblem = computed(() => props.visible && (props.previewError || monitorError.value))
 const modeKeys = Object.keys(modes) as (keyof typeof modes)[]
 const meter = computed(() => Math.max(0, Math.min(100, props.level)))
 const meterStatus = computed(() => {
@@ -20,7 +21,7 @@ const meterStatus = computed(() => {
   if (!current || !audio) return ''
   if (audio.inputDevice !== current.inputDevice || audio.inputGain !== current.inputGain ||
       audio.mode !== current.mode || audio.threshold !== current.threshold) return '正在应用输入设置'
-  if (monitorError.value) return '麦克风不可用'
+  if (monitorProblem.value) return '麦克风不可用'
   if (!monitoring.value) return '正在打开麦克风'
   if (audio.mode === 'activation') return meter.value >= audio.threshold ? '达到阈值' : '低于阈值'
   if (props.connected && props.speaking) return '正在发言'
@@ -99,7 +100,7 @@ onBeforeUnmount(() => { void flush() })
             <b v-if="draft.mode === 'activation'" :style="{ left: draft.threshold + '%' }"></b>
           </div>
         </div>
-        <p v-if="monitorError" class="form-error" role="alert">{{ monitorError }}</p>
+        <p v-if="monitorProblem" class="form-error" role="alert" data-preview-error>{{ monitorProblem }}</p>
       </section>
       <section class="settings-section"><h3><Volume2 /> 扬声器与音效</h3>
         <label class="field">输出设备

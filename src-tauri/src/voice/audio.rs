@@ -2,14 +2,14 @@ use std::{
     borrow::Cow,
     future::poll_fn,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     task::Poll,
     time::{Duration, Instant},
 };
 
-use super::{devices, status, AudioSettings, Mixer, Task};
+use super::{devices, preview_status, AudioSettings, Mixer, Task};
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     FromSample, Sample, SampleFormat, SizedSample,
@@ -21,7 +21,7 @@ use livekit::webrtc::{
     native::apm::AudioProcessingModule,
 };
 use tauri::{AppHandle, Emitter};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use super::diagnostics::{MixerTiming, PlaybackTiming};
 use speaker_preview::SpeakerTone;
@@ -280,26 +280,91 @@ fn capture_ready_at(
     callback_at - (delay - *baseline)
 }
 
+const INPUT_READY: u8 = 1;
+const OUTPUT_READY: u8 = 2;
+
+#[derive(Default)]
+struct StreamState {
+    callbacks: AtomicU8,
+    active: AtomicBool,
+    fault: Mutex<Option<String>>,
+    changed: Notify,
+    call_changed: Option<Arc<Notify>>,
+    preview: Option<AppHandle>,
+}
+
+impl StreamState {
+    fn callback(&self, stream: u8) {
+        self.callbacks.fetch_or(stream, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn set_active(&self, active: bool) {
+        let fault = self.fault.lock().unwrap();
+        self.active.store(active, Ordering::Release);
+        if let (true, Some(preview), Some(error)) = (active, &self.preview, fault.as_deref()) {
+            preview_status(preview, error);
+        }
+    }
+
+    fn activate_if_healthy(&self, configure: impl FnOnce()) -> Result<(), String> {
+        let fault = self.fault.lock().unwrap();
+        if let Some(error) = fault.as_ref() {
+            return Err(error.clone());
+        }
+        configure();
+        self.active.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn fail(&self, error: String) {
+        let mut fault = self.fault.lock().unwrap();
+        if fault.is_none() {
+            if self.active() {
+                if let Some(preview) = &self.preview {
+                    preview_status(preview, &error);
+                }
+                if let Some(changed) = &self.call_changed {
+                    changed.notify_one();
+                }
+            }
+            *fault = Some(error);
+            self.changed.notify_one();
+        }
+    }
+
+    async fn wait_ready(&self) -> Result<(), String> {
+        loop {
+            {
+                let fault = self.fault.lock().unwrap();
+                if let Some(error) = fault.as_ref() {
+                    return Err(error.clone());
+                }
+                if self.callbacks.load(Ordering::Acquire) == INPUT_READY | OUTPUT_READY {
+                    return Ok(());
+                }
+            }
+            self.changed.notified().await;
+        }
+    }
+}
+
 type ErrorCallback = Box<dyn FnMut(cpal::StreamError) + Send>;
 
-fn error_handler(app: &AppHandle, failed: &Arc<AtomicBool>, device: &'static str) -> ErrorCallback {
-    let app = app.clone();
-    let failed = failed.clone();
-    Box::new(move |e| {
-        if !failed.swap(true, Ordering::Relaxed) {
-            status(
-                &app,
-                "device-error",
-                Some(&format!("{device}已停止：{e}，请在声音设置中重新选择设备")),
-            );
-        }
-    })
+fn error_handler(state: &Arc<StreamState>, device: &'static str) -> ErrorCallback {
+    let state = state.clone();
+    Box::new(move |e| state.fail(format!("{device}已停止：{e}，请在声音设置中重新选择设备")))
 }
 
 fn capture<T: SizedSample>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     input: Arc<CaptureQueue>,
+    state: Arc<StreamState>,
     err: ErrorCallback,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -310,10 +375,18 @@ where
     let mut frames = Framer::new(config.sample_rate.0);
     let mut lowest_device_delay = None;
     let mut priority = devices::CallbackPriority::default();
+    let mut first = true;
     device.build_input_stream(
         config,
         move |samples: &[T], info| {
             priority.enter();
+            if first {
+                state.callback(INPUT_READY);
+                first = false;
+            }
+            if !state.active() {
+                return;
+            }
             let callback_at = Instant::now();
             let frames_in_packet = samples.chunks_exact(channels);
             let (packet_start, measured_timing) = capture_packet_start(
@@ -445,11 +518,20 @@ where
     let mut tone = SpeakerTone::new(device_rate);
     let mut priority = devices::CallbackPriority::default();
     let mut previous_callback = None;
+    let mut first = true;
     device.build_output_stream(
         config,
         move |buffer: &mut [T], info| {
             let callback_at = Instant::now();
             priority.enter();
+            if first {
+                speaker.state.callback(OUTPUT_READY);
+                first = false;
+            }
+            if !speaker.state.active() {
+                buffer.fill(T::EQUILIBRIUM);
+                return;
+            }
             let packet_start = if control.echo.load(Ordering::Relaxed) {
                 let time = info.timestamp();
                 Some(
@@ -525,7 +607,8 @@ pub(super) struct CallAudio {
 
 #[derive(Default)]
 struct SpeakerControl {
-    failed: Arc<AtomicBool>,
+    state: Arc<StreamState>,
+    failed: AtomicBool,
     preview: AtomicU32,
 }
 
@@ -543,7 +626,7 @@ pub(super) struct AudioIo {
     worker: Task,
     input: cpal::Stream,
     output: Option<SpeakerOutput>,
-    failed: Arc<AtomicBool>,
+    state: Arc<StreamState>,
 }
 
 pub(super) struct PreparedAudioIo {
@@ -555,7 +638,7 @@ pub(super) struct PreparedAudioIo {
     output: Option<SpeakerOutput>,
     capture: Arc<CaptureQueue>,
     reference: Arc<ArrayQueue<ReferenceBlock>>,
-    failed: Arc<AtomicBool>,
+    state: Arc<StreamState>,
 }
 
 // Types returned by WASAPI's shared-mode GetMixFormat.
@@ -576,11 +659,15 @@ pub(super) mod speaker_preview;
 
 impl AudioIo {
     pub(super) fn failed(&self) -> bool {
-        self.failed.load(Ordering::Relaxed)
-            || self
-                .output
-                .as_ref()
-                .is_some_and(|output| output.control.failed.load(Ordering::Relaxed))
+        self.state.fault.lock().unwrap().is_some()
+    }
+
+    pub(super) fn failure(&self) -> Option<String> {
+        self.state.fault.lock().unwrap().clone()
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.state.active()
     }
 
     pub(super) fn preview_speaker(&self, gain: f32) -> bool {
@@ -589,17 +676,22 @@ impl AudioIo {
             .is_some_and(|output| output.control.request(gain))
     }
 
+    pub(super) fn deactivate(&self) {
+        self.state.set_active(false);
+        self.worker.0.abort();
+    }
+
     pub(super) async fn stop(self) {
+        self.deactivate();
         let Self {
             mut worker,
             input,
             output,
             ..
         } = self;
-        worker.0.abort();
-        drop(input);
-        drop(output);
+        let streams = tokio::task::spawn_blocking(move || drop((input, output)));
         let _ = (&mut worker.0).await;
+        let _ = streams.await;
     }
 }
 
@@ -611,9 +703,14 @@ impl PreparedAudioIo {
         control: Arc<CaptureControl>,
         mix: Arc<Mutex<Mixer>>,
         call: Option<CallAudio>,
+        call_changed: Option<Arc<Notify>>,
     ) -> Result<Self, String> {
         let input = devices::select(&prefs.input_device, true)?;
-        let failed = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(StreamState {
+            preview: call.is_none().then(|| app.clone()),
+            call_changed,
+            ..Default::default()
+        });
         let input_queue = Arc::new(CaptureQueue::new());
         let reference = Arc::new(ArrayQueue::new(REFERENCE_QUEUE_BLOCKS));
         let input = devices::open_stream(&input, true, |format| {
@@ -623,13 +720,23 @@ impl PreparedAudioIo {
                 &input,
                 &format.config(),
                 input_queue.clone(),
-                error_handler(app, &failed, "麦克风")
+                state.clone(),
+                error_handler(&state, "麦克风")
             )
         })?;
         let output = if let Some(call) = &call {
             let output = devices::select(&prefs.output_device, false)?;
-            let speaker = Arc::new(SpeakerControl::default());
+            let speaker = Arc::new(SpeakerControl {
+                state: state.clone(),
+                ..Default::default()
+            });
             let stream = devices::open_stream(&output, false, |format| {
+                let reported = speaker.clone();
+                let mut mark_failed = error_handler(&state, "扬声器");
+                let error: ErrorCallback = Box::new(move |error| {
+                    reported.failed.store(true, Ordering::Relaxed);
+                    mark_failed(error);
+                });
                 build_stream!(
                     format.sample_format(),
                     play,
@@ -640,7 +747,7 @@ impl PreparedAudioIo {
                     speaker.clone(),
                     reference.clone(),
                     call.playback_timing.clone(),
-                    error_handler(app, &speaker.failed, "扬声器")
+                    error
                 )
             })?;
             Some(SpeakerOutput {
@@ -659,11 +766,42 @@ impl PreparedAudioIo {
             output,
             capture: input_queue,
             reference,
-            failed,
+            state,
         })
     }
 
-    pub(super) fn start(self) -> Result<AudioIo, String> {
+    pub(super) fn start(&self) -> Result<(), String> {
+        if let Some(output) = &self.output {
+            output
+                .stream
+                .play()
+                .map_err(|e| format!("无法启动播放设备：{e}"))?;
+        }
+        self.input
+            .play()
+            .map_err(|e| format!("无法启动麦克风：{e}"))
+    }
+
+    pub(super) async fn ready(&self) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(2), self.state.wait_ready())
+            .await
+            .map_err(|_| "等待麦克风和播放设备启动超时".to_owned())?
+    }
+
+    pub(super) fn failure(&self) -> Option<String> {
+        self.state.fault.lock().unwrap().clone()
+    }
+
+    pub(super) fn activate_call(&self, configure: impl FnOnce()) -> Result<(), String> {
+        self.state.activate_if_healthy(configure)
+    }
+
+    pub(super) fn activate_preview(self) -> AudioIo {
+        self.state.set_active(true);
+        self.into_io()
+    }
+
+    pub(super) fn into_io(self) -> AudioIo {
         let Self {
             app,
             settings,
@@ -673,28 +811,20 @@ impl PreparedAudioIo {
             output,
             capture,
             reference,
-            failed,
+            state,
         } = self;
-        if let Some(output) = &output {
-            output
-                .stream
-                .play()
-                .map_err(|e| format!("无法启动播放设备：{e}"))?;
-        }
-        input.play().map_err(|e| format!("无法启动麦克风：{e}"))?;
-        let fault = failed.clone();
+        let fault = state.clone();
         let worker = Task(tokio::spawn(async move {
             if let Err(error) = process(&app, settings, control, source, capture, reference).await {
-                fault.store(true, Ordering::Relaxed);
-                status(&app, "device-error", Some(&error));
+                fault.fail(error);
             }
         }));
-        Ok(AudioIo {
+        AudioIo {
             input,
             output,
             worker,
-            failed,
-        })
+            state,
+        }
     }
 }
 
@@ -886,6 +1016,31 @@ async fn process(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn both_stream_callbacks_are_required_and_startup_faults_win() {
+        let state = StreamState::default();
+        let ready = state.wait_ready();
+        tokio::pin!(ready);
+        assert!(futures_util::poll!(&mut ready).is_pending());
+        state.callback(INPUT_READY);
+        assert!(futures_util::poll!(&mut ready).is_pending());
+        state.fail("WASAPI failed to start playback".into());
+        state.callback(OUTPUT_READY);
+        assert_eq!(ready.await, Err("WASAPI failed to start playback".into()));
+
+        let working = StreamState::default();
+        working.callback(OUTPUT_READY);
+        working.callback(INPUT_READY);
+        assert_eq!(working.wait_ready().await, Ok(()));
+        assert!(!working.active());
+        working.fail("WASAPI failed after its first output callback".into());
+        assert_eq!(
+            working.activate_if_healthy(|| panic!("faulted device settings were applied")),
+            Err("WASAPI failed after its first output callback".into())
+        );
+        assert!(!working.active());
+    }
+
     #[test]
     fn speaker_tone_is_brief_and_scales_with_the_selected_gain() {
         for rate in [44_100, 48_000] {
@@ -935,6 +1090,7 @@ mod tests {
         let mix = Arc::new(Mutex::new(Mixer::default()));
         let control = Arc::new(CaptureControl::default());
         let speaker = Arc::new(SpeakerControl::default());
+        speaker.state.set_active(true);
         let reference = Arc::new(ArrayQueue::new(REFERENCE_QUEUE_BLOCKS));
         let timing = Arc::new(PlaybackTiming::default());
         let stream = devices::open_stream(&device, false, |format| {
@@ -971,6 +1127,8 @@ mod tests {
         }
         let device = devices::select("", true).unwrap();
         let queue = Arc::new(CaptureQueue::new());
+        let state = Arc::new(StreamState::default());
+        state.set_active(true);
         let stream = devices::open_stream(&device, true, |format| {
             build_stream!(
                 format.sample_format(),
@@ -978,6 +1136,7 @@ mod tests {
                 &device,
                 &format.config(),
                 queue.clone(),
+                state.clone(),
                 Box::new(|err| eprintln!("capture probe: {err}"))
             )
         })

@@ -29,7 +29,11 @@ pub(crate) enum RoomPhase {
     Opening,
     StartHost,
     ConnectTunnel,
+    DialPeer,
+    AuthenticateInvite,
     AcceptRoom,
+    OpenRoomSocket,
+    FirstRoomSnapshot,
     Ready,
     Disconnected,
     Closed,
@@ -190,6 +194,24 @@ pub(crate) struct RoomDiagnostics {
     role: Role,
 }
 
+struct RoomMeasurement<'a> {
+    room: &'a RoomDiagnostics,
+    phase: RoomPhase,
+    started: Instant,
+    succeeded: Option<bool>,
+}
+
+impl Drop for RoomMeasurement<'_> {
+    fn drop(&mut self) {
+        self.room.diagnostics.record(Event::Room {
+            role: self.room.role,
+            phase: self.phase,
+            duration_ms: Some(self.started.elapsed().as_millis() as u64),
+            succeeded: self.succeeded,
+        });
+    }
+}
+
 impl RoomDiagnostics {
     pub(crate) fn handle(&self) -> Diagnostics {
         self.diagnostics.clone()
@@ -209,14 +231,15 @@ impl RoomDiagnostics {
         phase: RoomPhase,
         operation: impl Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
-        let started = Instant::now();
-        let result = operation.await;
-        self.diagnostics.record(Event::Room {
-            role: self.role,
+        // A timed event with no result means the in-flight phase was interrupted.
+        let mut measurement = RoomMeasurement {
+            room: self,
             phase,
-            duration_ms: Some(started.elapsed().as_millis() as u64),
-            succeeded: Some(result.is_ok()),
-        });
+            started: Instant::now(),
+            succeeded: None,
+        };
+        let result = operation.await;
+        measurement.succeeded = Some(result.is_ok());
         result
     }
 }
@@ -253,6 +276,28 @@ mod tests {
         assert_eq!(history.events.len(), 1);
         history.expire(2 * RETENTION_MS + 2);
         assert!(history.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_in_flight_room_phase_records_interruption() {
+        let diagnostics = Diagnostics::default();
+        let room = diagnostics.room(Role::Guest);
+        let mut phase = Box::pin(room.measure(
+            RoomPhase::DialPeer,
+            std::future::pending::<Result<(), ()>>(),
+        ));
+        assert!(futures_util::poll!(&mut phase).is_pending());
+        drop(phase);
+        let history = diagnostics.recorder.history.lock().unwrap();
+        assert!(matches!(
+            history.events.back().unwrap().event,
+            Event::Room {
+                phase: RoomPhase::DialPeer,
+                duration_ms: Some(_),
+                succeeded: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

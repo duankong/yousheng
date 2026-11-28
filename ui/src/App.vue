@@ -1,16 +1,18 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Activity, ChevronDown, CircleAlert, Clipboard, Copy, Link2, LoaderCircle, Power, RotateCw, Settings2, UserRoundPlus, X } from 'lucide-vue-next'
 import { invoke } from '@tauri-apps/api/core'
 import Dialog from './features/Dialog.vue'
 import SettingsDialog from './features/SettingsDialog.vue'
-import Chat, { chatSendHint, type ChatAttempt } from './features/Chat.vue'
+import Chat from './features/Chat.vue'
 import Members from './features/Members.vue'
 import ProfileEditor from './features/ProfileEditor.vue'
 import PlayerAvatar from './features/PlayerAvatar.vue'
 import RoomAudioControls from './features/RoomAudioControls.vue'
 import { useLobby } from './features/useLobby'
 import { useAudioControls } from './features/useAudioControls'
+import { useChat } from './features/useChat'
+import { usePendingInvite } from './features/usePendingInvite'
 import { useUpdater } from './features/useUpdater'
 import type { PeerSettings, ProfileUpdate } from './model'
 
@@ -25,18 +27,14 @@ const detailsRefresh = ref(0)
 const detailsError = ref(false)
 const invite = ref('')
 const shareLink = ref('')
-const pendingInvite = ref('')
 const inviteError = ref('')
 const notice = ref('')
 const copyInput = ref<HTMLInputElement>()
 const showHistory = ref(false)
-const draft = ref('')
-const outbox = ref<ChatAttempt[]>([])
-let nextAttemptId = 0
 let shareRequest = 0
-const lastChatReceipt = ref<{ id: number; elapsedMs?: number; confirmed?: boolean }>()
-const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, connect, leave, retryVoice, retryingVoice,
-  history, historyLoading, historyError, refreshHistory } = useLobby(link => { pendingInvite.value = link })
+const { preferences, snapshot, session, ready, busy, error, offline, active, voice, level, speakers, voiceLabel, inVoice, previewError,
+  connect, joinStatus, cancelJoin, leave, retryVoice, retryingVoice, history, historyLoading, historyError, refreshHistory
+} = useLobby(link => queueInvite(link), room => preserve(room))
 const installBlocked = computed(() => busy.value || active.value)
 const updater = useUpdater(preferences, ready, installBlocked, () => session.value?.id ?? null)
 const audioControls = useAudioControls(preferences)
@@ -51,12 +49,25 @@ const myName = computed(() => preferences.value?.nickname || '本地玩家')
 const banner = computed(() => (!panel.value && error.value) || offline.value || preferences.value?.shortcutError || '')
 const visibleHistory = computed(() => showHistory.value ? history.value : history.value.slice(0, 2))
 const blocked = computed(() => busy.value || updater.installing || !ready.value || firstRun.value)
+const { draft, outbox, recovery, lastChatReceipt, preserve, sendChat, restoreAttempt, removeAttempt, removeRecovery } =
+  useChat(session, snapshot, () => !active.value || blocked.value, error)
+const { queue: queueInvite, discard: discardInvite } = usePendingInvite(
+  () => blocked.value || !!panel.value,
+  () => [session.value?.invite, shareLink.value],
+  link => {
+    askJoin(link)
+    if (!active.value) void enter()
+  },
+)
 const inviteAction = computed(() => session.value?.isHost ? { icon: UserRoundPlus, title: '邀请好友' }
   : busy.value ? { icon: LoaderCircle, title: '正在开启房间…' }
     : { icon: Power, title: '开启房间' })
 const homeStatus = computed(() => session.value?.isHost ? '等待好友加入'
   : ready.value && !firstRun.value && !busy.value ? '房间未开启' : '')
 const canRetryVoice = computed(() => ['device-error', 'error', 'failed', 'disconnected'].includes(voice.value.state))
+const canDismissJoin = computed(() => panel.value === 'join' && joinStatus.value === 'waiting')
+const joinFeedback = computed(() => joinStatus.value === 'cancelling' ? '正在取消加入…'
+  : joinStatus.value === 'finishing' ? '正在完成房间切换，请稍候。' : '')
 
 watch([panel, session, detailsRefresh], async ([view, current], _, onCleanup) => {
   if (view !== 'connection') return
@@ -83,12 +94,21 @@ function openPanel(next: Panel) {
   error.value = ''
   panel.value = next
 }
-function closePanel() {
-  if (!busy.value && !updater.installing) {
-    shareRequest++
-    inviteError.value = ''
-    panel.value = ''
-    error.value = ''
+function clearPanel() {
+  shareRequest++
+  inviteError.value = ''
+  panel.value = ''
+  error.value = ''
+}
+async function closePanel() {
+  if (canDismissJoin.value) {
+    const link = invite.value
+    if (await cancelJoin() && panel.value === 'join') {
+      discardInvite(link)
+      clearPanel()
+    }
+  } else if (!busy.value && !updater.installing) {
+    clearPanel()
   }
 }
 function askJoin(link = '') {
@@ -96,16 +116,6 @@ function askJoin(link = '') {
   invite.value = link
   openPanel('join')
 }
-// Keep the latest external invite until identity setup and room transitions finish.
-watch([pendingInvite, ready, busy, editingProfile, () => updater.installing], async ([link, initialized, working, editing, installing]) => {
-  if (!link || !initialized || working || editing || installing) return
-  await nextTick()
-  if (pendingInvite.value !== link || blocked.value || editingProfile.value) return
-  pendingInvite.value = ''
-  if (session.value?.invite === link || shareLink.value === link) return
-  askJoin(link)
-  if (!active.value) await enter()
-})
 function profileSaved(updated: ProfileUpdate) {
   if (!preferences.value) return
   const onboarding = firstRun.value
@@ -145,40 +155,21 @@ async function leaveRoom() {
 async function closeRoom() {
   if (session.value?.isHost && await leave()) panel.value = ''
 }
-function removeAttempt(id: number) {
-  outbox.value = outbox.value.filter(item => item.id !== id)
-}
-async function sendChat() {
-  const room = session.value
-  const text = draft.value.trim()
-  const roomId = snapshot.value?.roomId
-  if (!room || !roomId || !active.value || blocked.value || !text || chatSendHint(outbox.value, text)) return
-  if (Array.from(text).length > 1000) {
-    error.value = '每条消息最多可发送 1000 个字符。'
-    return
-  }
-  const attempt = reactive<ChatAttempt>({ id: ++nextAttemptId, original: draft.value, error: '' })
-  const started = performance.now()
-  lastChatReceipt.value = { id: attempt.id }
-  outbox.value.push(attempt)
-  draft.value = ''
-  error.value = ''
+async function copyRecovered(original: string, id: number) {
   try {
-    await invoke('lobby_action', { sessionId: room.id, action: { type: 'chat', roomId, text } })
-    removeAttempt(attempt.id)
-  } catch (reason) {
-    attempt.error = String(reason) || '房主未返回发送结果'
-  } finally {
-    if (lastChatReceipt.value?.id === attempt.id) {
-      lastChatReceipt.value = { id: attempt.id, elapsedMs: Math.round(performance.now() - started), confirmed: !attempt.error }
+    await navigator.clipboard.writeText(original)
+    inform('消息原文已复制')
+  } catch {
+    const element = document.getElementById(`recovered-original-${id}`)
+    const selection = window.getSelection()
+    if (element && selection) {
+      const range = document.createRange()
+      range.selectNodeContents(element)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      inform('请按 Ctrl+C 复制选中的原文')
     }
   }
-}
-function restoreAttempt(id: number) {
-  const item = outbox.value.find(attempt => attempt.id === id)
-  if (!item?.error || draft.value || !active.value) return
-  draft.value = item.original
-  removeAttempt(id)
 }
 async function openShare() {
   const current = session.value
@@ -213,10 +204,7 @@ function dismissBanner() {
 }
 watch(() => session.value?.id, () => {
   shareLink.value = ''
-  lastChatReceipt.value = undefined
-  draft.value = ''
-  outbox.value = []
-})
+}, { flush: 'sync' })
 watch(offline, message => {
   if (message && ['invite', 'close', 'connection'].includes(panel.value)) panel.value = ''
 })
@@ -268,6 +256,19 @@ watch(offline, message => {
             <img src="/grovecall.png" width="164" height="164" alt="" />
           </div>
         </section>
+        <section v-if="recovery.length" id="chat-recovery" class="history" aria-labelledby="recovery-title">
+          <header class="history-heading"><h2 id="recovery-title">待恢复的消息</h2></header>
+          <ul class="history-list">
+            <li v-for="item in recovery" :key="item.id" class="recovery-item">
+              <p><strong>{{ item.kind === 'draft' ? '未发送草稿' : '发送未确认' }}</strong><span>{{ item.roomName }}</span></p>
+              <p :id="`recovered-original-${item.id}`" class="recovery-original">{{ item.original }}</p>
+              <div>
+                <button type="button" class="text-button" @click="copyRecovered(item.original, item.id)">复制原文</button>
+                <button type="button" class="text-button" @click="removeRecovery(item.id)">移除</button>
+              </div>
+            </li>
+          </ul>
+        </section>
         <section class="history" aria-labelledby="history-title">
           <header class="history-heading">
             <h2 id="history-title">历史房间</h2>
@@ -315,8 +316,9 @@ watch(offline, message => {
 
     <ProfileEditor v-if="editingProfile && preferences" :preferences="preferences" :first-run="firstRun" @close="closePanel" @saved="profileSaved" />
     <SettingsDialog v-else-if="(panel === 'audio' || panel === 'updates' || panel === 'diagnostics') && preferences" :tab="panel" :level="level"
-      :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice" :updater="updater" :controls="audioControls" @tab="panel = $event" @close="closePanel" />
-    <Dialog v-else-if="panel" :key="panel" :title="panelTitles[panel]" :dismissible="!busy" @close="closePanel">
+      :speaking="!!snapshot && speakers.includes(snapshot.selfId)" :connected="inVoice" :preview-error="previewError"
+      :updater="updater" :controls="audioControls" @tab="panel = $event" @close="closePanel" />
+    <Dialog v-else-if="panel" :key="panel" :title="panelTitles[panel]" :dismissible="!busy || canDismissJoin" @close="closePanel">
       <div v-if="panel === 'connection'">
         <div role="status">
           <p v-if="detailsError" class="dialog-desc">暂时无法读取连接信息，请刷新重试。</p>
@@ -333,12 +335,13 @@ watch(offline, message => {
         </div>
         <footer v-if="details?.transport !== 'local'" class="dialog-actions"><button class="button" :disabled="!details && !detailsError" @click="detailsRefresh++">刷新</button></footer>
       </div>
-      <form v-else-if="panel === 'join'" @submit.prevent="enter">
+      <form v-else-if="panel === 'join'" class="join-form" @submit.prevent="enter">
         <p v-if="active" class="dialog-desc">{{ session?.isHost ? '加入成功后会关闭你的房间，当前成员会断开连接。' : '加入成功后会退出当前房间。' }}</p>
         <label class="field">好友的邀请链接<input v-model.trim="invite" required autofocus spellcheck="false" placeholder="粘贴友声邀请链接" :disabled="busy" /></label>
         <p v-if="error" class="form-error" role="alert">{{ error }}</p>
+        <p v-if="joinFeedback" class="dialog-desc" role="status">{{ joinFeedback }}</p>
         <footer class="dialog-actions">
-          <button class="button" type="button" :disabled="busy" @click="closePanel">取消</button>
+          <button class="button" type="button" :disabled="busy && !canDismissJoin" @click="closePanel">取消</button>
           <button class="button tinted" :disabled="blocked || !invite.trim()">{{ busy ? '正在加入…' : '加入房间' }}</button>
         </footer>
       </form>
@@ -361,3 +364,10 @@ watch(offline, message => {
     </Dialog>
   </div>
 </template>
+
+<style scoped>
+.recovery-item { padding: 12px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.recovery-item span { margin-inline-start: 8px; color: var(--muted); }
+.recovery-original { margin: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.recovery-item .text-button + .text-button { margin-inline-start: 12px; }
+</style>

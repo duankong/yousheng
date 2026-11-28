@@ -1,6 +1,6 @@
 //! The same authenticated peer connection carries lobby/signaling streams and
 //! encrypted WebRTC UDP packets, whether iroh chooses a direct path or relay.
-use crate::diagnostics::{Diagnostics, Event, Role};
+use crate::diagnostics::{Diagnostics, Event, Role, RoomDiagnostics, RoomPhase};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use futures_util::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
@@ -313,6 +313,7 @@ impl HostEndpoint {
         });
         Ok(Self { ep, accept })
     }
+    #[cfg(test)]
     pub fn id(&self) -> String {
         self.ep.id().to_string()
     }
@@ -618,34 +619,43 @@ pub struct GuestEndpoint {
     pub media: SocketAddrV4,
 }
 impl GuestEndpoint {
-    pub async fn start(ticket: &Ticket, diagnostics: Diagnostics) -> Result<Self> {
+    pub async fn start(ticket: &Ticket, diagnostics: &RoomDiagnostics) -> Result<Self> {
         let ep = endpoint_builder().bind().await.map_err(err)?;
         if force_relay() {
             timeout(Duration::from_secs(12), ep.online())
                 .await
                 .map_err(|_| "本机无法连接中转服务".to_string())?;
         }
-        let conn = timeout(
-            Duration::from_secs(20),
-            ep.connect(ticket.address.clone(), ALPN),
-        )
-        .await
-        .map_err(|_| "房间暂时离线，或此网络无法连接中转".to_string())?
-        .map_err(|e| format!("无法建立到房间的加密连接：{e}"))?;
-        let (mut tx, mut rx) = conn
-            .open_bi()
-            .await
-            .map_err(|e| format!("无法打开房间认证连接：{e}"))?;
-        tx.write_all(ticket.key.as_bytes()).await.map_err(err)?;
-        tx.finish().map_err(err)?;
-        let mut ack = [0; 2];
-        timeout(Duration::from_secs(6), rx.read_exact(&mut ack))
-            .await
-            .map_err(|_| "房间邀请认证响应超时".to_string())?
-            .map_err(|e| format!("房间未接受邀请：{e}"))?;
-        if &ack != b"OK" {
-            return Err("邀请被拒绝".into());
-        }
+        let conn = diagnostics
+            .measure(RoomPhase::DialPeer, async {
+                timeout(
+                    Duration::from_secs(20),
+                    ep.connect(ticket.address.clone(), ALPN),
+                )
+                .await
+                .map_err(|_| "房间暂时离线，或此网络无法连接中转".to_string())?
+                .map_err(|e| format!("无法建立到房间的加密连接：{e}"))
+            })
+            .await?;
+        diagnostics
+            .measure(RoomPhase::AuthenticateInvite, async {
+                let (mut tx, mut rx) = conn
+                    .open_bi()
+                    .await
+                    .map_err(|e| format!("无法打开房间认证连接：{e}"))?;
+                tx.write_all(ticket.key.as_bytes()).await.map_err(err)?;
+                tx.finish().map_err(err)?;
+                let mut ack = [0; 2];
+                timeout(Duration::from_secs(6), rx.read_exact(&mut ack))
+                    .await
+                    .map_err(|_| "房间邀请认证响应超时".to_string())?
+                    .map_err(|e| format!("房间未接受邀请：{e}"))?;
+                if &ack != b"OK" {
+                    return Err("邀请被拒绝".to_owned());
+                }
+                Ok(())
+            })
+            .await?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(err)?;
@@ -654,7 +664,12 @@ impl GuestEndpoint {
         let udp = UdpSocket::bind((ip, 0)).await.map_err(err)?;
         let media = SocketAddrV4::new(ip, udp.local_addr().map_err(err)?.port());
         let media_counters = Arc::new(MediaStreamCounters::default());
-        observe_transport(&conn, Role::Guest, diagnostics, media_counters.clone());
+        observe_transport(
+            &conn,
+            Role::Guest,
+            diagnostics.handle(),
+            media_counters.clone(),
+        );
         let stream_conn = conn.clone();
         let streams = tokio::spawn(async move {
             loop {

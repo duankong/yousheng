@@ -117,6 +117,7 @@ pub(super) async fn install_update(
         .await
         .map_err(|e| format!("下载或验证更新失败：{e}"))?;
     let mut session = install_session(&state, session_id.as_deref())?;
+    let installing = state.rooms.begin_install()?;
     if let Some(host) = session.as_ref().and_then(|s| s.host.as_ref()) {
         host.stop_if_empty().await?;
     }
@@ -124,7 +125,7 @@ pub(super) async fn install_update(
         current.close().await;
     }
     // Shutdown may have been requested while the old room was draining.
-    state.rooms.check_install_ready()?;
+    installing.check_ready()?;
     if let Err(error) = update.install(bytes) {
         if let Some(id) = session_id {
             emit_room(

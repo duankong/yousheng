@@ -1,7 +1,7 @@
 use crate::{
     client::{emit_room, AcceptedRoom, Client, ClientCommands},
     diagnostics::{Diagnostics, Role, RoomDiagnostics, RoomPhase},
-    host::Host,
+    host::{Host, HostIdentity},
     network::{GuestEndpoint, Ticket},
     player_profile,
     preferences::{Preferences, Profile, RecentRoom},
@@ -149,55 +149,90 @@ async fn host_lobby(
     state: State<'_, Desktop>,
     session_id: String,
 ) -> Result<ConnectionInfo, String> {
-    let mut slot = state.rooms.current.write().await;
-    let opening = state.rooms.begin_opening()?;
-    if let Some(session) = opening.publish(|| slot.take())? {
-        session.close().await;
+    let (host_start, opening) = state.rooms.begin_host(&session_id).await?;
+    {
+        let mut slot = state.rooms.current.write().await;
+        opening.drain(&mut slot).await?;
     }
-    let profile = opening
-        .prepare(async { Ok(state.profile.lock().await) })
+    let (identity, owner_nickname) = opening
+        .prepare(async {
+            let profile = state.profile.lock().await;
+            let owner_nickname = player_profile::nickname(&profile.settings.nickname)?.to_owned();
+            Ok((HostIdentity::from(&*profile), owner_nickname))
+        })
         .await?;
-    let name = player_profile::nickname(&profile.settings.nickname)?;
     let executable = executable(&app)?;
     let diagnostics = state.diagnostics.room(Role::Host);
     let host = opening
         .prepare(diagnostics.measure(
             RoomPhase::StartHost,
-            Host::start(&profile, &executable, diagnostics.handle()),
+            Host::start(&identity, &executable, owner_nickname, diagnostics.handle()),
         ))
         .await?;
-    let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name,"avatar":profile.settings.avatar});
-    drop(profile);
-    let accepted = match opening
-        .prepare(diagnostics.measure(
-            RoomPhase::AcceptRoom,
-            AcceptedRoom::connect(host.gateway, hello),
-        ))
-        .await
-    {
-        Ok(accepted) => accepted,
-        Err(e) => {
-            host.close().await;
-            return Err(e);
-        }
-    };
-    let info = ConnectionInfo {
-        id: session_id.clone(),
-        invite: host.invite.clone(),
-        is_host: true,
-        snapshot: accepted.snapshot().clone(),
-        history_error: None,
-    };
-    opening.publish(|| {
-        diagnostics.mark(RoomPhase::Ready);
-        *slot = Some(Session {
+    let gateway = host.gateway;
+    let invite = host.invite.clone();
+    let credential = host.credential.clone();
+    let mut host = Some(host);
+    let published = async {
+        let (nickname, avatar) = opening
+            .prepare(async {
+                let profile = state.profile.lock().await;
+                Ok((
+                    player_profile::nickname(&profile.settings.nickname)?.to_owned(),
+                    profile.settings.avatar.clone(),
+                ))
+            })
+            .await?;
+        let hello = json!({"type":"hello","inviteKey":identity.invite_key,"identity":credential,"nickname":nickname,"avatar":avatar});
+        let accepted = opening
+            .prepare(diagnostics.measure(
+                RoomPhase::AcceptRoom,
+                AcceptedRoom::connect(gateway, hello, &diagnostics),
+            ))
+            .await?;
+        let info = ConnectionInfo {
             id: session_id.clone(),
-            client: state.activate(app, accepted, &session_id, &diagnostics),
-            host: Some(host),
-            guest: None,
-            diagnostics,
-        });
-    })?;
+            invite,
+            is_host: true,
+            snapshot: accepted.snapshot().clone(),
+            history_error: None,
+        };
+        let profile = opening
+            .prepare(async { Ok(state.profile.lock().await) })
+            .await?;
+        let mut slot = opening
+            .prepare(async { Ok(state.rooms.current.write().await) })
+            .await?;
+        opening.publish(|| {
+            diagnostics.mark(RoomPhase::Ready);
+            let client = state.activate(app.clone(), accepted, &session_id, &diagnostics);
+            let reply = sync_admitted_profile(&client.commands, &profile.settings, &nickname, &avatar);
+            *slot = Some(Session {
+                id: session_id.clone(),
+                client,
+                host: host.take(),
+                guest: None,
+                diagnostics,
+            });
+            (info, reply)
+        })
+    }
+    .await;
+    if let Some(host) = host {
+        host.close().await;
+    }
+    let (info, reply) = published?;
+    drop(opening);
+    drop(host_start);
+    if let Some(reply) = reply {
+        if let Err(error) = reply.await {
+            emit_room(
+                &app,
+                &session_id,
+                json!({"type":"error","message":profile_sync_error(error)}),
+            );
+        }
+    }
     Ok(info)
 }
 
@@ -225,49 +260,48 @@ async fn join_lobby(
     let invite = invite.trim().to_owned();
     let ticket = Ticket::parse(&invite)?;
     let host_id = ticket.address.id;
+    let opening = state.rooms.begin_join(&session_id, host_id).await?;
     let diagnostics = state.diagnostics.room(Role::Guest);
-    let (opening, (guest, accepted)) = state
-        .rooms
-        .prepare_join(host_id, async {
-            let (name, id, avatar) = {
-                let profile = state.profile.lock().await;
-                if host_id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
-                    return Err("这是本机房间的邀请".into());
-                }
-                (
-                    player_profile::nickname(&profile.settings.nickname)?.to_owned(),
-                    profile.player_credential(&host_id.to_string()),
-                    profile.settings.avatar.clone(),
-                )
-            };
-            let guest = diagnostics
-                .measure(
-                    RoomPhase::ConnectTunnel,
-                    // Keep iroh's connection future off the Windows IPC thread stack.
-                    Box::pin(GuestEndpoint::start(&ticket, diagnostics.handle())),
-                )
-                .await?;
-            let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
-            match diagnostics
-                .measure(
-                    RoomPhase::AcceptRoom,
-                    AcceptedRoom::connect(guest.gateway, hello),
-                )
-                .await
-            {
-                Ok(accepted) => Ok((guest, accepted)),
-                Err(e) => {
-                    guest.close().await;
-                    Err(e)
-                }
+    let (name, id, avatar) = opening
+        .prepare(async {
+            let profile = state.profile.lock().await;
+            if host_id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
+                return Err("这是本机房间的邀请".into());
             }
+            Ok((
+                player_profile::nickname(&profile.settings.nickname)?.to_owned(),
+                profile.player_credential(&host_id.to_string()),
+                profile.settings.avatar.clone(),
+            ))
         })
         .await?;
-
+    let guest = opening
+        .prepare(diagnostics.measure(
+            RoomPhase::ConnectTunnel,
+            // Keep iroh's connection future off the Windows IPC thread stack.
+            Box::pin(GuestEndpoint::start(&ticket, &diagnostics)),
+        ))
+        .await?;
+    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
+    let accepted = match opening
+        .prepare(diagnostics.measure(
+            RoomPhase::AcceptRoom,
+            AcceptedRoom::connect(guest.gateway, hello, &diagnostics),
+        ))
+        .await
+    {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            guest.close().await;
+            return Err(error);
+        }
+    };
     let snapshot = accepted.snapshot().clone();
-    state
+    let mut candidate = Some((guest, accepted));
+    if let Err(error) = state
         .rooms
         .replace(&opening, || {
+            let (guest, accepted) = candidate.take().expect("prepared guest");
             diagnostics.mark(RoomPhase::Ready);
             Session {
                 id: session_id.clone(),
@@ -277,7 +311,13 @@ async fn join_lobby(
                 diagnostics,
             }
         })
-        .await?;
+        .await
+    {
+        let (guest, accepted) = candidate.expect("unpublished guest");
+        drop(accepted);
+        guest.close().await;
+        return Err(error);
+    }
     drop(opening);
     let nickname = snapshot["ownerNickname"]
         .as_str()
@@ -295,6 +335,11 @@ async fn join_lobby(
         snapshot,
         history_error,
     })
+}
+
+#[tauri::command]
+async fn cancel_join(state: State<'_, Desktop>, session_id: String) -> Result<bool, String> {
+    Ok(state.rooms.cancel_join(&session_id))
 }
 
 #[tauri::command]
@@ -408,6 +453,35 @@ mod command_tests {
                 && third.await.unwrap().is_ok()
         );
     }
+
+    #[tokio::test]
+    async fn profile_saved_during_host_admission_is_queued_before_the_next_save() {
+        let (client, mut host) = crate::client::tests::command_peer();
+        let storage = tempfile::tempdir().unwrap();
+        let mut profile = Profile::load(storage.path().into()).unwrap();
+        let mut during_admission = profile.settings.clone();
+        during_admission.nickname = "更新后的房主".into();
+        during_admission.avatar = "updated-avatar".into();
+        profile.save(during_admission).unwrap();
+
+        let mut replay = Box::pin(
+            sync_admitted_profile(&client.commands, &profile.settings, "原来的房主", "")
+                .expect("profile changed since hello"),
+        );
+        let next = send_profile(&client.commands, "再次修改的房主", "");
+        let (message, ack) = host.recv().await.unwrap();
+        assert_eq!(
+            message,
+            json!({"type":"profile","nickname":"更新后的房主","avatar":"updated-avatar"})
+        );
+        let (next_message, next_ack) = host.recv().await.unwrap();
+        assert_eq!(next_message["nickname"], "再次修改的房主");
+        next_ack.send(Ok(())).unwrap();
+        assert!(next.await.is_ok());
+        assert!(futures_util::poll!(&mut replay).is_pending());
+        ack.send(Ok(())).unwrap();
+        assert!(replay.await.is_ok());
+    }
 }
 #[tauri::command]
 async fn get_preferences(state: State<'_, Desktop>) -> Result<Preferences, String> {
@@ -428,6 +502,29 @@ struct ProfileUpdate {
     profile_sync_error: Option<String>,
 }
 
+fn send_profile(
+    client: &ClientCommands,
+    nickname: &str,
+    avatar: &str,
+) -> impl std::future::Future<Output = Result<(), String>> + 'static {
+    client.send(json!({"type":"profile","nickname":nickname,"avatar":avatar}))
+}
+
+fn sync_admitted_profile(
+    client: &ClientCommands,
+    settings: &Preferences,
+    nickname: &str,
+    avatar: &str,
+) -> Option<impl std::future::Future<Output = Result<(), String>> + 'static> {
+    let current = settings.nickname.trim();
+    (current != nickname || settings.avatar != avatar)
+        .then(|| send_profile(client, current, &settings.avatar))
+}
+
+fn profile_sync_error(error: String) -> String {
+    format!("个人资料已保存在本机。当前房间同步失败，重新加入后将使用新资料。{error}")
+}
+
 #[tauri::command]
 async fn set_profile(
     state: State<'_, Desktop>,
@@ -436,30 +533,23 @@ async fn set_profile(
 ) -> Result<ProfileUpdate, String> {
     let nickname = player_profile::nickname(&nickname)?.to_owned();
     player_profile::validate_avatar(&avatar)?;
-    let commands = current_commands(&state.rooms.current, None);
     let mut profile = state.profile.lock().await;
     let mut preferences = profile.settings.clone();
     preferences.nickname = nickname.clone();
     preferences.avatar = avatar.clone();
     profile.save(preferences)?;
-    let pending = commands.map(|available| {
-        available.map(|client| {
-            client.send(json!({"type":"profile","nickname":nickname,"avatar":avatar}))
-        })
-    });
+    let pending = current_commands(&state.rooms.current, None)
+        .map(|available| available.map(|client| send_profile(&client, &nickname, &avatar)));
     drop(profile);
     let sync = match pending {
         Ok(Some(reply)) => reply.await,
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
-    let profile_sync_error = sync.err().map(|error| {
-        format!("个人资料已保存在本机。当前房间同步失败，重新加入后将使用新资料。{error}")
-    });
     Ok(ProfileUpdate {
         nickname,
         avatar,
-        profile_sync_error,
+        profile_sync_error: sync.err().map(profile_sync_error),
     })
 }
 #[tauri::command]
@@ -647,6 +737,7 @@ pub fn run() {
             host_lobby,
             share_host_invite,
             join_lobby,
+            cancel_join,
             leave_lobby,
             lobby_action,
             get_preferences,

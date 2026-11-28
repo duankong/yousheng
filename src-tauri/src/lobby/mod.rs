@@ -55,6 +55,7 @@ struct Member {
     session: Uuid,
     name: String,
     avatar: String,
+    avatar_revision: u64,
     playback: Option<std::net::SocketAddrV4>,
     membership: Option<Membership>,
     dirty: watch::Sender<()>,
@@ -207,9 +208,13 @@ impl Core {
             })
             .transpose()?;
         let (tx, rx) = watch::channel(());
-        if self.members.get(&id).map_or("", |m| m.avatar.as_str()) != avatar {
-            self.avatar_revision += 1;
-        }
+        let avatar_revision =
+            if let Some(old) = self.members.get(&id).filter(|old| old.avatar == avatar) {
+                old.avatar_revision
+            } else {
+                self.avatar_revision += 1;
+                self.avatar_revision
+            };
         if id == self.owner {
             self.owner_nickname = name.into();
         }
@@ -219,6 +224,7 @@ impl Core {
                 session,
                 name: name.into(),
                 avatar,
+                avatar_revision,
                 playback,
                 membership: None,
                 dirty: tx,
@@ -238,7 +244,7 @@ impl Core {
             .iter()
             .map(|(id, m)| {
                 let mut member = json!({"id":id, "name":m.name});
-                if sent_avatar_revision != Some(self.avatar_revision) {
+                if sent_avatar_revision.is_none_or(|sent| m.avatar_revision > sent) {
                     member["avatar"] = json!(m.avatar);
                 }
                 member
@@ -276,6 +282,7 @@ impl Core {
                     player_profile::validate_avatar(&avatar)?;
                     member.avatar = avatar;
                     self.avatar_revision += 1;
+                    member.avatar_revision = self.avatar_revision;
                 }
                 member.name = name.into();
                 if id == self.owner {
@@ -452,9 +459,6 @@ async fn socket(mut ws: WebSocket, state: Shared) {
     let mut core = state.core.lock().await;
     if core.active(&id, session) {
         let member = core.members.remove(&id).unwrap();
-        if !member.avatar.is_empty() {
-            core.avatar_revision += 1;
-        }
         if let Some(membership) = member.membership {
             media::cleanup(&state, &mut core, id, membership);
         }

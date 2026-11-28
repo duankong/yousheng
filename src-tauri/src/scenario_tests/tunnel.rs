@@ -68,15 +68,16 @@ async fn tunnel_exchange() -> Result<(), String> {
         let invite = host.share_invite(key.clone()).await?;
         let mut bad = Ticket::parse(&invite)?;
         bad.key = "b".repeat(64);
+        let diagnostics = crate::diagnostics::Diagnostics::default();
         if let Ok(unexpected) =
-            GuestEndpoint::start(&bad, crate::diagnostics::Diagnostics::default()).await
+            GuestEndpoint::start(&bad, &diagnostics.room(crate::diagnostics::Role::Guest)).await
         {
             unexpected.close().await;
             return Err("host accepted invalid invite key".to_string());
         }
         let guest = GuestEndpoint::start(
             &Ticket::parse(&invite)?,
-            crate::diagnostics::Diagnostics::default(),
+            &diagnostics.room(crate::diagnostics::Role::Guest),
         )
         .await?;
         let exchanges = async {

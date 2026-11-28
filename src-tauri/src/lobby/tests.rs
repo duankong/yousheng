@@ -594,6 +594,10 @@ async fn two_sockets_observe_profile_changes_without_interrupting_voice_or_chat(
         assert_eq!(changed["name"], "新昵称");
         assert_eq!(changed["avatar"], avatar);
         assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .filter(|member| member["id"] != *guest_id)
+            .all(|member| member.get("avatar").is_none()));
         assert_eq!(remote["roomId"], *id);
         assert!(remote["messagesAfter"].is_string());
         assert_eq!(remote["messages"], json!([]));
