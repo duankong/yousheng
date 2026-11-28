@@ -11,7 +11,6 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
 };
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
@@ -19,7 +18,10 @@ use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
+mod rooms;
 mod updates;
+
+use rooms::RoomState;
 
 struct Session {
     id: String,
@@ -46,10 +48,9 @@ struct Desktop {
     profile: AsyncMutex<Profile>,
     voice: Arc<VoiceEngine>,
     diagnostics: Diagnostics,
-    session: RwLock<Option<Session>>,
+    rooms: RoomState,
     available_update: AsyncMutex<Option<tauri_plugin_updater::Update>>,
     invite: Mutex<Option<String>>,
-    closing: AtomicBool,
 }
 impl Desktop {
     fn activate(
@@ -70,7 +71,7 @@ impl Desktop {
                 // The socket task has to finish before teardown can join it.
                 tokio::spawn(async move {
                     let state = notify.state::<Desktop>();
-                    let mut slot = state.session.write().await;
+                    let mut slot = state.rooms.current.write().await;
                     if let Some(session) = slot.take_if(|session| session.id == id) {
                         session.diagnostics.mark(RoomPhase::Disconnected);
                         session.close().await;
@@ -102,7 +103,7 @@ struct ConnectionDetails {
 
 #[tauri::command]
 async fn lobby_connection_details(state: State<'_, Desktop>) -> Result<ConnectionDetails, String> {
-    let slot = state.session.read().await;
+    let slot = state.rooms.current.read().await;
     let session = slot.as_ref().ok_or("房间已断开")?;
     let (transport, rtt_ms) = match &session.guest {
         None => ("local", None),
@@ -148,27 +149,30 @@ async fn host_lobby(
     state: State<'_, Desktop>,
     session_id: String,
 ) -> Result<ConnectionInfo, String> {
-    let mut slot = state.session.write().await;
-    if let Some(session) = slot.take() {
+    let mut slot = state.rooms.current.write().await;
+    let opening = state.rooms.begin_opening()?;
+    if let Some(session) = opening.publish(|| slot.take())? {
         session.close().await;
     }
-    let profile = state.profile.lock().await;
+    let profile = opening
+        .prepare(async { Ok(state.profile.lock().await) })
+        .await?;
     let name = player_profile::nickname(&profile.settings.nickname)?;
     let executable = executable(&app)?;
     let diagnostics = state.diagnostics.room(Role::Host);
-    let host = diagnostics
-        .measure(
+    let host = opening
+        .prepare(diagnostics.measure(
             RoomPhase::StartHost,
             Host::start(&profile, &executable, diagnostics.handle()),
-        )
+        ))
         .await?;
     let hello = json!({"type":"hello","inviteKey":profile.invite_key,"identity":host.credential,"nickname":name,"avatar":profile.settings.avatar});
     drop(profile);
-    let accepted = match diagnostics
-        .measure(
+    let accepted = match opening
+        .prepare(diagnostics.measure(
             RoomPhase::AcceptRoom,
             AcceptedRoom::connect(host.gateway, hello),
-        )
+        ))
         .await
     {
         Ok(accepted) => accepted,
@@ -184,14 +188,16 @@ async fn host_lobby(
         snapshot: accepted.snapshot().clone(),
         history_error: None,
     };
-    diagnostics.mark(RoomPhase::Ready);
-    *slot = Some(Session {
-        id: session_id.clone(),
-        client: state.activate(app, accepted, &session_id, &diagnostics),
-        host: Some(host),
-        guest: None,
-        diagnostics,
-    });
+    opening.publish(|| {
+        diagnostics.mark(RoomPhase::Ready);
+        *slot = Some(Session {
+            id: session_id.clone(),
+            client: state.activate(app, accepted, &session_id, &diagnostics),
+            host: Some(host),
+            guest: None,
+            diagnostics,
+        });
+    })?;
     Ok(info)
 }
 
@@ -199,7 +205,7 @@ async fn host_lobby(
 async fn share_host_invite(state: State<'_, Desktop>) -> Result<String, String> {
     let key = state.profile.lock().await.invite_key.clone();
     let invite = {
-        let slot = state.session.read().await;
+        let slot = state.rooms.current.read().await;
         let host = slot
             .as_ref()
             .and_then(|s| s.host.as_ref())
@@ -219,50 +225,60 @@ async fn join_lobby(
     let invite = invite.trim().to_owned();
     let ticket = Ticket::parse(&invite)?;
     let host_id = ticket.address.id;
-    let mut slot = state.session.write().await;
-    if slot.as_ref().is_some_and(|s| {
-        s.client.is_connected() && s.guest.as_ref().is_some_and(|g| g.host_id() == host_id)
-    }) {
-        return Err("你已在这个房间".into());
-    }
-    let profile = state.profile.lock().await;
-    if host_id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
-        return Err("这是本机房间的邀请".into());
-    }
-    let name = player_profile::nickname(&profile.settings.nickname)?.to_owned();
-    let host_id = host_id.to_string();
-    let id = profile.player_credential(&host_id);
-    let avatar = profile.settings.avatar.clone();
-    drop(profile);
-
     let diagnostics = state.diagnostics.room(Role::Guest);
-    let guest = diagnostics
-        .measure(
-            RoomPhase::ConnectTunnel,
-            GuestEndpoint::start(&ticket, diagnostics.handle()),
-        )
+    let (opening, (guest, accepted)) = state
+        .rooms
+        .prepare_join(host_id, async {
+            let (name, id, avatar) = {
+                let profile = state.profile.lock().await;
+                if host_id == iroh::SecretKey::from_bytes(&profile.host_key).public() {
+                    return Err("这是本机房间的邀请".into());
+                }
+                (
+                    player_profile::nickname(&profile.settings.nickname)?.to_owned(),
+                    profile.player_credential(&host_id.to_string()),
+                    profile.settings.avatar.clone(),
+                )
+            };
+            let guest = diagnostics
+                .measure(
+                    RoomPhase::ConnectTunnel,
+                    // Keep iroh's connection future off the Windows IPC thread stack.
+                    Box::pin(GuestEndpoint::start(&ticket, diagnostics.handle())),
+                )
+                .await?;
+            let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
+            match diagnostics
+                .measure(
+                    RoomPhase::AcceptRoom,
+                    AcceptedRoom::connect(guest.gateway, hello),
+                )
+                .await
+            {
+                Ok(accepted) => Ok((guest, accepted)),
+                Err(e) => {
+                    guest.close().await;
+                    Err(e)
+                }
+            }
+        })
         .await?;
-    let hello = json!({"type":"hello","inviteKey":ticket.key,"identity":id,"nickname":name,"avatar":avatar,"playbackAddress":guest.media.to_string()});
-    let accepted = match diagnostics
-        .measure(
-            RoomPhase::AcceptRoom,
-            AcceptedRoom::connect(guest.gateway, hello),
-        )
-        .await
-    {
-        Ok(accepted) => accepted,
-        Err(e) => {
-            guest.close().await;
-            return Err(e);
-        }
-    };
 
-    // The target has admitted us. Retire the old socket and microphone before
-    // publishing the new room or letting it open a media session.
-    if let Some(session) = slot.take() {
-        session.close().await;
-    }
     let snapshot = accepted.snapshot().clone();
+    state
+        .rooms
+        .replace(&opening, || {
+            diagnostics.mark(RoomPhase::Ready);
+            Session {
+                id: session_id.clone(),
+                client: state.activate(app, accepted, &session_id, &diagnostics),
+                host: None,
+                guest: Some(guest),
+                diagnostics,
+            }
+        })
+        .await?;
+    drop(opening);
     let nickname = snapshot["ownerNickname"]
         .as_str()
         .expect("checked by room handshake");
@@ -270,16 +286,8 @@ async fn join_lobby(
         .profile
         .lock()
         .await
-        .remember_room(&host_id, nickname, &invite)
+        .remember_room(&host_id.to_string(), nickname, &invite)
         .err();
-    diagnostics.mark(RoomPhase::Ready);
-    *slot = Some(Session {
-        id: session_id.clone(),
-        client: state.activate(app, accepted, &session_id, &diagnostics),
-        host: None,
-        guest: Some(guest),
-        diagnostics,
-    });
     Ok(ConnectionInfo {
         id: session_id,
         invite,
@@ -291,14 +299,7 @@ async fn join_lobby(
 
 #[tauri::command]
 async fn leave_lobby(state: State<'_, Desktop>, session_id: String) -> Result<(), String> {
-    let mut slot = state.session.write().await;
-    if slot.as_ref().is_some_and(|s| s.id != session_id) {
-        return Err("房间已切换".into());
-    }
-    if let Some(session) = slot.take() {
-        session.close().await;
-    }
-    Ok(())
+    state.rooms.leave(&session_id).await
 }
 #[tauri::command]
 async fn lobby_action(
@@ -306,7 +307,7 @@ async fn lobby_action(
     session_id: String,
     action: Value,
 ) -> Result<(), String> {
-    send_lobby_action(&state.session, &session_id, action).await
+    send_lobby_action(&state.rooms.current, &session_id, action).await
 }
 
 fn current_commands(
@@ -435,7 +436,7 @@ async fn set_profile(
 ) -> Result<ProfileUpdate, String> {
     let nickname = player_profile::nickname(&nickname)?.to_owned();
     player_profile::validate_avatar(&avatar)?;
-    let commands = current_commands(&state.session, None);
+    let commands = current_commands(&state.rooms.current, None);
     let mut profile = state.profile.lock().await;
     let mut preferences = profile.settings.clone();
     preferences.nickname = nickname.clone();
@@ -610,10 +611,9 @@ pub fn run() {
                 profile: AsyncMutex::new(profile),
                 voice: voice.clone(),
                 diagnostics: Diagnostics::default(),
-                session: RwLock::new(None),
+                rooms: RoomState::default(),
                 available_update: AsyncMutex::new(None),
                 invite: Mutex::new(None),
-                closing: AtomicBool::new(false),
             });
             tauri::async_runtime::block_on(async {
                 voice
@@ -665,18 +665,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("无法启动友声");
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
             let state = app.state::<Desktop>();
-            if !state.closing.swap(true, Ordering::SeqCst) {
+            if state.rooms.begin_shutdown() {
                 api.prevent_exit();
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<Desktop>();
-                    if let Some(session) = state.session.write().await.take() {
-                        session.close().await;
-                    }
+                    state.rooms.shutdown().await;
                     handle.exit(0);
                 });
+            } else if code.is_none() {
+                api.prevent_exit();
             }
         }
     });

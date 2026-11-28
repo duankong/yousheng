@@ -23,6 +23,7 @@ use livekit::webrtc::{
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
+use super::diagnostics::{MixerTiming, PlaybackTiming};
 use speaker_preview::SpeakerTone;
 
 pub(super) const RATE: u32 = 48_000;
@@ -377,7 +378,8 @@ impl Playback {
         master: f32,
         mix: &Mutex<Mixer>,
         mut write: impl FnMut(Frame, f32),
-    ) {
+    ) -> MixerTiming {
+        let mut timing = MixerTiming::default();
         let muted = master == 0.0;
         if muted {
             // Drop the two interpolator samples from the previous, audible callback.
@@ -385,7 +387,7 @@ impl Playback {
             self.next = 0.0;
         }
         let Some(last_frame) = frames.len().checked_sub(1) else {
-            return;
+            return timing;
         };
         // Consume exactly the source samples this callback needs, including
         // any fractional phase carried over from the previous callback.
@@ -398,11 +400,14 @@ impl Playback {
             while self.phase >= self.rate {
                 if offset == end {
                     end = remaining.min(BLOCK);
-                    mix.lock().unwrap().mix_block(
-                        &mut self.mixed[..end],
-                        muted,
-                        new_callback.take(),
-                    );
+                    let waited = {
+                        let started = Instant::now();
+                        let mut mix = mix.lock().unwrap();
+                        let waited = started.elapsed();
+                        mix.mix_block(&mut self.mixed[..end], muted, new_callback.take());
+                        waited
+                    };
+                    timing.record(waited);
                     remaining -= end;
                     offset = 0;
                 }
@@ -416,6 +421,7 @@ impl Playback {
             self.phase += RATE;
             write(frame, sample);
         }
+        timing
     }
 }
 
@@ -424,8 +430,9 @@ fn play<T: SizedSample + FromSample<f32>>(
     config: &cpal::StreamConfig,
     mix: Arc<Mutex<Mixer>>,
     control: Arc<CaptureControl>,
-    preview: Arc<AtomicU32>,
+    speaker: Arc<SpeakerControl>,
     reference: Arc<ArrayQueue<ReferenceBlock>>,
+    timing: Arc<PlaybackTiming>,
     err: ErrorCallback,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -437,12 +444,13 @@ where
     let mut playback = Playback::new(device_rate);
     let mut tone = SpeakerTone::new(device_rate);
     let mut priority = devices::CallbackPriority::default();
+    let mut previous_callback = None;
     device.build_output_stream(
         config,
         move |buffer: &mut [T], info| {
+            let callback_at = Instant::now();
             priority.enter();
             let packet_start = if control.echo.load(Ordering::Relaxed) {
-                let callback_at = Instant::now();
                 let time = info.timestamp();
                 Some(
                     callback_at
@@ -456,11 +464,12 @@ where
                 None
             };
             let master = control.playback_gain();
-            let requested = preview.swap(0, Ordering::Relaxed);
+            let requested = speaker.preview.swap(0, Ordering::Relaxed);
             if requested != 0 && requested == master.to_bits() {
                 tone.start(master);
             }
             let frames = buffer.chunks_exact_mut(channels);
+            let frame_count = frames.len();
             let mut index = 0;
             let mut write_frame = |frame: &mut [T], sample: f32| {
                 let output = T::from_sample(sample.clamp(-1.0, 0.999_969_5));
@@ -479,14 +488,24 @@ where
                     index += 1;
                 }
             };
-            if tone.keep_playing_at(master) {
+            let mixer_timing = if tone.keep_playing_at(master) {
                 // Include the local cue in the echo-canceller's playback reference.
                 playback.render(frames, master, &mix, |frame, sample| {
                     write_frame(frame, sample + tone.next_sample());
-                });
+                })
             } else {
-                playback.render(frames, master, &mix, write_frame);
-            }
+                playback.render(frames, master, &mix, write_frame)
+            };
+            let interval = previous_callback
+                .replace(callback_at)
+                .map(|previous| callback_at - previous);
+            timing.record(
+                interval,
+                callback_at.elapsed(),
+                frame_count,
+                device_rate,
+                mixer_timing,
+            );
         },
         err,
         None,
@@ -495,7 +514,29 @@ where
 
 struct SpeakerOutput {
     stream: cpal::Stream,
-    preview: Arc<AtomicU32>,
+    control: Arc<SpeakerControl>,
+}
+
+#[derive(Clone)]
+pub(super) struct CallAudio {
+    pub(super) source: NativeAudioSource,
+    pub(super) playback_timing: Arc<PlaybackTiming>,
+}
+
+#[derive(Default)]
+struct SpeakerControl {
+    failed: Arc<AtomicBool>,
+    preview: AtomicU32,
+}
+
+impl SpeakerControl {
+    fn request(&self, gain: f32) -> bool {
+        if self.failed.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.preview.store(gain.to_bits(), Ordering::Relaxed);
+        true
+    }
 }
 
 pub(super) struct AudioIo {
@@ -536,14 +577,16 @@ pub(super) mod speaker_preview;
 impl AudioIo {
     pub(super) fn failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
+            || self
+                .output
+                .as_ref()
+                .is_some_and(|output| output.control.failed.load(Ordering::Relaxed))
     }
 
     pub(super) fn preview_speaker(&self, gain: f32) -> bool {
-        let Some(output) = self.output.as_ref().filter(|_| !self.failed()) else {
-            return false;
-        };
-        output.preview.store(gain.to_bits(), Ordering::Relaxed);
-        true
+        self.output
+            .as_ref()
+            .is_some_and(|output| output.control.request(gain))
     }
 
     pub(super) async fn stop(self) {
@@ -567,7 +610,7 @@ impl PreparedAudioIo {
         settings: watch::Receiver<AudioSettings>,
         control: Arc<CaptureControl>,
         mix: Arc<Mutex<Mixer>>,
-        source: Option<NativeAudioSource>,
+        call: Option<CallAudio>,
     ) -> Result<Self, String> {
         let input = devices::select(&prefs.input_device, true)?;
         let failed = Arc::new(AtomicBool::new(false));
@@ -583,9 +626,9 @@ impl PreparedAudioIo {
                 error_handler(app, &failed, "麦克风")
             )
         })?;
-        let output = if source.is_some() {
+        let output = if let Some(call) = &call {
             let output = devices::select(&prefs.output_device, false)?;
-            let preview = Arc::new(AtomicU32::new(0));
+            let speaker = Arc::new(SpeakerControl::default());
             let stream = devices::open_stream(&output, false, |format| {
                 build_stream!(
                     format.sample_format(),
@@ -594,12 +637,16 @@ impl PreparedAudioIo {
                     &format.config(),
                     mix.clone(),
                     control.clone(),
-                    preview.clone(),
+                    speaker.clone(),
                     reference.clone(),
-                    error_handler(app, &failed, "扬声器")
+                    call.playback_timing.clone(),
+                    error_handler(app, &speaker.failed, "扬声器")
                 )
             })?;
-            Some(SpeakerOutput { stream, preview })
+            Some(SpeakerOutput {
+                stream,
+                control: speaker,
+            })
         } else {
             None
         };
@@ -607,7 +654,7 @@ impl PreparedAudioIo {
             app: app.clone(),
             settings,
             control,
-            source,
+            source: call.map(|call| call.source),
             input,
             output,
             capture: input_queue,
@@ -865,6 +912,55 @@ mod tests {
         assert!(tone.keep_playing_at(1.0));
         assert!(!tone.keep_playing_at(0.0));
         assert!(!tone.keep_playing_at(1.0));
+    }
+
+    #[test]
+    fn failed_output_rejects_speaker_preview_requests() {
+        let output = SpeakerControl::default();
+        assert!(output.request(0.5));
+        assert_eq!(output.preview.swap(0, Ordering::Relaxed), 0.5f32.to_bits());
+
+        output.failed.store(true, Ordering::Relaxed);
+        assert!(!output.request(0.5));
+        assert_eq!(output.preview.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "measures the local speaker callback with silent PCM"]
+    async fn inspect_playback_cadence() {
+        if std::env::var("DUIPIN_TEST_PLAYBACK_CADENCE").as_deref() != Ok("1") {
+            return;
+        }
+        let device = devices::select("", false).unwrap();
+        let mix = Arc::new(Mutex::new(Mixer::default()));
+        let control = Arc::new(CaptureControl::default());
+        let speaker = Arc::new(SpeakerControl::default());
+        let reference = Arc::new(ArrayQueue::new(REFERENCE_QUEUE_BLOCKS));
+        let timing = Arc::new(PlaybackTiming::default());
+        let stream = devices::open_stream(&device, false, |format| {
+            build_stream!(
+                format.sample_format(),
+                play,
+                &device,
+                &format.config(),
+                mix.clone(),
+                control.clone(),
+                speaker.clone(),
+                reference.clone(),
+                timing.clone(),
+                Box::new(|error| eprintln!("playback probe: {error}"))
+            )
+        })
+        .unwrap();
+        stream.play().unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        drop(stream);
+        let stats = timing.sample().expect("no playback callback was observed");
+        let stats = serde_json::to_value(stats).unwrap();
+        assert!(stats["callback_count"].as_u64().unwrap() > 1);
+        assert!(stats["mixer_lock_count"].as_u64().unwrap() > 0);
+        assert!(stats["max_callback_frames"].as_u64().unwrap() > 0);
+        println!("WASAPI playback: {stats}");
     }
 
     #[tokio::test]

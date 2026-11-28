@@ -51,6 +51,11 @@ pub(crate) enum TransportEvent {
         quic_packets_lost: u64,
         media_stream_fallbacks: u64,
         media_stream_queue_drops: u64,
+        media_stream_queue_expirations: u64,
+        media_stream_open_timeouts: u64,
+        media_stream_write_timeouts: u64,
+        media_stream_send_errors: u64,
+        media_streams_finished: u64,
     },
     SelectedPathChanged {
         link_id: u64,
@@ -72,6 +77,11 @@ pub(crate) enum TransportSamplePhase {
 struct MediaStreamCounters {
     fallbacks: AtomicU64,
     queue_drops: AtomicU64,
+    queue_expirations: AtomicU64,
+    open_timeouts: AtomicU64,
+    write_timeouts: AtomicU64,
+    send_errors: AtomicU64,
+    finished: AtomicU64,
 }
 
 fn transport_label(address: &TransportAddr) -> &'static str {
@@ -116,6 +126,11 @@ fn observe_transport(
                 quic_packets_lost: quic.lost_packets,
                 media_stream_fallbacks: media.fallbacks.load(Ordering::Relaxed),
                 media_stream_queue_drops: media.queue_drops.load(Ordering::Relaxed),
+                media_stream_queue_expirations: media.queue_expirations.load(Ordering::Relaxed),
+                media_stream_open_timeouts: media.open_timeouts.load(Ordering::Relaxed),
+                media_stream_write_timeouts: media.write_timeouts.load(Ordering::Relaxed),
+                media_stream_send_errors: media.send_errors.load(Ordering::Relaxed),
+                media_streams_finished: media.finished.load(Ordering::Relaxed),
             }));
         };
         sample(TransportSamplePhase::Initial);
@@ -466,7 +481,12 @@ impl OutgoingPackets {
     fn new(conn: &Connection, counters: Arc<MediaStreamCounters>) -> Self {
         let (large, queue) = mpsc::channel(MAX_QUEUED_MEDIA_STREAMS);
         let (stop, stopped) = oneshot::channel();
-        tokio::spawn(Self::send_large(conn.clone(), queue, stopped));
+        tokio::spawn(Self::send_large(
+            conn.clone(),
+            queue,
+            stopped,
+            counters.clone(),
+        ));
         Self {
             conn: conn.clone(),
             large,
@@ -502,6 +522,7 @@ impl OutgoingPackets {
         conn: Connection,
         mut queue: mpsc::Receiver<(Instant, Bytes)>,
         mut stopped: oneshot::Receiver<()>,
+        counters: Arc<MediaStreamCounters>,
     ) {
         loop {
             let next = tokio::select! {
@@ -514,6 +535,7 @@ impl OutgoingPackets {
                 return;
             };
             if deadline <= Instant::now() {
+                counters.queue_expirations.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let mut stream = tokio::select! {
@@ -521,8 +543,14 @@ impl OutgoingPackets {
                 _ = &mut stopped => return,
                 opened = timeout_at(deadline, conn.open_uni()) => match opened {
                     Ok(Ok(stream)) => stream,
-                    Ok(Err(_)) => return,
-                    Err(_) => continue,
+                    Ok(Err(_)) => {
+                        counters.send_errors.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(_) => {
+                        counters.open_timeouts.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 },
             };
             let written = tokio::select! {
@@ -533,11 +561,21 @@ impl OutgoingPackets {
                 }
                 written = timeout_at(deadline, stream.write_chunk(frame)) => written,
             };
-            if matches!(written, Ok(Ok(()))) {
-                let _ = stream.finish();
-            } else {
-                let _ = stream.reset(1u8.into());
-            }
+            match written {
+                Ok(Ok(())) => {
+                    // Finishing locally does not wait for peer receipt.
+                    let counter = if stream.finish().is_ok() {
+                        &counters.finished
+                    } else {
+                        &counters.send_errors
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok(Err(_)) => counters.send_errors.fetch_add(1, Ordering::Relaxed),
+                Err(_) => counters.write_timeouts.fetch_add(1, Ordering::Relaxed),
+            };
+            let _ = stream.reset(1u8.into());
         }
     }
 }
@@ -763,6 +801,49 @@ mod tests {
                 .unwrap(),
             Bytes::from_static(b"\x12\x34live audio")
         );
+        let frame = timeout(Duration::from_secs(2), async {
+            guest_conn
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_to_end(MAX_PACKET + 2)
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(&frame[2..], &payload);
+        assert!(counters.finished.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn media_stream_counters_distinguish_queue_expiry_and_stream_open_timeout() {
+        let host = local_endpoint().bind().await.unwrap();
+        let guest = local_endpoint()
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_uni_streams(0u8.into())
+                    .build(),
+            )
+            .bind()
+            .await
+            .unwrap();
+        let (_guest_conn, host_conn) = connect_local(&host, &guest).await;
+        let counters = Arc::new(MediaStreamCounters::default());
+        let (outbound, queue) = mpsc::channel(2);
+        let (_stop, stopped) = oneshot::channel();
+        outbound.try_send((Instant::now(), Bytes::new())).unwrap();
+        outbound
+            .try_send((Instant::now() + Duration::from_millis(500), Bytes::new()))
+            .unwrap();
+        drop(outbound);
+
+        OutgoingPackets::send_large(host_conn, queue, stopped, counters.clone()).await;
+
+        assert_eq!(counters.queue_expirations.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.open_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.write_timeouts.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.finished.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -855,7 +936,8 @@ mod tests {
             .await
             .unwrap();
         let (guest_conn, host_conn) = connect_local(&host, &guest).await;
-        let outgoing = OutgoingPackets::new(&host_conn, Arc::default());
+        let counters = Arc::new(MediaStreamCounters::default());
+        let outgoing = OutgoingPackets::new(&host_conn, counters.clone());
         let payload = vec![7; 16_000];
         outgoing.send(0x1234, &payload).unwrap();
 
@@ -871,6 +953,8 @@ mod tests {
             reset.is_some(),
             "partial media was finished without a reset"
         );
+        assert_eq!(counters.write_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.finished.load(Ordering::Relaxed), 0);
 
         outgoing.send(0x1234, b"live audio").unwrap();
         assert_eq!(

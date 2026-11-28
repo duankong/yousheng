@@ -16,7 +16,12 @@ export interface Snapshot {
   messages: { id: string; authorId: string; authorName: string; text: string; time: number }[]
 }
 
-export type LobbyEvent = (Snapshot | { type: 'error' | 'offline'; message: string }) & { sessionId: string }
+export type SnapshotUpdate = Snapshot & (
+  | { messagesAfter: string; retainedMessageCount: number }
+  | { messagesAfter?: never; retainedMessageCount?: never }
+)
+
+export type LobbyEvent = (SnapshotUpdate | { type: 'error' | 'offline'; message: string }) & { sessionId: string }
 export interface Session { id: string; invite: string; isHost: boolean }
 export interface RecentRoom { hostId: string; nickname: string; invite: string; lastJoinedAt: number }
 

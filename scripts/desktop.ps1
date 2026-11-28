@@ -33,6 +33,8 @@ try {
         $env:LK_CUSTOM_WEBRTC = & (Join-Path $PSScriptRoot 'prepare-webrtc.ps1')
     }
     if ($Mode -eq 'test') {
+        npm.cmd --prefix ui test
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
         npm.cmd --prefix ui run build
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         cargo test --locked --target x86_64-pc-windows-msvc --manifest-path src-tauri/Cargo.toml

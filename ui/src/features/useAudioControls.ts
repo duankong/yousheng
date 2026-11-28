@@ -14,18 +14,21 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
     const audio = current.value
     if (audio) return { ...audio, ...applying.value, ...pending.value }
   })
-  const error = ref('')
+  const writeErrors = reactive(new Map<keyof AudioSettings, string>())
+  const previewError = ref('')
+  const error = computed(() => writeErrors.values().next().value ?? previewError.value)
   const peerChanges = reactive(new Map<string, PeerSettings>())
   let timer: ReturnType<typeof setTimeout> | undefined
   let writing: Promise<boolean> | undefined
+  let flushRequested = false
   let speakerGainBefore: number | undefined
   let speakerRevision = 0
 
   async function drain() {
-    let success = true
     try {
       while (!timer && Object.keys(pending.value).length) {
         const patch = pending.value
+        const keys = Object.keys(patch) as (keyof AudioSettings)[]
         pending.value = {}
         applying.value = patch
         try {
@@ -37,36 +40,48 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
             preferences.value.audio = { ...preferences.value.audio, ...patch }
             preferences.value.shortcutError = null
           }
+          for (const key of keys) writeErrors.delete(key)
         } catch (reason) {
-          error.value = '声音设置未应用：' + String(reason)
-          success = false
+          const message = '声音设置未应用：' + String(reason)
+          for (const key of keys) writeErrors.set(key, message)
         } finally { applying.value = {} }
       }
-      return success
-    } finally { writing = undefined }
+      return writeErrors.size === 0
+    } finally {
+      writing = undefined
+      flushRequested = false
+    }
   }
 
-  function flush(): Promise<boolean> {
+  function savePending(immediate: boolean): Promise<boolean> {
     clearTimeout(timer)
     timer = undefined
-    if (writing) return writing
+    if (writing) {
+      if (immediate) flushRequested = true
+      return writing
+    }
     if (!Object.keys(pending.value).length) return Promise.resolve(true)
+    flushRequested = immediate
     writing = Promise.resolve().then(drain)
     return writing
+  }
+
+  function flush() {
+    return savePending(true)
   }
 
   function change<K extends keyof AudioSettings>(key: K, value: AudioSettings[K], dragging = false) {
     const audio = effective.value
     if (!audio || audio[key] === value) return
-    if (key === 'outputGain') {
-      speakerGainBefore ??= audio.outputGain
+    if (key === 'outputGain' || key === 'outputMuted' || key === 'outputDevice') {
+      if (key === 'outputGain') speakerGainBefore ??= audio.outputGain
       ++speakerRevision
+      previewError.value = ''
     }
     pending.value = { ...pending.value, [key]: value }
-    error.value = ''
     // A sustained drag previews periodically. Pointer release and navigation flush immediately.
     if (!dragging) void flush()
-    else if (!timer) timer = setTimeout(flush, 120)
+    else if (!timer && !flushRequested) timer = setTimeout(() => { void savePending(false) }, 120)
   }
 
   async function finishGain(key: AudioGain) {
@@ -78,14 +93,16 @@ export function useAudioControls(preferences: Ref<Preferences | undefined>) {
     speakerGainBefore = undefined
     const revision = speakerRevision
     const audio = effective.value
-    const saved = await flush()
-    if (!saved || !audio || before === undefined || audio.outputGain === before ||
+    await flush()
+    const applied = current.value
+    if (!audio || before === undefined || audio.outputGain === before ||
         audio.outputGain === 0 || audio.outputMuted || revision !== speakerRevision ||
-        effective.value?.outputMuted || current.value?.outputGain !== audio.outputGain) return
+        effective.value?.outputMuted || writeErrors.has(key) ||
+        applied?.outputGain !== audio.outputGain || applied.outputDevice !== audio.outputDevice) return
     try {
       await invoke('preview_speaker_volume', { gain: audio.outputGain })
     } catch (reason) {
-      if (revision === speakerRevision) error.value = '扬声器试听失败：' + String(reason)
+      if (revision === speakerRevision) previewError.value = '扬声器试听失败：' + String(reason)
     }
   }
 

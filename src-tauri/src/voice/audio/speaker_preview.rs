@@ -4,10 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cpal::{
-    traits::{DeviceTrait, StreamTrait},
-    FromSample, SampleFormat, SizedSample,
-};
+use cpal::{traits::DeviceTrait, FromSample, SampleFormat, SizedSample};
 use tokio::sync::oneshot;
 
 use super::{devices, CaptureControl};
@@ -55,13 +52,13 @@ impl SpeakerTone {
     }
 }
 
-pub(in crate::voice) async fn play_on_device(
+pub(in crate::voice) fn prepare_on_device(
     device_id: &str,
     control: Arc<CaptureControl>,
     gain: f32,
-) -> Result<(), String> {
+) -> Result<(cpal::Stream, oneshot::Receiver<Instant>), String> {
     let device = devices::select(device_id, false)?;
-    let (stream, finished) = devices::open_stream(&device, false, |format| {
+    devices::open_stream(&device, false, |format| {
         build_stream!(
             format.sample_format(),
             open_preview,
@@ -70,10 +67,12 @@ pub(in crate::voice) async fn play_on_device(
             control.clone(),
             gain
         )
-    })?;
-    stream
-        .play()
-        .map_err(|error| format!("无法启动播放设备：{error}"))?;
+    })
+}
+
+pub(in crate::voice) async fn wait_until_played(
+    finished: oneshot::Receiver<Instant>,
+) -> Result<(), String> {
     tokio::time::timeout(Duration::from_secs(2), async {
         let played_at = finished.await.map_err(|_| "扬声器试听已中断")?;
         tokio::time::sleep_until(played_at.into()).await;

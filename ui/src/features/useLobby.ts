@@ -1,19 +1,27 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import type { LobbyEvent, Preferences, RecentRoom, Session, Snapshot, VoiceStatus } from '../model'
+import type { LobbyEvent, Preferences, RecentRoom, Session, Snapshot, SnapshotUpdate, VoiceStatus } from '../model'
 
 interface RoomSession {
   session: Session
   snapshot: Snapshot
 }
 
-function withAvatars(snapshot: Snapshot, previous?: Snapshot): Snapshot {
+function applySnapshot(update: SnapshotUpdate, previous?: Snapshot): Snapshot | undefined {
+  const { messagesAfter, retainedMessageCount, ...snapshot } = update
+  let messages = snapshot.messages
+  if (messagesAfter !== undefined) {
+    if (!previous || previous.messages.at(-1)?.id !== messagesAfter) return
+    messages = messages.length
+      ? previous.messages.concat(messages).slice(-retainedMessageCount)
+      : previous.messages
+  }
   const avatars = new Map(previous?.members.map(member => [member.id, member.avatar]))
   const members = snapshot.members.map(member => member.avatar === undefined
     ? { ...member, avatar: avatars.get(member.id) }
     : member)
-  return { ...snapshot, members }
+  return { ...snapshot, members, messages }
 }
 
 export function useLobby(openInvite: (link: string) => void) {
@@ -89,15 +97,17 @@ export function useLobby(openInvite: (link: string) => void) {
 
   function eventReceived(event: LobbyEvent) {
     if (pending?.id === event.sessionId) {
-      if (event.type === 'snapshot') pending.snapshot = withAvatars(event, pending.snapshot)
+      if (event.type === 'snapshot') pending.snapshot = applySnapshot(event, pending.snapshot) ?? pending.snapshot
       else if (event.type === 'offline') pending.offline = event.message || '房间连接已断开'
       else pending.error = event.message
       return
     }
     const room = current.value
     if (!room || room.session.id !== event.sessionId) return
-    if (event.type === 'snapshot') current.value = { session: room.session, snapshot: withAvatars(event, room.snapshot) }
-    else if (event.type === 'offline') disconnected(event.message, room.session.isHost)
+    if (event.type === 'snapshot') {
+      const next = applySnapshot(event, room.snapshot)
+      if (next) current.value = { session: room.session, snapshot: next }
+    } else if (event.type === 'offline') disconnected(event.message, room.session.isHost)
     else error.value = event.message
   }
 

@@ -1,10 +1,11 @@
 {
   "name": "duipin-ui",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test",
     "typecheck": "vue-tsc --noEmit",
     "build": "npm run typecheck && vite build"
   },

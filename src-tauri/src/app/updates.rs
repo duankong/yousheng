@@ -2,7 +2,7 @@ use super::{Desktop, Session};
 use crate::client::emit_room;
 use serde::Serialize;
 use serde_json::json;
-use std::{sync::atomic::Ordering, time::Duration};
+use std::time::Duration;
 use tauri::{AppHandle, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLockWriteGuard;
@@ -82,10 +82,12 @@ fn install_session<'a>(
     expected: Option<&str>,
 ) -> Result<RwLockWriteGuard<'a, Option<Session>>, String> {
     let session = state
-        .session
+        .rooms
+        .current
         .try_write()
         .map_err(|_| "房间状态正在变化，请稍后安装更新")?;
-    if session.as_ref().map(|s| s.id.as_str()) != expected || state.closing.load(Ordering::SeqCst) {
+    state.rooms.check_install_ready()?;
+    if session.as_ref().map(|s| s.id.as_str()) != expected {
         return Err("房间状态已变化，请重新确认安装".into());
     }
     if session.as_ref().is_some_and(|s| s.host.is_none()) {
@@ -121,6 +123,8 @@ pub(super) async fn install_update(
     if let Some(current) = session.take() {
         current.close().await;
     }
+    // Shutdown may have been requested while the old room was draining.
+    state.rooms.check_install_ready()?;
     if let Err(error) = update.install(bytes) {
         if let Some(id) = session_id {
             emit_room(

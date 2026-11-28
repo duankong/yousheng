@@ -8,6 +8,7 @@ pub(crate) use diagnostics::VoiceEvent;
 #[cfg(test)]
 pub(crate) use scenario_playback::ScenarioPlayback;
 
+use cpal::traits::StreamTrait;
 use futures_util::StreamExt;
 use livekit::{
     prelude::*,
@@ -29,9 +30,9 @@ use tokio::{
 };
 
 use crate::diagnostics::Diagnostics;
-use audio::{AudioIo, CaptureControl, PreparedAudioIo, BLOCK, RATE};
+use audio::{AudioIo, CallAudio, CaptureControl, PreparedAudioIo, BLOCK, RATE};
 pub use devices::AudioDevices;
-use diagnostics::{CallDiagnostics, ConnectingCall, PcmStats, VoiceState};
+use diagnostics::{CallDiagnostics, ConnectingCall, PcmStats, PlaybackTiming, VoiceState};
 
 // Decoded WebRTC sink frames are typically 10 ms each.
 const SDK_PCM_QUEUE_FRAMES: usize = 3;
@@ -79,6 +80,12 @@ impl AudioSettings {
         } else {
             f32::from(self.output_gain) / 100.0
         }
+    }
+
+    fn speaker_preview_target(&self, expected_gain: u16) -> Option<(&str, f32)> {
+        let gain = self.playback_gain();
+        (gain != 0.0 && self.output_gain == expected_gain)
+            .then_some((self.output_device.as_str(), gain))
     }
 }
 
@@ -216,7 +223,7 @@ fn silence(app: &AppHandle) {
 
 struct Session {
     room: Arc<Room>,
-    source: NativeAudioSource,
+    call: CallAudio,
     io: Arc<AsyncMutex<Option<AudioIo>>>,
     events: Task,
     diagnostics: CallDiagnostics,
@@ -244,10 +251,50 @@ impl Preview {
     }
 }
 
+struct SpeakerPreviewGuard<'a>(&'a Mutex<Option<cpal::Stream>>);
+
+impl Drop for SpeakerPreviewGuard<'_> {
+    fn drop(&mut self) {
+        stop_speaker_preview(self.0);
+    }
+}
+
+fn stop_speaker_preview(stream: &Mutex<Option<cpal::Stream>>) {
+    let mut stream = stream.lock().unwrap();
+    drop(stream.take());
+}
+
+struct UninstalledRoom<'a> {
+    room: Option<Arc<Room>>,
+    closing: &'a mut Option<JoinHandle<()>>,
+}
+
+impl Drop for UninstalledRoom<'_> {
+    fn drop(&mut self) {
+        if let Some(room) = self.room.take() {
+            *self.closing = Some(close_room(room));
+        }
+    }
+}
+
+fn close_room(room: Arc<Room>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = room.close().await;
+    })
+}
+
+async fn wait_for_room_close(closing: &mut Option<JoinHandle<()>>) {
+    if let Some(close) = closing.as_mut() {
+        let _ = tokio::time::timeout(Duration::from_secs(4), close).await;
+        closing.take();
+    }
+}
+
 #[derive(Clone)]
 struct AudioControls {
     app: AppHandle,
     preview: Arc<Mutex<Preview>>,
+    speaker_stream: Arc<Mutex<Option<cpal::Stream>>>,
     settings: watch::Sender<AudioSettings>,
     capture_control: Arc<CaptureControl>,
     mix: Arc<Mutex<Mixer>>,
@@ -257,7 +304,7 @@ impl AudioControls {
     fn prepare_io(
         &self,
         settings: &AudioSettings,
-        source: Option<&NativeAudioSource>,
+        call: Option<&CallAudio>,
     ) -> Result<PreparedAudioIo, String> {
         PreparedAudioIo::open(
             &self.app,
@@ -265,7 +312,7 @@ impl AudioControls {
             self.settings.subscribe(),
             self.capture_control.clone(),
             self.mix.clone(),
-            source.cloned(),
+            call.cloned(),
         )
     }
 
@@ -274,15 +321,14 @@ impl AudioControls {
         current: &mut Option<AudioIo>,
         settings: &AudioSettings,
         room: &Room,
-        source: &NativeAudioSource,
+        call: &CallAudio,
     ) -> Result<(), String> {
         // Keep a working device if the replacement format or endpoint fails to open.
-        let replacement = self.prepare_io(settings, Some(source))?;
+        let replacement = self.prepare_io(settings, Some(call))?;
         if let Some(old) = current.take() {
             old.stop().await;
         }
-        let preview_input = self.preview.lock().unwrap().input.take();
-        if let Some(preview_input) = preview_input {
+        if let Some(preview_input) = self.take_preview_for_call() {
             preview_input.stop().await;
         }
         if !call_is_active(room.connection_state()) {
@@ -298,6 +344,11 @@ impl AudioControls {
                 Err(error)
             }
         }
+    }
+
+    fn take_preview_for_call(&self) -> Option<AudioIo> {
+        stop_speaker_preview(&self.speaker_stream);
+        self.preview.lock().unwrap().input.take()
     }
 
     fn resume_preview(&self) {
@@ -344,6 +395,7 @@ pub(crate) async fn join_microphone(
 
 pub struct VoiceEngine {
     session: AsyncMutex<Option<Session>>,
+    transition: AsyncMutex<Option<JoinHandle<()>>>,
     audio: AudioControls,
     speaker_preview: AsyncMutex<()>,
 }
@@ -352,9 +404,11 @@ impl VoiceEngine {
     pub fn new(app: AppHandle) -> Self {
         Self {
             session: AsyncMutex::new(None),
+            transition: AsyncMutex::new(None),
             audio: AudioControls {
                 app,
                 preview: Default::default(),
+                speaker_stream: Default::default(),
                 settings: watch::channel(AudioSettings::default()).0,
                 capture_control: Arc::new(CaptureControl::default()),
                 mix: Default::default(),
@@ -364,40 +418,59 @@ impl VoiceEngine {
     }
 
     pub(crate) async fn connect(&self, url: &str, token: &str, diagnostics: &Diagnostics) {
-        let mut slot = self.session.lock().await;
-        if let Some(old) = slot.take() {
-            self.stop(old).await;
+        let mut closing = self.transition.lock().await;
+        {
+            let mut slot = self.session.lock().await;
+            if let Some(old) = slot.take() {
+                *closing = Some(self.stop(old).await);
+            }
         }
+        wait_for_room_close(&mut closing).await;
         self.set_ptt(false);
         let connecting = ConnectingCall::begin(diagnostics);
         status(&self.audio.app, "connecting", None);
-        let joined = join_microphone(url, token).await;
-        let diagnostics = connecting.finish();
-        let (room, events, source) = match joined {
+        let (room, events, source) = match join_microphone(url, token).await {
             Ok(joined) => joined,
             Err(error) => {
-                diagnostics.status(VoiceState::ConnectFailed);
+                connecting.finish().status(VoiceState::ConnectFailed);
                 silence(&self.audio.app);
                 status(&self.audio.app, "error", Some(&error));
                 return;
             }
         };
+        let mut pending = UninstalledRoom {
+            room: Some(Arc::new(room)),
+            closing: &mut closing,
+        };
+        let mut slot = self.session.lock().await;
+        let room = pending.room.take().unwrap();
+        drop(pending);
+        let diagnostics = connecting.finish();
+        if !call_is_active(room.connection_state()) {
+            diagnostics.status(VoiceState::Disconnected);
+            silence(&self.audio.app);
+            status(&self.audio.app, "disconnected", None);
+            *closing = Some(close_room(room));
+            return;
+        }
         self.audio.mix.lock().unwrap().pcm_stats = PcmStats::default();
         let settings = self.audio.settings.borrow().clone();
+        let call = CallAudio {
+            source,
+            playback_timing: Arc::new(PlaybackTiming::default()),
+        };
         let audio = self
             .audio
-            .prepare_io(&settings, Some(&source))
+            .prepare_io(&settings, Some(&call))
             .and_then(|io| {
-                self.audio.preview.lock().unwrap().input.take();
+                drop(self.audio.take_preview_for_call());
                 io.start()
             });
         let audio = match audio {
             Ok(audio) => audio,
             Err(e) => {
                 diagnostics.status(VoiceState::DeviceError);
-                tokio::spawn(async move {
-                    let _ = room.close().await;
-                });
+                *closing = Some(close_room(room));
                 silence(&self.audio.app);
                 status(&self.audio.app, "device-error", Some(&e));
                 self.audio.resume_preview();
@@ -405,7 +478,6 @@ impl VoiceEngine {
             }
         };
         let io = Arc::new(AsyncMutex::new(Some(audio)));
-        let room = Arc::new(room);
         diagnostics.status(VoiceState::Connected);
         status(&self.audio.app, "connected", None);
         let events = Task(tokio::spawn(room_events(
@@ -413,23 +485,21 @@ impl VoiceEngine {
             events,
             io.clone(),
             room.clone(),
-            source.clone(),
+            call.clone(),
             diagnostics.clone(),
         )));
         *slot = Some(Session {
             room,
-            source,
+            call,
             io,
             events,
             diagnostics,
         });
     }
 
-    async fn stop(&self, session: Session) {
+    async fn stop(&self, session: Session) -> JoinHandle<()> {
         // Close signaling in parallel with local audio cleanup.
-        let close = tokio::spawn(async move {
-            let _ = session.room.close().await;
-        });
+        let close = close_room(session.room);
         session.events.0.abort();
         // Join before clearing the shared mixer so a stale subscription cannot reinsert a track.
         let mut events = session.events;
@@ -441,17 +511,21 @@ impl VoiceEngine {
         self.audio.mix.lock().unwrap().tracks.clear();
         session.diagnostics.status(VoiceState::Disconnected);
         silence(&self.audio.app);
-        let _ = tokio::time::timeout(Duration::from_secs(4), close).await;
+        close
     }
 
     pub async fn disconnect(&self) {
-        let mut slot = self.session.lock().await;
+        let mut closing = self.transition.lock().await;
         self.set_ptt(false);
-        if let Some(session) = slot.take() {
-            self.stop(session).await;
+        {
+            let mut slot = self.session.lock().await;
+            if let Some(session) = slot.take() {
+                *closing = Some(self.stop(session).await);
+            }
+            status(&self.audio.app, "disconnected", None);
+            self.audio.resume_preview();
         }
-        status(&self.audio.app, "disconnected", None);
-        self.audio.resume_preview();
+        wait_for_room_close(&mut closing).await;
     }
 
     pub async fn monitor(&self, active: bool) -> Result<(), String> {
@@ -505,7 +579,7 @@ impl VoiceEngine {
                 })
             {
                 self.audio
-                    .replace_call_io(io, &settings, &session.room, &session.source)
+                    .replace_call_io(io, &settings, &session.room, &session.call)
                     .await
                     .inspect_err(|_| session.diagnostics.status(VoiceState::DeviceError))?;
                 if io.as_ref().is_some_and(|current| !current.failed()) {
@@ -525,6 +599,10 @@ impl VoiceEngine {
             preview.input.take();
             preview.input = Some(input.start()?);
         }
+        drop(preview);
+        if old.output_device != settings.output_device {
+            stop_speaker_preview(&self.audio.speaker_stream);
+        }
         self.audio.capture_control.configure(
             &settings,
             old.mode != settings.mode || old.shortcut != settings.shortcut,
@@ -534,24 +612,67 @@ impl VoiceEngine {
     }
 
     pub async fn preview_speaker_volume(&self, expected_gain: u16) -> Result<(), String> {
+        let Some((device, gain)) = self
+            .audio
+            .settings
+            .borrow()
+            .speaker_preview_target(expected_gain)
+            .map(|(device, gain)| (device.to_owned(), gain))
+        else {
+            return Ok(());
+        };
         let _preview = self.speaker_preview.lock().await;
-        let (device, gain) = {
+        let mut prepared = None;
+        let finished = loop {
             let slot = self.session.lock().await;
-            let settings = self.audio.settings.borrow().clone();
-            let gain = settings.playback_gain();
-            if gain == 0.0 || settings.output_gain != expected_gain {
+            if self
+                .audio
+                .settings
+                .borrow()
+                .speaker_preview_target(expected_gain)
+                != Some((device.as_str(), gain))
+            {
                 return Ok(());
             }
-            if let Some(session) = slot.as_ref() {
-                let io = session.io.lock().await;
-                if io.as_ref().is_some_and(|io| io.preview_speaker(gain)) {
-                    return Ok(());
-                }
+            let io = match slot.as_ref() {
+                Some(session) => Some(session.io.lock().await),
+                None => None,
+            };
+            if io
+                .as_ref()
+                .is_some_and(|io| io.as_ref().is_some_and(|io| io.preview_speaker(gain)))
+            {
+                return Ok(());
             }
-            (settings.output_device, gain)
+            if let Some(opened) = prepared.take() {
+                let (speaker, finished): (cpal::Stream, _) = opened?;
+                if let Err(error) = speaker.play() {
+                    drop(io);
+                    drop(slot);
+                    return Err(format!("无法启动播放设备：{error}"));
+                }
+                *self.audio.speaker_stream.lock().unwrap() = Some(speaker);
+                break finished;
+            }
+            drop(io);
+            drop(slot);
+            let output_device = device.clone();
+            let control = self.audio.capture_control.clone();
+            prepared = Some(
+                tokio::task::spawn_blocking(move || {
+                    audio::speaker_preview::prepare_on_device(&output_device, control, gain)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("扬声器试听准备失败：{error}"))),
+            );
         };
-        audio::speaker_preview::play_on_device(&device, self.audio.capture_control.clone(), gain)
-            .await
+        let _speaker = SpeakerPreviewGuard(&self.audio.speaker_stream);
+        let result = audio::speaker_preview::wait_until_played(finished).await;
+        if self.audio.speaker_stream.lock().unwrap().is_none() {
+            Ok(())
+        } else {
+            result
+        }
     }
 
     pub async fn devices(&self) -> Result<AudioDevices, String> {
@@ -574,6 +695,30 @@ impl VoiceEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speaker_preview_requires_the_requested_output_and_live_gain() {
+        let mut settings = AudioSettings {
+            output_device: "headset".to_owned(),
+            ..AudioSettings::default()
+        };
+        let (device, gain) = settings
+            .speaker_preview_target(100)
+            .map(|(device, gain)| (device.to_owned(), gain))
+            .unwrap();
+        assert_eq!((device.as_str(), gain), ("headset", 1.0));
+        assert_eq!(settings.speaker_preview_target(120), None);
+        settings.output_device = "speakers".to_owned();
+        assert_ne!(
+            settings.speaker_preview_target(100),
+            Some((device.as_str(), gain))
+        );
+        settings.output_muted = true;
+        assert_eq!(settings.speaker_preview_target(100), None);
+        settings.output_muted = false;
+        settings.output_gain = 0;
+        assert_eq!(settings.speaker_preview_target(0), None);
+    }
 
     #[test]
     fn disconnected_call_cannot_recover_audio() {
@@ -789,15 +934,17 @@ async fn room_events(
     mut events: mpsc::UnboundedReceiver<RoomEvent>,
     io: Arc<AsyncMutex<Option<AudioIo>>>,
     room: Arc<Room>,
-    source: NativeAudioSource,
+    call: CallAudio,
     diagnostics: CallDiagnostics,
 ) {
     let mut reason = None;
     let app = &audio.app;
     let mix = &audio.mix;
-    let sampler = Task(tokio::spawn(
-        diagnostics.clone().sample(room.clone(), mix.clone()),
-    ));
+    let sampler = Task(tokio::spawn(diagnostics.clone().sample(
+        room.clone(),
+        mix.clone(),
+        call.playback_timing.clone(),
+    )));
     let mut network_ready = true;
     let mut device_failed = false;
     let mut retry = tokio::time::interval(Duration::from_secs(2));
@@ -813,7 +960,7 @@ async fn room_events(
                     }
                     device_failed = true;
                     let settings = audio.settings.borrow().clone();
-                    if audio.replace_call_io(&mut current, &settings, &room, &source).await.is_ok() {
+                    if audio.replace_call_io(&mut current, &settings, &room, &call).await.is_ok() {
                         if network_ready && current.is_some() { status(app, "connected", None); }
                     }
                 }

@@ -121,10 +121,16 @@ struct WireChat<'a> {
     messages: Vec<ChatMessage<&'a str>>,
 }
 
+#[derive(Default)]
+struct ChatCursor {
+    last_id: Option<String>,
+    len: usize,
+}
+
 fn decode_snapshot(
     event: &mut Value,
     room: Option<&str>,
-    previous: &mut Vec<Value>,
+    chat_cursor: &mut ChatCursor,
 ) -> Result<(), String> {
     if event["type"] != "snapshot" {
         return Err(event["message"].as_str().unwrap_or("加入房间失败").into());
@@ -173,32 +179,46 @@ fn decode_snapshot(
         .unwrap()
         .iter()
         .any(|message| !message.is_object())
-        || !complete_chat(event, previous)
+        || !retain_chat_delta(event, chat_cursor)
     {
         return Err("房间聊天记录同步失败".into());
     }
     Ok(())
 }
 
-// The WebSocket orders snapshots. Expand negotiated deltas before a snapshot reaches the UI.
-fn complete_chat(snapshot: &mut Value, previous: &mut Vec<Value>) -> bool {
+// Keep the cursor and window size on the Rust side. The UI expands validated deltas.
+fn retain_chat_delta(snapshot: &mut Value, cursor: &mut ChatCursor) -> bool {
     let Some(fields) = snapshot.as_object_mut() else {
         return false;
     };
-    let after = fields.remove("messagesAfter");
+    let delta = match fields.get("messagesAfter") {
+        Some(after)
+            if after
+                .as_str()
+                .is_some_and(|id| Some(id) == cursor.last_id.as_deref()) =>
+        {
+            true
+        }
+        Some(_) => return false,
+        None => false,
+    };
     let Some(messages) = fields.get_mut("messages").and_then(Value::as_array_mut) else {
         return false;
     };
-    if let Some(after) = after {
-        if after.as_str().is_none() || previous.last().and_then(|m| m.get("id")) != Some(&after) {
-            return false;
-        }
-        previous.append(messages);
-        previous.drain(..previous.len().saturating_sub(HISTORY_LIMIT));
-        messages.clone_from(previous);
+    messages.drain(..messages.len().saturating_sub(HISTORY_LIMIT));
+    if !delta || !messages.is_empty() {
+        cursor.last_id = messages
+            .last()
+            .and_then(|message| message["id"].as_str())
+            .map(str::to_owned);
+    }
+    let previous_len = if delta { cursor.len } else { 0 };
+    cursor.len = (previous_len + messages.len()).min(HISTORY_LIMIT);
+    // This is desktop metadata calculated locally from the canonical chat limit.
+    if delta {
+        fields.insert("retainedMessageCount".into(), cursor.len.into());
     } else {
-        messages.drain(..messages.len().saturating_sub(HISTORY_LIMIT));
-        previous.clone_from(messages);
+        fields.remove("retainedMessageCount");
     }
     true
 }
@@ -213,7 +233,7 @@ pub(crate) struct AcceptedRoom {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     base: String,
     initial: Value,
-    messages: Vec<Value>,
+    chat_cursor: ChatCursor,
 }
 
 pub(crate) fn emit_room(app: &AppHandle, session_id: &str, mut event: Value) {
@@ -239,13 +259,13 @@ impl AcceptedRoom {
             .map_err(|e| e.to_string())?;
         let mut initial: Value = serde_json::from_str(first.to_text().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
-        let mut messages = Vec::new();
-        decode_snapshot(&mut initial, None, &mut messages)?;
+        let mut chat_cursor = ChatCursor::default();
+        decode_snapshot(&mut initial, None, &mut chat_cursor)?;
         Ok(Self {
             ws,
             base,
             initial,
-            messages,
+            chat_cursor,
         })
     }
 
@@ -265,7 +285,7 @@ impl AcceptedRoom {
             mut ws,
             base,
             initial,
-            mut messages,
+            mut chat_cursor,
         } = self;
         let room = initial["roomId"].as_str().unwrap().to_owned();
         emit_room(&app, &session_id, initial);
@@ -314,7 +334,7 @@ impl AcceptedRoom {
                                     let _=reply.send(result);
                                 },
                                 Some("snapshot")=>{
-                                    if let Err(message) = decode_snapshot(&mut event, Some(&room), &mut messages) {
+                                    if let Err(message) = decode_snapshot(&mut event, Some(&room), &mut chat_cursor) {
                                         closure = message;
                                         break;
                                     }
@@ -387,6 +407,14 @@ pub(crate) mod tests {
         )
     }
 
+    pub(crate) fn pause_audio_cleanup(client: &mut Client) -> oneshot::Sender<()> {
+        let (resume, wait) = oneshot::channel();
+        client.audio = tokio::spawn(async move {
+            let _ = wait.await;
+        });
+        resume
+    }
+
     #[tokio::test]
     async fn closing_room_waits_for_voice_cleanup_already_in_progress() {
         let (commands, _peer) = mpsc::channel(1);
@@ -451,37 +479,44 @@ pub(crate) mod tests {
 
     #[test]
     fn chat_deltas_preserve_order_roll_over_and_accept_full_resync() {
-        let mut previous = Vec::new();
+        let mut cursor = ChatCursor::default();
         let mut full = wire_snapshot();
         full["messages"] = Value::Array((0..102).map(|n| wire_message(&n.to_string())).collect());
-        decode_snapshot(&mut full, None, &mut previous).unwrap();
+        full["retainedMessageCount"] = json!(102);
+        decode_snapshot(&mut full, None, &mut cursor).unwrap();
         assert_eq!(full["messages"].as_array().unwrap().len(), 100);
         assert_eq!(full["messages"][0]["id"], "2");
+        assert!(full.get("retainedMessageCount").is_none());
 
         let mut delta = wire_snapshot();
         delta["messagesAfter"] = json!("101");
         delta["messages"] = json!([wire_message("102"), wire_message("103")]);
-        decode_snapshot(&mut delta, Some("room"), &mut previous).unwrap();
-        let messages = delta["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 100);
-        assert_eq!(messages.first().unwrap()["id"], "4");
-        assert_eq!(messages.last().unwrap()["id"], "103");
-        assert!(delta.get("messagesAfter").is_none());
+        delta["retainedMessageCount"] = json!(2);
+        decode_snapshot(&mut delta, Some("room"), &mut cursor).unwrap();
+        assert_eq!(
+            delta["messages"],
+            json!([wire_message("102"), wire_message("103")])
+        );
+        assert_eq!(delta["messagesAfter"], "101");
+        assert_eq!(delta["retainedMessageCount"], 100);
 
         let mut unchanged = wire_snapshot();
         unchanged["messagesAfter"] = json!("103");
         unchanged["messages"] = json!([]);
-        decode_snapshot(&mut unchanged, Some("room"), &mut previous).unwrap();
-        assert_eq!(unchanged, delta);
+        decode_snapshot(&mut unchanged, Some("room"), &mut cursor).unwrap();
+        assert_eq!(unchanged["messages"], json!([]));
+        assert_eq!(unchanged["retainedMessageCount"], 100);
 
         let mut stale = wire_snapshot();
         stale["messagesAfter"] = json!("101");
-        assert!(decode_snapshot(&mut stale, Some("room"), &mut previous).is_err());
-        assert_eq!(previous.last().unwrap()["id"], "103");
+        assert!(decode_snapshot(&mut stale, Some("room"), &mut cursor).is_err());
+        assert_eq!(cursor.last_id.as_deref(), Some("103"));
+        assert_eq!(cursor.len, 100);
 
         let mut resync = wire_snapshot();
-        decode_snapshot(&mut resync, Some("room"), &mut previous).unwrap();
-        assert_eq!(previous, [wire_message("message")]);
+        decode_snapshot(&mut resync, Some("room"), &mut cursor).unwrap();
+        assert_eq!(cursor.last_id.as_deref(), Some("message"));
+        assert_eq!(cursor.len, 1);
     }
 
     fn wire_message(id: &str) -> Value {
@@ -548,8 +583,8 @@ pub(crate) mod tests {
 
     #[test]
     fn snapshot_updates_reject_invalid_metadata_and_nested_values() {
-        let mut previous = Vec::new();
-        decode_snapshot(&mut wire_snapshot(), None, &mut previous).unwrap();
+        let mut cursor = ChatCursor::default();
+        decode_snapshot(&mut wire_snapshot(), None, &mut cursor).unwrap();
         let mut invalid_member = wire_snapshot();
         invalid_member["members"][0] = json!(["host", "Host", "picture"]);
         let mut invalid_message = wire_snapshot();
@@ -583,10 +618,11 @@ pub(crate) mod tests {
             null_cursor,
         ] {
             assert!(
-                decode_snapshot(&mut event, Some("room"), &mut previous).is_err(),
+                decode_snapshot(&mut event, Some("room"), &mut cursor).is_err(),
                 "accepted malformed update: {event}"
             );
-            assert_eq!(previous, [wire_message("message")]);
+            assert_eq!(cursor.last_id.as_deref(), Some("message"));
+            assert_eq!(cursor.len, 1);
         }
     }
 
@@ -603,7 +639,7 @@ pub(crate) mod tests {
             let mut event = wire_snapshot();
             event["messages"][0]["time"] = time.clone();
             assert_eq!(
-                decode_snapshot(&mut event, Some("room"), &mut Vec::new()).is_ok(),
+                decode_snapshot(&mut event, Some("room"), &mut ChatCursor::default()).is_ok(),
                 accepted,
                 "unexpected result for {time}"
             );
@@ -612,13 +648,13 @@ pub(crate) mod tests {
 
     #[test]
     fn snapshot_updates_preserve_avatar_omission_clear_and_member_departure() {
-        let mut previous = Vec::new();
+        let mut cursor = ChatCursor::default();
         let mut initial = wire_snapshot();
         initial["members"]
             .as_array_mut()
             .unwrap()
             .push(json!({"id":"leaving","name":"Leaving","avatar":"old picture"}));
-        decode_snapshot(&mut initial, None, &mut previous).unwrap();
+        decode_snapshot(&mut initial, None, &mut cursor).unwrap();
         assert_eq!(initial["members"][0]["avatar"], "picture");
 
         let mut update = wire_snapshot();
@@ -628,11 +664,13 @@ pub(crate) mod tests {
             .remove("avatar");
         update["messagesAfter"] = json!("message");
         update["messages"] = json!([]);
-        decode_snapshot(&mut update, Some("room"), &mut previous).unwrap();
+        decode_snapshot(&mut update, Some("room"), &mut cursor).unwrap();
         assert_eq!(
             update["members"],
             json!([{"id":"host","name":"Host"},{"id":"guest","name":"Guest","avatar":""}])
         );
-        assert_eq!(update["messages"], json!([wire_message("message")]));
+        assert_eq!(update["messages"], json!([]));
+        assert_eq!(update["messagesAfter"], "message");
+        assert_eq!(update["retainedMessageCount"], 1);
     }
 }
